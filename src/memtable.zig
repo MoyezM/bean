@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
+const constants = @import("constants.zig");
 
 /// A fixed-size, in-memory sorted table. All memory is allocated in
 /// `init`; no other method allocates.
@@ -20,6 +21,42 @@ pub const MemTable = struct {
     /// With a branching factor of 4 this covers about 4^12 entries.
     const max_height = 12;
     const branching = 4;
+
+    /// The longest key the table stores. A longer key is a bug in the caller.
+    pub const key_size_max = constants.key_size_max;
+
+    /// The longest value the table stores. A longer value is a bug in the
+    /// caller.
+    pub const value_size_max = constants.value_size_max;
+
+    /// The most bytes any one entry can take from the table.
+    pub const entry_size_max = entrySizeMax(key_size_max, value_size_max);
+
+    /// The fewest bytes an entry takes from the table beyond its key and
+    /// value: a node of height one.
+    pub const entry_overhead_min = Node.size(1, 0, 0);
+
+    /// The most bytes of padding the arena puts before a node to align it.
+    const node_padding_max = @alignOf(Node) - 1;
+
+    /// The largest buffer `init` accepts, and the size the store gives its
+    /// memtable. A flushed memtable must fit in one table, so nothing larger
+    /// is allowed.
+    pub const buffer_size_max = constants.memtable_size;
+
+    /// The longest key a node can represent. `Node.key_len` is a u32.
+    const key_size_node_max = std.math.maxInt(u32);
+
+    /// The longest value a node can represent. `Node.value_len` is a u32.
+    const value_size_node_max = std.math.maxInt(u32);
+
+    comptime {
+        assert(key_size_max <= key_size_node_max);
+        assert(value_size_max <= value_size_node_max);
+
+        // An empty table of the largest size has room for the largest entry.
+        assert(buffer_size_max >= buffer_size_min + entry_size_max);
+    }
 
     /// The smallest `buffer_size` that `init` accepts. A table this size has
     /// no room for entries.
@@ -144,10 +181,10 @@ pub const MemTable = struct {
     };
 
     /// Allocates `buffer_size` bytes for the table. `gpa` is not retained.
-    /// `buffer_size` must be between `buffer_size_min` and `maxInt(u32)`.
+    /// `buffer_size` must be between `buffer_size_min` and `buffer_size_max`.
     pub fn init(gpa: Allocator, buffer_size: usize) Allocator.Error!MemTable {
         assert(buffer_size >= buffer_size_min);
-        assert(buffer_size <= std.math.maxInt(u32));
+        assert(buffer_size <= buffer_size_max);
 
         const buffer = try gpa.alignedAlloc(u8, .of(Node), buffer_size);
         var table: MemTable = .{
@@ -199,8 +236,7 @@ pub const MemTable = struct {
     /// `bytesFree()`, inserting all of them cannot return `Full`.
     pub fn entrySizeMax(key_len: usize, value_len: usize) usize {
         const node_size_max = Node.size(max_height, key_len, value_len);
-        const padding_max = @alignOf(Node) - 1;
-        return node_size_max + padding_max;
+        return node_size_max + node_padding_max;
     }
 
     /// Bytes not yet used. An empty table has `buffer_size_min` fewer than
@@ -213,6 +249,8 @@ pub const MemTable = struct {
     /// value inserts a tombstone.
     fn insert(self: *MemTable, key: []const u8, value: ?[]const u8) Error!void {
         const value_len = if (value) |v| v.len else 0;
+        assert(key.len <= key_size_max);
+        assert(value_len <= value_size_max);
         if (!self.fitsWhenEmpty(key.len, value_len)) return error.TooLarge;
 
         const height = self.randomHeight();
@@ -268,7 +306,7 @@ pub const MemTable = struct {
 
     /// Whether an entry of this size fits in a table holding nothing else.
     fn fitsWhenEmpty(self: *const MemTable, key_len: usize, value_len: usize) bool {
-        const overhead = buffer_size_min + Node.size(1, 0, 0);
+        const overhead = buffer_size_min + entry_overhead_min;
         if (self.arena.buffer.len < overhead) return false;
         const room = self.arena.buffer.len - overhead;
         return key_len <= room and value_len <= room - key_len;
@@ -585,7 +623,8 @@ test "put reports full and leaves table intact" {
         table.put(key, "value") catch |err| {
             try testing.expectEqual(error.Full, err);
             // Full means not even the shortest node fits, and nothing was used.
-            try testing.expect(free_before < MemTable.Node.size(1, key.len, "value".len) + 7);
+            const node_size_min = MemTable.Node.size(1, key.len, "value".len);
+            try testing.expect(free_before < node_size_min + MemTable.node_padding_max);
             try testing.expectEqual(free_before, table.bytesFree());
             break;
         };
@@ -601,11 +640,13 @@ test "put reports full and leaves table intact" {
 }
 
 test "entry larger than the table is too large" {
-    var table: MemTable = try .init(testing.allocator, 256);
+    const size = 256;
+    var table: MemTable = try .init(testing.allocator, size);
     defer table.deinit(testing.allocator);
 
     const free_before = table.bytesFree();
-    const big: [256]u8 = @splat('x');
+    // As long as the whole buffer, so it cannot fit as a key or as a value.
+    const big: [size]u8 = @splat('x');
     try testing.expectError(error.TooLarge, table.put("key", &big));
     try testing.expectError(error.TooLarge, table.put(&big, "value"));
     try testing.expectError(error.TooLarge, table.delete(&big));
