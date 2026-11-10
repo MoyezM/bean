@@ -1,0 +1,12 @@
+.{
+    .name = .bean,
+    .version = "0.0.0",
+    .fingerprint = 0x289bffe6f1b72cca,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
