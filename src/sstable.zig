@@ -81,6 +81,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 const constants = @import("constants.zig");
 const crc32c = @import("checksum.zig").crc32c;
+const durable = @import("durable.zig");
 
 /// The longest key a table stores. A longer key is a bug in the caller.
 pub const key_size_max = constants.key_size_max;
@@ -806,9 +807,7 @@ pub const Writer = struct {
     /// this returns without an error, the table is complete and durable.
     /// Nothing may be added afterwards.
     ///
-    /// The file's name is not durable until the caller syncs `dir`. On macOS
-    /// the sync does not yet make the drive flush its write cache, so a
-    /// power failure can still lose the table there; see the note below.
+    /// The file's name is not durable until the caller syncs `dir`.
     ///
     /// After an error the file's state is unknown, and the writer must only
     /// be closed.
@@ -833,9 +832,7 @@ pub const Writer = struct {
         const footer_offset = self.offset + index.bytes.len;
         try self.file.writePositionalAll(self.io, footer.toBytes(), footer_offset);
 
-        // TODO: On macOS this does not make the drive flush its write cache.
-        // See the note in `wal.Writer.append`.
-        try self.file.sync(self.io);
+        try durable.sync(self.io, self.file);
 
         self.finished = true;
         return .{

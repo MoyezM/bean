@@ -22,10 +22,28 @@
 //! does not compile.
 
 /// The longest key the store accepts, in bytes.
-pub const key_size_max = 1024;
+///
+/// This is sized for a SQL layer whose keys are an encoded table, index and
+/// column values. Postgres allows 2,704 bytes of indexed columns; 4 KiB
+/// leaves room for the encoding and for the primary key that follows them
+/// in a secondary index entry.
+///
+/// A table's index currently holds the full last key of every block and is
+/// kept in memory, so a long key limit makes its worst case large. The plan
+/// is to replace it with a tree of index blocks that hold fixed-size key
+/// prefixes and are read through a block cache, so that memory no longer
+/// depends on key length.
+pub const key_size_max = 4 * 1024;
 
 /// The longest value the store accepts, in bytes.
-pub const value_size_max = 1024 * 1024;
+///
+/// A value is stored inline in a table block, and every buffer that holds a
+/// block has to be long enough for the largest one, so this is kept modest.
+/// Larger values can be split into chunks by the layer above. If they turn
+/// out to be common, the plan is a separate append-only file of values (a
+/// value heap), with the table holding a pointer to each, so that compaction
+/// does not rewrite them.
+pub const value_size_max = 64 * 1024;
 
 /// The size of the memtable's buffer, in bytes. When the memtable is full it
 /// is flushed to one table, so this also bounds how large a table gets.

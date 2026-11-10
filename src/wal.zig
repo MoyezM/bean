@@ -69,6 +69,7 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Io = std.Io;
 const crc32c = @import("checksum.zig").crc32c;
+const durable = @import("durable.zig");
 
 // The sizes of the two headers come from the structs that describe them,
 // further down.
@@ -202,7 +203,7 @@ fn syncDir(io: Io, dir: Io.Dir) (Io.Dir.OpenError || Io.File.SyncError)!void {
         .handle = opened.handle,
         .flags = .{ .nonblocking = false },
     };
-    try dir_as_file.sync(io);
+    try durable.sync(io, dir_as_file);
 }
 
 /// Whether `name` is a file name with no directory part. The log syncs the
@@ -240,8 +241,9 @@ pub const Writer = struct {
     /// the file already exists. `name` is a file name, not a path.
     ///
     /// If this fails, the file is removed again. If the process dies partway
-    /// through, a file shorter than a file header can be left behind, which
-    /// `Reader.open` reports as `IncompleteLog`.
+    /// through, a file shorter than a file header, or a file header of all
+    /// zeros with nothing after it, can be left behind. `Reader.open` reports
+    /// both as `IncompleteLog`.
     ///
     /// `previous` is the record this log continues from: the last record of
     /// the log file before it, or `RecordId.none` for a brand-new log.
@@ -263,7 +265,7 @@ pub const Writer = struct {
 
         const header: FileHeader = .init(previous);
         try file.writePositionalAll(io, header.toBytes(), 0);
-        try file.sync(io);
+        try durable.sync(io, file);
         try syncDir(io, dir);
 
         return .{
@@ -297,7 +299,7 @@ pub const Writer = struct {
         // Remove a damaged final record, if there is one, so that it can
         // never be mistaken for part of the log later.
         try file.setLength(io, end.valid_len);
-        try file.sync(io);
+        try durable.sync(io, file);
 
         return .{
             .io = io,
@@ -343,11 +345,7 @@ pub const Writer = struct {
         try self.file.writePositionalAll(self.io, header.toBytes(), self.offset);
         try self.file.writePositionalAll(self.io, payload, payload_offset);
 
-        // TODO: On macOS, `Io.File.sync` calls `fsync`, which does not make
-        // the drive flush its write cache, so a record can be lost on power
-        // failure. Use `fcntl` with `F_FULLFSYNC` there. Until then, use
-        // `Io.File.sync` on every platform.
-        try self.file.sync(self.io);
+        try durable.sync(self.io, self.file);
 
         self.offset = payload_offset + payload.len;
         self.last = .{ .op = header.op, .checksum = header.header_checksum };
@@ -380,9 +378,10 @@ pub const Reader = struct {
     };
 
     pub const OpenError = error{
-        /// The file is shorter than a file header. A crash while the log was
-        /// being created leaves this. Such a file holds no records, so it is
-        /// safe to delete and create again.
+        /// The file is shorter than a file header, or is a file header of
+        /// all zeros and nothing more. A crash while the log was being
+        /// created leaves this. Such a file holds no records, so it is safe
+        /// to delete and create again.
         IncompleteLog,
         /// The file does not start with a valid log file header.
         NotALog,
@@ -416,6 +415,14 @@ pub const Reader = struct {
         }
         const header = FileHeader.fromBytes(&header_bytes);
         if (header == null) {
+            // Zeros are what unwritten space in a file reads as. A crash in
+            // `Writer.create` can leave the file at its full length before
+            // the header's bytes are on disk.
+            const file_is_only_header = file_len == file_header_size;
+            const header_is_zeros = std.mem.allEqual(u8, &header_bytes, 0);
+            if (file_is_only_header and header_is_zeros) {
+                return error.IncompleteLog;
+            }
             return error.NotALog;
         }
 
@@ -1015,6 +1022,36 @@ test "a file shorter than a file header is an incomplete log" {
         const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
         try testing.expectError(error.IncompleteLog, result);
     }
+}
+
+test "a file header of zeros with nothing after it is an incomplete log" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [test_payload_size_max]u8 = undefined;
+
+    const zeros: [file_header_size]u8 = @splat(0);
+    const file = try tmp.dir.createFile(testing.io, test_name, .{});
+    try file.writePositionalAll(testing.io, &zeros, 0);
+    file.close(testing.io);
+
+    const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
+    try testing.expectError(error.IncompleteLog, result);
+}
+
+test "a file header of zeros with data after it is not a log" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [test_payload_size_max]u8 = undefined;
+
+    // One byte more than a header. A file this long could hold part of a
+    // record, so it is not taken for a crash while the log was created.
+    const zeros: [file_header_size + 1]u8 = @splat(0);
+    const file = try tmp.dir.createFile(testing.io, test_name, .{});
+    try file.writePositionalAll(testing.io, &zeros, 0);
+    file.close(testing.io);
+
+    const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
+    try testing.expectError(error.NotALog, result);
 }
 
 test "a file that is not a log is rejected" {

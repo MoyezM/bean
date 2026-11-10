@@ -7,6 +7,8 @@ pub const write_batch = @import("write_batch.zig");
 
 test {
     _ = @import("checksum.zig");
+    _ = @import("durable.zig");
+    _ = @import("bench_group_commit.zig");
     _ = @import("kv.zig");
     _ = @import("memtable.zig");
     _ = @import("sstable.zig");

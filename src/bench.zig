@@ -421,8 +421,8 @@ fn timeReplay(io: Io, dir: Io.Dir, buffer: []u8) !ReplayResult {
 /// asks the drive itself to flush. Returns the median, or `null` on systems
 /// where an ordinary sync already does that.
 ///
-/// The log does not sync this way yet; see the TODO in `wal.Writer.append`.
-/// This shows what doing so would cost.
+/// This is how the log syncs on macOS; see `durable.zig`. Timing it on a
+/// plain file shows how much of an append's time is the sync.
 fn timeFullSyncWrites(io: Io, dir: Io.Dir, payload: []const u8, count: u32) !?u64 {
     if (builtin.os.tag != .macos) {
         return null;

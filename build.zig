@@ -31,4 +31,22 @@ pub fn build(b: *std.Build) void {
 
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    // A client that drives a store with the workloads of RocksDB's db_bench.
+    // Like the benchmarks, it is always built optimized.
+    const bean_bench = b.addExecutable(.{
+        .name = "bean-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bean_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    b.installArtifact(bean_bench);
+    const run_bean_bench = b.addRunArtifact(bean_bench);
+    // Flags given after `--` on the command line go to the client.
+    run_bean_bench.addPassthruArgs();
+
+    const bean_bench_step = b.step("bean-bench", "Run the db_bench-style client; pass its flags after --");
+    bean_bench_step.dependOn(&run_bean_bench.step);
 }
