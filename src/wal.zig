@@ -192,20 +192,6 @@ const RecordHeader = extern struct {
     }
 };
 
-/// Syncs a directory, so that a file just created in it survives a crash.
-fn syncDir(io: Io, dir: Io.Dir) (Io.Dir.OpenError || Io.File.SyncError)!void {
-    // `dir` may stand for the current directory without being an open
-    // handle, and only an open handle can be synced. Opening "." gives one.
-    var opened = try dir.openDir(io, ".", .{});
-    defer opened.close(io);
-
-    const dir_as_file: Io.File = .{
-        .handle = opened.handle,
-        .flags = .{ .nonblocking = false },
-    };
-    try durable.sync(io, dir_as_file);
-}
-
 /// Whether `name` is a file name with no directory part. The log syncs the
 /// directory it was given, which only covers a file directly inside it.
 fn isPlainFileName(name: []const u8) bool {
@@ -266,7 +252,7 @@ pub const Writer = struct {
         const header: FileHeader = .init(previous);
         try file.writePositionalAll(io, header.toBytes(), 0);
         try durable.sync(io, file);
-        try syncDir(io, dir);
+        try durable.syncDir(io, dir);
 
         return .{
             .io = io,
@@ -1116,10 +1102,6 @@ test "the bytes of a log file match the documented layout" {
     defer file.close(testing.io);
     const actual_len = try file.readPositionalAll(testing.io, &actual, 0);
     try testing.expectEqualSlices(u8, &expected, actual[0..actual_len]);
-}
-
-test "the current directory can be synced" {
-    try syncDir(testing.io, Io.Dir.cwd());
 }
 
 test "a damaged file header is rejected" {

@@ -131,7 +131,9 @@ fn fill(table: *MemTable, order: KeyOrder) u64 {
     var index: u64 = 0;
     while (true) {
         makeKey(&key, index, order);
-        table.put(&key, &value) catch |err| {
+        // Each entry is written once, so its index numbers its write.
+        const sequence = index + 1;
+        table.put(&key, &value, sequence) catch |err| {
             switch (err) {
                 error.Full => return index,
                 error.TooLarge => unreachable,

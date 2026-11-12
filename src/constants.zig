@@ -58,3 +58,24 @@ pub const block_size = 16 * 1024;
 /// one batch holds. A batch is the payload of one log record, so this is
 /// also the largest record payload.
 pub const batch_size_max = 2 * 1024 * 1024;
+
+/// How many bytes of a memtable that is being written to a table each write
+/// flushes, for every byte the write may add to the other memtable.
+///
+/// A store has two memtables. When the one taking writes is full, it is
+/// frozen and the other takes over, and the frozen one is written out a
+/// little at a time by the writes that follow. At 2 or more, the frozen one
+/// is on disk before the other is full.
+pub const flush_pace = 2;
+
+/// The most table files a store holds at once.
+///
+/// This is small because, for now, every table keeps its whole index in
+/// memory, and a store has no way to merge tables. Once it has, and once
+/// indexes are read through a block cache, the number of tables will stop
+/// being what limits a store's size.
+pub const tables_max = 8;
+
+/// The number of levels tables are arranged in. A table written from the
+/// memtable is at level 0.
+pub const level_count = 2;

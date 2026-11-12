@@ -27,16 +27,23 @@
 //!                     kind (u32)              1 = data, 2 = index
 //!                     entry count (u32)
 //!                     body length (u32)
-//!     body:           entry, entry, ...       back to back, in key order
+//!     body:           entry, entry, ...       back to back, in order
 //!                     slot, slot, ...         one for each entry, last entry first
 //!
 //!     entry:          flags (u8)              0 = value, 1 = tombstone
 //!                     key length (u16)
 //!                     value length (u32)      0 for a tombstone
+//!                     sequence (u64)          the number of the write
 //!                     key
 //!                     value
 //!
 //!     slot:           entry offset (u32)      where the entry starts in the body
+//!
+//! Every entry carries the sequence number of the write that made it. Entries
+//! are ordered by key, and entries with the same key by sequence number,
+//! largest first. So a table can hold several entries for one key, and the
+//! first of them is the newest. No two entries have the same key and the same
+//! sequence number.
 //!
 //! There is no padding anywhere. The entries start at the front of the body
 //! and the slots fill the end of it. The slots are in the opposite order to
@@ -50,8 +57,8 @@
 //! longer than that when it holds a single large entry.
 //!
 //! The index block has one entry for each data block, in file order. The
-//! entry's key is the last key of the data block, and its value says where
-//! the data block is:
+//! entry's key and sequence number are those of the last entry of the data
+//! block, and its value says where the data block is:
 //!
 //!     block location: block offset (u64)
 //!                     block length (u32)      header and body together
@@ -73,7 +80,8 @@
 //!
 //! The reader loads the whole index block when it opens the table. A lookup
 //! binary searches the index block for the one data block that can hold the
-//! key, reads that block from the file, and binary searches it.
+//! newest entry for the key, reads that block from the file, and binary
+//! searches it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -151,11 +159,17 @@ pub const Entry = struct {
     key: []const u8,
     /// `null` means the entry is a tombstone.
     value: ?[]const u8,
+    /// The sequence number of the write that made the entry.
+    sequence: u64,
 };
+
+/// The largest sequence number. A search for a key with this number lands on
+/// the newest entry for the key.
+const sequence_newest = std.math.maxInt(u64);
 
 /// The magic never changes. A change to the format changes `version`.
 const magic: [8]u8 = "beansst1".*;
-const version = 1;
+const version = 2;
 
 // The sizes of the parts of the file come from the structs that describe
 // them, further down.
@@ -173,7 +187,7 @@ comptime {
     // These sizes are part of the format. A change to a struct that makes
     // one of these fail has changed the format, and needs a new `version`.
     assert(block_header_size == 20);
-    assert(entry_header_size == 7);
+    assert(entry_header_size == 15);
     assert(slot_size == 4);
     assert(block_location_size == 16);
     assert(footer_size == 36);
@@ -276,6 +290,8 @@ const EntryHeader = extern struct {
     key_len: u16 align(1),
     /// Zero for a tombstone.
     value_len: u32 align(1),
+    /// The sequence number of the write that made the entry.
+    sequence: u64 align(1),
 
     fn fromBytes(bytes: *const [entry_header_size]u8) EntryHeader {
         return std.mem.bytesToValue(EntryHeader, bytes);
@@ -367,9 +383,29 @@ fn indexEntrySize(key_len: usize) usize {
     return entrySize(key_len, block_location_size) + slot_size;
 }
 
+/// Whether an entry with key `a_key` and sequence number `a_sequence` comes
+/// before one with `b_key` and `b_sequence` in a table: its key is smaller,
+/// or the keys are the same and its sequence number is larger.
+pub fn sortsBefore(a_key: []const u8, a_sequence: u64, b_key: []const u8, b_sequence: u64) bool {
+    const key_order = std.mem.order(u8, a_key, b_key);
+    if (key_order == .lt) {
+        return true;
+    }
+    if (key_order == .gt) {
+        return false;
+    }
+    return a_sequence > b_sequence;
+}
+
 /// Writes one entry into `bytes`, which must be exactly `entrySize` long.
 /// Returns the key as it is stored in `bytes`.
-fn writeEntry(bytes: []u8, flags: EntryFlags, key: []const u8, value: []const u8) []const u8 {
+fn writeEntry(
+    bytes: []u8,
+    flags: EntryFlags,
+    key: []const u8,
+    value: []const u8,
+    sequence: u64,
+) []const u8 {
     assert(bytes.len == entrySize(key.len, value.len));
     const key_start = entry_header_size;
     const value_start = key_start + key.len;
@@ -378,6 +414,7 @@ fn writeEntry(bytes: []u8, flags: EntryFlags, key: []const u8, value: []const u8
         .flags = flags,
         .key_len = @intCast(key.len),
         .value_len = @intCast(value.len),
+        .sequence = sequence,
     };
     @memcpy(bytes[0..entry_header_size], header.toBytes());
     @memcpy(bytes[key_start..value_start], key);
@@ -391,6 +428,7 @@ const StoredEntry = struct {
     flags: EntryFlags,
     key: []const u8,
     value: []const u8,
+    sequence: u64,
 };
 
 /// Reads the entry that starts at `offset` in `entries`, the part of a block
@@ -433,6 +471,7 @@ fn readEntry(entries: []const u8, offset: usize) error{Corrupt}!StoredEntry {
         .flags = flags,
         .key = entries[key_start..value_start],
         .value = entries[value_start..value_end],
+        .sequence = header.sequence,
     };
 }
 
@@ -512,17 +551,19 @@ fn blockEntry(block: Block, entry_index: usize) error{Corrupt}!StoredEntry {
     return readEntry(block.entries, entry_offset);
 }
 
-/// Returns the number of the first entry in the block whose key is >= `key`,
-/// or the block's entry count if every key is smaller.
-fn blockLowerBound(block: Block, key: []const u8) error{Corrupt}!usize {
-    // Binary search. Every entry before `low` has a key smaller than `key`,
-    // and every entry from `high` on has a key at or after `key`.
+/// Returns the number of the first entry in the block that does not come
+/// before the write to `key` numbered `sequence`, or the block's entry count
+/// if every entry comes before it. With `sequence_newest`, that is the first
+/// entry whose key is >= `key`.
+fn blockLowerBound(block: Block, key: []const u8, sequence: u64) error{Corrupt}!usize {
+    // Binary search. Every entry before `low` comes before the target, and
+    // every entry from `high` on does not.
     var low: usize = 0;
     var high: usize = block.entry_count;
     while (low < high) {
         const middle = low + (high - low) / 2;
         const entry = try blockEntry(block, middle);
-        if (std.mem.order(u8, entry.key, key) == .lt) {
+        if (sortsBefore(entry.key, entry.sequence, key, sequence)) {
             low = middle + 1;
         } else {
             high = middle;
@@ -532,13 +573,14 @@ fn blockLowerBound(block: Block, key: []const u8) error{Corrupt}!usize {
 }
 
 /// Returns the number of the first entry whose key is >= `key`, in the data
-/// block that `Reader.findBlock` chose for `key`.
+/// block that `Reader.findBlock` chose for `key`. Among entries for one key
+/// that is the newest.
 ///
-/// Such an entry always exists. The index key of the block is at or after
-/// `key`, and `Reader.readBlock` has checked that the block's last key is
-/// its index key.
+/// Such an entry always exists. The index entry of the block does not come
+/// before the newest write to `key`, and `Reader.readBlock` has checked that
+/// the block's last entry has the index entry's key and sequence number.
 fn lowerBoundInFoundBlock(block: Block, key: []const u8) error{Corrupt}!usize {
-    const entry_index = try blockLowerBound(block, key);
+    const entry_index = try blockLowerBound(block, key, sequence_newest);
     assert(entry_index < block.entry_count);
     return entry_index;
 }
@@ -590,13 +632,19 @@ const BlockBuilder = struct {
     /// Adds one entry after the entries already in the block. The entry and
     /// its slot must fit in the free space. Returns the key as it is stored
     /// in the buffer.
-    fn add(self: *BlockBuilder, flags: EntryFlags, key: []const u8, value: []const u8) []const u8 {
+    fn add(
+        self: *BlockBuilder,
+        flags: EntryFlags,
+        key: []const u8,
+        value: []const u8,
+        sequence: u64,
+    ) []const u8 {
         const entry_size = entrySize(key.len, value.len);
         assert(entry_size + slot_size <= self.bytesFree());
 
         const entry_start = block_header_size + self.entries_len;
         const entry_bytes = self.buffer[entry_start..][0..entry_size];
-        const stored_key = writeEntry(entry_bytes, flags, key, value);
+        const stored_key = writeEntry(entry_bytes, flags, key, value, sequence);
 
         const slots_len = self.entry_count * slot_size;
         const slot_end = self.buffer.len - slots_len;
@@ -655,6 +703,9 @@ pub const Writer = struct {
     /// The key of the entry added last. It points into the buffer of `data`.
     /// Only meaningful once an entry has been added.
     last_key: []const u8,
+    /// The sequence number of the entry added last. Only meaningful once an
+    /// entry has been added.
+    last_sequence: u64,
     /// Where in the file the next block will be written.
     offset: u64,
     /// How many entries have been added.
@@ -726,6 +777,7 @@ pub const Writer = struct {
             .data = data,
             .index = index,
             .last_key = "",
+            .last_sequence = 0,
             .offset = 0,
             .entry_count = 0,
             .block_len_max = 0,
@@ -743,14 +795,16 @@ pub const Writer = struct {
 
     /// Adds one entry. A `null` value adds a tombstone.
     ///
-    /// `key` must be greater than the key added before it. Adding keys out
-    /// of order, or the same key twice, is a bug in the caller.
+    /// Entries are added in the table's order: `key` must be greater than
+    /// the key added before it, or the same key with a smaller `sequence`.
+    /// Adding entries out of order, or the same key and sequence number
+    /// twice, is a bug in the caller.
     ///
     /// `EntryTooLarge` and `TableFull` are reported before anything
     /// is changed, so the caller can still finish the table as it stands.
     /// After any other error the file's state is unknown, and the writer
     /// must only be closed.
-    pub fn add(self: *Writer, key: []const u8, value: ?[]const u8) AddError!void {
+    pub fn add(self: *Writer, key: []const u8, value: ?[]const u8, sequence: u64) AddError!void {
         assert(!self.finished);
         assert(!self.broken);
 
@@ -772,7 +826,7 @@ pub const Writer = struct {
         }
 
         if (self.entry_count > 0) {
-            assert(std.mem.order(u8, self.last_key, key) == .lt);
+            assert(sortsBefore(self.last_key, self.last_sequence, key, sequence));
         }
 
         // The current block is closed first if this entry and its slot would
@@ -799,7 +853,8 @@ pub const Writer = struct {
             errdefer self.broken = true;
             try self.writeDataBlock();
         }
-        self.last_key = self.data.add(flags, key, value_bytes);
+        self.last_key = self.data.add(flags, key, value_bytes, sequence);
+        self.last_sequence = sequence;
         self.entry_count += 1;
     }
 
@@ -858,7 +913,7 @@ pub const Writer = struct {
 
         // The entry added last is the last entry of this block. `add` has
         // already made sure the index has room for it.
-        _ = self.index.add(.value, self.last_key, location.toBytes());
+        _ = self.index.add(.value, self.last_key, location.toBytes(), self.last_sequence);
 
         self.offset += block.bytes.len;
         self.block_len_max = @max(self.block_len_max, location.len);
@@ -896,8 +951,9 @@ pub const Reader = struct {
         Corrupt,
     } || Io.File.ReadPositionalError;
 
-    /// A forward-only cursor over the entries of a table in key order,
-    /// tombstones included.
+    /// A forward-only cursor over every entry of a table, in the table's
+    /// order: by key, and for one key from the newest entry to the oldest.
+    /// Tombstones are included.
     pub const Iterator = struct {
         reader: *const Reader,
         /// Holds the current data block.
@@ -954,9 +1010,9 @@ pub const Reader = struct {
             self.entry_next += 1;
 
             if (entry.flags == .tombstone) {
-                return .{ .key = entry.key, .value = null };
+                return .{ .key = entry.key, .value = null, .sequence = entry.sequence };
             }
-            return .{ .key = entry.key, .value = entry.value };
+            return .{ .key = entry.key, .value = entry.value, .sequence = entry.sequence };
         }
 
         /// Reads one data block and puts the cursor at its first entry.
@@ -1053,7 +1109,8 @@ pub const Reader = struct {
         return self.footer_checksum;
     }
 
-    /// Looks up `key`, reading at most one data block from the file into
+    /// Looks up the newest entry for `key`, the one with the largest
+    /// sequence number, reading at most one data block from the file into
     /// `block_buffer`. A returned value points into `block_buffer`.
     pub fn get(self: *const Reader, key: []const u8, block_buffer: []u8) ReadError!Lookup {
         assert(block_buffer.len >= self.block_len_max);
@@ -1098,10 +1155,10 @@ pub const Reader = struct {
     }
 
     /// Returns the first data block whose last key is >= `key`. That is the
-    /// only block that can hold `key`. Returns `null` if `key` is greater
-    /// than every key in the table.
+    /// only block that can hold the newest entry for `key`. Returns `null`
+    /// if `key` is greater than every key in the table.
     fn findBlock(self: *const Reader, key: []const u8) error{Corrupt}!?usize {
-        const block_index = try blockLowerBound(self.index, key);
+        const block_index = try blockLowerBound(self.index, key, sequence_newest);
         if (block_index == self.blockCount()) {
             return null;
         }
@@ -1131,16 +1188,26 @@ pub const Reader = struct {
             return error.Corrupt;
         }
 
-        // The block's keys must lie in the range the index gives it: after
-        // the last key of the block before it, and up to its own index key.
+        // The block's entries must lie in the range the index gives it:
+        // after the last entry of the block before it, and up to the entry
+        // its own index entry names.
         const first_entry = try blockEntry(block, 0);
         const last_entry = try blockEntry(block, block.entry_count - 1);
         if (!std.mem.eql(u8, last_entry.key, index_entry.key)) {
             return error.Corrupt;
         }
+        if (last_entry.sequence != index_entry.sequence) {
+            return error.Corrupt;
+        }
         if (block_index > 0) {
             const previous_index_entry = try blockEntry(self.index, block_index - 1);
-            if (std.mem.order(u8, previous_index_entry.key, first_entry.key) != .lt) {
+            const previous_comes_first = sortsBefore(
+                previous_index_entry.key,
+                previous_index_entry.sequence,
+                first_entry.key,
+                first_entry.sequence,
+            );
+            if (!previous_comes_first) {
                 return error.Corrupt;
             }
         }
@@ -1150,7 +1217,7 @@ pub const Reader = struct {
 
 /// Checks every entry of the index block. Each must hold a block location,
 /// the data blocks they describe must lie back to back from the start of the
-/// file to the index block, their keys must increase, and the longest of
+/// file to the index block, their last entries must be in order, and the longest of
 /// them must be as long as the footer says.
 fn checkIndexEntries(index: Block, footer: Footer) error{Corrupt}!void {
     var file_offset: u64 = 0;
@@ -1170,10 +1237,10 @@ fn checkIndexEntries(index: Block, footer: Footer) error{Corrupt}!void {
             return error.Corrupt;
         }
 
-        // Each data block ends with a greater key than the block before it.
+        // Each data block ends after the block before it does.
         if (block_index > 0) {
             const previous = try blockEntry(index, block_index - 1);
-            if (std.mem.order(u8, previous.key, entry.key) != .lt) {
+            if (!sortsBefore(previous.key, previous.sequence, entry.key, entry.sequence)) {
                 return error.Corrupt;
             }
         }
@@ -1221,6 +1288,8 @@ fn testBlockSize(options: Options, entries: []const Entry) usize {
 }
 
 /// Writes a table holding `entries`, replacing the test file if it exists.
+/// The entries must be in the table's order: by key, and for one key from
+/// the largest sequence number to the smallest.
 fn writeTable(dir: Io.Dir, options: Options, entries: []const Entry) !Writer.Summary {
     const gpa = testing.allocator;
     const block_buffer = try gpa.alloc(u8, testBlockSize(options, entries));
@@ -1234,7 +1303,7 @@ fn writeTable(dir: Io.Dir, options: Options, entries: []const Entry) !Writer.Sum
     defer writer.close();
 
     for (entries) |entry| {
-        try writer.add(entry.key, entry.value);
+        try writer.add(entry.key, entry.value, entry.sequence);
     }
     return try writer.finish();
 }
@@ -1287,9 +1356,12 @@ const TestReader = struct {
     }
 };
 
+/// Checks that an iterator returned exactly `expected`: the same key, the
+/// same sequence number, and the same value or a tombstone.
 fn expectEntry(expected: Entry, actual: ?Entry) !void {
     try testing.expect(actual != null);
     try testing.expectEqualSlices(u8, expected.key, actual.?.key);
+    try testing.expectEqual(expected.sequence, actual.?.sequence);
     if (expected.value) |expected_value| {
         try testing.expect(actual.?.value != null);
         try testing.expectEqualSlices(u8, expected_value, actual.?.value.?);
@@ -1299,6 +1371,7 @@ fn expectEntry(expected: Entry, actual: ?Entry) !void {
 }
 
 /// Checks that looking up the key of `expected` found exactly that entry.
+/// A lookup does not report the sequence number, so it is not checked.
 fn expectLookup(expected: Entry, lookup: Lookup) !void {
     if (expected.value) |expected_value| {
         try testing.expect(lookup == .value);
@@ -1309,7 +1382,8 @@ fn expectLookup(expected: Entry, lookup: Lookup) !void {
 }
 
 /// Checks that the test file holds exactly `entries`, by a full scan and by
-/// looking up every key.
+/// looking up every key. `entries` is in the table's order, so the first
+/// entry for a key is its newest, and that is the one a lookup must find.
 fn expectTable(dir: Io.Dir, entries: []const Entry) !void {
     var table: TestReader = try .open(dir);
     defer table.close();
@@ -1321,8 +1395,15 @@ fn expectTable(dir: Io.Dir, entries: []const Entry) !void {
     try testing.expect(try it.next() == null);
     try testing.expect(try it.next() == null);
 
-    for (entries) |expected| {
-        try expectLookup(expected, try table.get(expected.key));
+    for (entries, 0..) |expected, entry_number| {
+        var is_newest_for_key = true;
+        if (entry_number > 0) {
+            const previous = entries[entry_number - 1];
+            is_newest_for_key = !std.mem.eql(u8, previous.key, expected.key);
+        }
+        if (is_newest_for_key) {
+            try expectLookup(expected, try table.get(expected.key));
+        }
     }
 }
 
@@ -1385,6 +1466,27 @@ fn testBlockHeader(kind: u32, entry_count: u32, body: []const u8) [block_header_
     return bytes;
 }
 
+/// Where the sequence number is in an entry: after the flags (1 byte), the
+/// key length (2 bytes) and the value length (4 bytes). It is the last 8
+/// bytes of the entry header, so the key follows it. The number is counted
+/// from the format's description and not taken from `EntryHeader`, so that
+/// a test that uses it also checks where the header puts the field.
+const test_sequence_offset = 7;
+
+/// Reads the sequence number of the entry that starts at `entry_start` in
+/// `bytes`, a whole table file.
+fn readEntrySequence(bytes: []const u8, entry_start: usize) u64 {
+    const sequence_bytes = bytes[entry_start + test_sequence_offset ..][0..8];
+    return std.mem.readInt(u64, sequence_bytes, .little);
+}
+
+/// Overwrites the sequence number of the entry that starts at `entry_start`
+/// in `bytes`, a whole table file.
+fn writeEntrySequence(bytes: []u8, entry_start: usize, sequence: u64) void {
+    const sequence_bytes = bytes[entry_start + test_sequence_offset ..][0..8];
+    std.mem.writeInt(u64, sequence_bytes, sequence, .little);
+}
+
 /// Where the blocks are in a table that a test edits by hand. Every data
 /// block has the same length, and every key is one byte long.
 const TestLayout = struct {
@@ -1392,9 +1494,9 @@ const TestLayout = struct {
     data_block_count: usize,
 };
 
-/// An index entry whose key is one byte long: a 7-byte entry header, the
-/// key, and a 16-byte block location. Its slot is not counted.
-const test_index_entry_len = 24;
+/// An index entry whose key is one byte long: an entry header, the key, and
+/// a block location. Its slot is not counted.
+const test_index_entry_len = entrySize(1, block_location_size);
 
 /// Gives a block's header the two checksums that its bytes now call for.
 /// The kind, the entry count and the body length stay as they are. The
@@ -1446,9 +1548,10 @@ fn sealTable(bytes: []u8, layout: TestLayout) void {
         sealBlock(block);
 
         // The index entry of this block ends with the block's header
-        // checksum: the last 4 of the entry's 24 bytes.
+        // checksum: the last 4 bytes of the entry.
         const index_entry_start = index_body_start + block_number * test_index_entry_len;
-        const checksum_copy = bytes[index_entry_start + 20 ..][0..4];
+        const index_entry_end = index_entry_start + test_index_entry_len;
+        const checksum_copy = bytes[index_entry_end - 4 ..][0..4];
         @memcpy(checksum_copy, block[0..4]);
 
         block_number += 1;
@@ -1457,18 +1560,26 @@ fn sealTable(bytes: []u8, layout: TestLayout) void {
     sealIndexAndFooter(bytes, layout);
 }
 
-/// The small table of the layout test: one data block at bytes 0 to 45, the
-/// index block at bytes 45 to 93, and the footer at bytes 93 to 129.
+/// The small table of the layout test: one data block, then the index block
+/// with one entry, then the footer. The layout test spells out every byte.
 const small_table_entries = [_]Entry{
-    .{ .key = "a", .value = "1" },
-    .{ .key = "b", .value = null },
+    .{ .key = "a", .value = "1", .sequence = 0x0807060504030201 },
+    .{ .key = "b", .value = null, .sequence = 0x1817161514131211 },
 };
-const small_table_layout: TestLayout = .{ .data_block_len = 45, .data_block_count = 1 };
-const small_table_len = 129;
+/// The data block of the small table: a block header, the entry for "a"
+/// with its one-byte value, the tombstone for "b", and two slots.
+const small_data_block_len = block_header_size + entrySize(1, 1) + entrySize(1, 0) + 2 * slot_size;
+/// The index block of the small table: one entry for a one-byte key.
+const small_index_block_len = indexSizeMax(1, 1);
+const small_table_layout: TestLayout = .{
+    .data_block_len = small_data_block_len,
+    .data_block_count = 1,
+};
+const small_table_len = small_data_block_len + small_index_block_len + footer_size;
 /// Where the parts of the small table start in the file.
-const small_data_body_start = 20;
-const small_index_body_start = 65;
-const small_footer_start = 93;
+const small_data_body_start = block_header_size;
+const small_index_body_start = small_data_block_len + block_header_size;
+const small_footer_start = small_data_block_len + small_index_block_len;
 
 /// Writes the small table and returns the bytes of the file, for a test to
 /// change by hand. The caller frees them.
@@ -1480,38 +1591,82 @@ fn smallTableBytes(dir: Io.Dir) ![]u8 {
     return bytes;
 }
 
-/// A table of eight entries with the keys "a" to "h" and 8-byte values, in
-/// two data blocks of four entries each. Each entry takes 7 + 1 + 8 bytes
-/// and a 4-byte slot, so a data block is 20 + 4 * 20 = 100 bytes.
-///
-/// The data blocks are at bytes 0 to 100 and 100 to 200. The index block is
-/// at bytes 200 to 276: a 20-byte header, two 24-byte entries and two slots.
-/// The footer is at bytes 276 to 312.
-const eight_table_layout: TestLayout = .{ .data_block_len = 100, .data_block_count = 2 };
-const eight_table_len = 312;
-const eight_index_body_start = 220;
+/// The length of a data block that holds four entries, each with a one-byte
+/// key and an 8-byte value: the block header, and for each entry the entry
+/// itself and its slot. With this as the block size, a table of eight such
+/// entries has two data blocks that are exactly full.
+const eight_data_block_len = block_header_size + 4 * (entrySize(1, 8) + slot_size);
+
+/// The layout of a table of eight entries with one-byte keys and 8-byte
+/// values, written with a block size of `eight_data_block_len`. The two data
+/// blocks come first, back to back. The index block follows, with two
+/// entries for one-byte keys, and then the footer.
+const eight_table_layout: TestLayout = .{
+    .data_block_len = eight_data_block_len,
+    .data_block_count = 2,
+};
+const eight_index_block_len = indexSizeMax(2, 1);
+const eight_table_len = 2 * eight_data_block_len + eight_index_block_len + footer_size;
+const eight_index_body_start = 2 * eight_data_block_len + block_header_size;
+
+/// Where one entry of the eight-entry table starts in the file. Both
+/// numbers count from zero.
+fn eightTableEntryOffset(block_number: usize, entry_number: usize) usize {
+    const block_start = block_number * eight_table_layout.data_block_len;
+    // Every entry has a 1-byte key and an 8-byte value.
+    return block_start + block_header_size + entry_number * entrySize(1, 8);
+}
 
 /// Where the key of one entry of the eight-entry table is in the file.
 /// Both numbers count from zero.
 fn eightTableKeyOffset(block_number: usize, entry_number: usize) usize {
-    const block_start = block_number * eight_table_layout.data_block_len;
-    // Every entry has a 1-byte key and an 8-byte value.
-    const entry_start = block_start + block_header_size + entry_number * entrySize(1, 8);
+    const entry_start = eightTableEntryOffset(block_number, entry_number);
     return entry_start + entry_header_size;
+}
+
+/// Where one index entry of the eight-entry table starts in the file.
+fn eightTableIndexEntryOffset(block_number: usize) usize {
+    return eight_index_body_start + block_number * test_index_entry_len;
 }
 
 /// Where the key of one index entry of the eight-entry table is in the file.
 fn eightTableIndexKeyOffset(block_number: usize) usize {
-    const entry_start = eight_index_body_start + block_number * test_index_entry_len;
+    const entry_start = eightTableIndexEntryOffset(block_number);
     return entry_start + entry_header_size;
 }
 
-/// Writes the eight-entry table, with `value` as the value of every entry,
-/// and returns the bytes of the file, for a test to change by hand. The
-/// caller frees them.
-fn eightTableBytes(dir: Io.Dir, value: *const [8]u8) ![]u8 {
-    const entries = eightEntries(value, 8);
-    _ = try writeTable(dir, .{ .block_size = 100 }, &entries);
+/// Eight entries with the keys "a" to "h", each with a value of `value_len`
+/// bytes. The values point into `value_bytes`. The entries are numbered in
+/// key order: "a" has sequence number 1 and "h" has 8.
+fn eightEntries(value_bytes: []const u8, value_len: usize) [8]Entry {
+    const keys = "abcdefgh";
+    var entries: [8]Entry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        entry.key = keys[i..][0..1];
+        entry.value = value_bytes[0..value_len];
+        entry.sequence = i + 1;
+    }
+    return entries;
+}
+
+/// Eight entries for the one key "k", each with the 8-byte value `value`.
+/// They are in the table's order, newest first: the first has sequence
+/// number 8 and the last has 1.
+fn eightVersions(value: *const [8]u8) [8]Entry {
+    var entries: [8]Entry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        entry.key = "k";
+        entry.value = value;
+        entry.sequence = 8 - i;
+    }
+    return entries;
+}
+
+/// Writes `entries` as a table with the eight-entry layout, and returns the
+/// bytes of the file, for a test to change by hand. Every entry must have a
+/// one-byte key and an 8-byte value. The caller frees the bytes.
+fn eightTableBytes(dir: Io.Dir, entries: *const [8]Entry) ![]u8 {
+    _ = try writeTable(dir, .{ .block_size = eight_data_block_len }, entries);
     const bytes = try readWholeFile(dir);
     errdefer testing.allocator.free(bytes);
     try testing.expectEqual(@as(usize, eight_table_len), bytes.len);
@@ -1521,9 +1676,10 @@ fn eightTableBytes(dir: Io.Dir, value: *const [8]u8) ![]u8 {
 /// Expects `Reader.open` itself to reject the test file, before any data
 /// block is read.
 fn expectOpenCorrupt(dir: Io.Dir) !void {
-    // The tables that tests edit by hand are at most 312 bytes long, so the
-    // index always fits in this buffer.
-    var index_buffer: [512]u8 = undefined;
+    // The eight-entry table is the longest table that tests edit by hand,
+    // and an index is never longer than its file, so the index always fits
+    // in this buffer.
+    var index_buffer: [eight_table_len]u8 = undefined;
     const result = Reader.open(testing.io, dir, test_name, &index_buffer);
     try testing.expectError(error.Corrupt, result);
 }
@@ -1556,9 +1712,9 @@ test "entries are read back in order" {
     defer tmp.cleanup();
 
     const entries = [_]Entry{
-        .{ .key = "apple", .value = "red" },
-        .{ .key = "banana", .value = "yellow" },
-        .{ .key = "cherry", .value = "dark red" },
+        .{ .key = "apple", .value = "red", .sequence = 3 },
+        .{ .key = "banana", .value = "yellow", .sequence = 1 },
+        .{ .key = "cherry", .value = "dark red", .sequence = 2 },
     };
     const summary = try writeTable(tmp.dir, .{}, &entries);
     try testing.expectEqual(@as(u64, 3), summary.entry_count);
@@ -1569,51 +1725,65 @@ test "the layout of a small table, byte for byte" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // Each sequence number has eight different bytes, so that the test pins
+    // where the number is and that its lowest byte comes first.
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
-        .{ .key = "b", .value = null },
+        .{ .key = "a", .value = "1", .sequence = 0x0807060504030201 },
+        .{ .key = "b", .value = null, .sequence = 0x1817161514131211 },
     };
     _ = try writeTable(tmp.dir, .{}, &entries);
 
-    var expected: [129]u8 = undefined;
+    var expected: [153]u8 = undefined;
 
-    // The data block is bytes 0 to 45.
+    // The data block is bytes 0 to 61: a 20-byte header and a 41-byte body.
+    // The first entry takes 15 + 1 + 1 = 17 bytes and the second takes
+    // 15 + 1 = 16, so the second starts at byte 17 of the body.
     const data_body = [_]u8{
-        0, 1, 0, 1, 0, 0, 0, 'a', '1', // a value: key length 1, value length 1
-        1, 1, 0, 0, 0, 0, 0, 'b', // a tombstone: key length 1, value length 0
-        9, 0, 0, 0, // slot of the second entry
+        0, 1, 0, 1, 0, 0, 0, // a value: key length 1, value length 1
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // sequence number
+        'a', '1', // key and value
+        1, 1, 0, 0, 0, 0, 0, // a tombstone: key length 1, value length 0
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // sequence number
+        'b', // key
+        17, 0, 0, 0, // slot of the second entry
         0, 0, 0, 0, // slot of the first entry
     };
     const data_header = testBlockHeader(@backingInt(BlockKind.data), 2, &data_body);
     @memcpy(expected[0..20], &data_header);
-    @memcpy(expected[20..45], &data_body);
+    @memcpy(expected[20..61], &data_body);
 
-    // The index block is bytes 45 to 93.
+    // The index block is bytes 61 to 117: a 20-byte header and a 36-byte
+    // body. Its entry has the key and the sequence number of the last entry
+    // of the data block.
     var index_body = [_]u8{
-        0, 1, 0, 16, 0, 0, 0, 'b', // a value: key length 1, value length 16
+        0, 1, 0, 16, 0, 0, 0, // a value: key length 1, value length 16
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // sequence number
+        'b', // key
         0, 0, 0, 0, 0, 0, 0, 0, // data block offset
-        45, 0, 0, 0, // data block length
+        61, 0, 0, 0, // data block length
         0, 0, 0, 0, // data block header checksum, filled in below
         0, 0, 0, 0, // slot of the only entry
     };
-    @memcpy(index_body[20..24], data_header[0..4]);
+    // The checksum follows the entry header (15), the key (1), the offset
+    // (8) and the length (4).
+    @memcpy(index_body[28..32], data_header[0..4]);
     const index_header = testBlockHeader(@backingInt(BlockKind.index), 1, &index_body);
-    @memcpy(expected[45..65], &index_header);
-    @memcpy(expected[65..93], &index_body);
+    @memcpy(expected[61..81], &index_header);
+    @memcpy(expected[81..117], &index_body);
 
-    // The footer is bytes 93 to 129.
+    // The footer is bytes 117 to 153.
     var footer = [_]u8{
         'b', 'e', 'a', 'n', 's', 's', 't', '1', // magic
-        1, 0, 0, 0, // version
-        45, 0, 0, 0, 0, 0, 0, 0, // index block offset
-        48, 0, 0, 0, // index block length
+        2, 0, 0, 0, // version
+        61, 0, 0, 0, 0, 0, 0, 0, // index block offset
+        56, 0, 0, 0, // index block length
         0, 0, 0, 0, // index block header checksum, filled in below
-        45, 0, 0, 0, // largest data block length
+        61, 0, 0, 0, // largest data block length
         0, 0, 0, 0, // footer checksum, filled in below
     };
     @memcpy(footer[24..28], index_header[0..4]);
     std.mem.writeInt(u32, footer[32..36], crc32c(footer[0..32]), .little);
-    @memcpy(expected[93..129], &footer);
+    @memcpy(expected[117..153], &footer);
 
     const actual = try readWholeFile(tmp.dir);
     defer testing.allocator.free(actual);
@@ -1625,9 +1795,9 @@ test "the summary describes the file" {
     defer tmp.cleanup();
 
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
-        .{ .key = "b", .value = null },
-        .{ .key = "c", .value = "3" },
+        .{ .key = "a", .value = "1", .sequence = 1 },
+        .{ .key = "b", .value = null, .sequence = 2 },
+        .{ .key = "c", .value = "3", .sequence = 3 },
     };
     const summary = try writeTable(tmp.dir, .{}, &entries);
 
@@ -1651,9 +1821,9 @@ test "a tombstone is found as a tombstone" {
     defer tmp.cleanup();
 
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
-        .{ .key = "b", .value = null },
-        .{ .key = "c", .value = "3" },
+        .{ .key = "a", .value = "1", .sequence = 1 },
+        .{ .key = "b", .value = null, .sequence = 2 },
+        .{ .key = "c", .value = "3", .sequence = 3 },
     };
     _ = try writeTable(tmp.dir, .{}, &entries);
 
@@ -1661,11 +1831,10 @@ test "a tombstone is found as a tombstone" {
     defer table.close();
     try testing.expect(try table.get("b") == .tombstone);
 
+    // The iterator returns the tombstone with its sequence number.
     var it = table.iterator();
     try it.seek("b");
-    const entry = try it.next();
-    try testing.expectEqualSlices(u8, "b", entry.?.key);
-    try testing.expect(entry.?.value == null);
+    try expectEntry(entries[1], try it.next());
 }
 
 test "an empty value is not a tombstone, and the empty key is a key" {
@@ -1673,8 +1842,8 @@ test "an empty value is not a tombstone, and the empty key is a key" {
     defer tmp.cleanup();
 
     const entries = [_]Entry{
-        .{ .key = "", .value = "empty key" },
-        .{ .key = "a", .value = "" },
+        .{ .key = "", .value = "empty key", .sequence = 1 },
+        .{ .key = "a", .value = "", .sequence = 2 },
     };
     _ = try writeTable(tmp.dir, .{}, &entries);
     try expectTable(tmp.dir, &entries);
@@ -1691,8 +1860,8 @@ test "keys that are not in the table are absent" {
     defer tmp.cleanup();
 
     const entries = [_]Entry{
-        .{ .key = "bb", .value = "1" },
-        .{ .key = "dd", .value = "2" },
+        .{ .key = "bb", .value = "1", .sequence = 1 },
+        .{ .key = "dd", .value = "2", .sequence = 2 },
     };
     _ = try writeTable(tmp.dir, .{}, &entries);
 
@@ -1707,73 +1876,307 @@ test "keys that are not in the table are absent" {
     try testing.expect(try table.get("z") == .absent);
 }
 
-/// Eight entries, each with a one-byte key and a value of `value_len` bytes.
-/// The values point into `value_bytes`.
-fn eightEntries(value_bytes: []const u8, value_len: usize) [8]Entry {
-    const keys = "abcdefgh";
-    var entries: [8]Entry = undefined;
-    for (&entries, 0..) |*entry, i| {
-        entry.key = keys[i..][0..1];
-        entry.value = value_bytes[0..value_len];
+test "every entry for one key is returned, newest first, and get finds the newest" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const entries = [_]Entry{
+        .{ .key = "a", .value = "a4", .sequence = 4 },
+        .{ .key = "b", .value = "b9", .sequence = 9 },
+        .{ .key = "b", .value = "b7", .sequence = 7 },
+        .{ .key = "b", .value = "b2", .sequence = 2 },
+        .{ .key = "c", .value = "c1", .sequence = 1 },
+    };
+    const summary = try writeTable(tmp.dir, .{}, &entries);
+    try testing.expectEqual(@as(u64, 5), summary.entry_count);
+
+    var table: TestReader = try .open(tmp.dir);
+    defer table.close();
+
+    // The iterator returns all three entries for "b", with their sequence
+    // numbers, from the largest to the smallest.
+    var it = table.iterator();
+    try expectEntry(entries[0], try it.next());
+    try expectEntry(entries[1], try it.next());
+    try expectEntry(entries[2], try it.next());
+    try expectEntry(entries[3], try it.next());
+    try expectEntry(entries[4], try it.next());
+    try testing.expect(try it.next() == null);
+
+    const lookup = try table.get("b");
+    try testing.expect(lookup == .value);
+    try testing.expectEqualSlices(u8, "b9", lookup.value);
+
+    // A seek to the key lands on its newest entry.
+    try it.seek("b");
+    try expectEntry(entries[1], try it.next());
+    try expectEntry(entries[2], try it.next());
+}
+
+test "get returns a tombstone that is newer than a value for the same key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const entries = [_]Entry{
+        .{ .key = "a", .value = "a1", .sequence = 1 },
+        .{ .key = "b", .value = null, .sequence = 8 },
+        .{ .key = "b", .value = "b5", .sequence = 5 },
+        .{ .key = "c", .value = "c2", .sequence = 2 },
+    };
+    _ = try writeTable(tmp.dir, .{}, &entries);
+
+    var table: TestReader = try .open(tmp.dir);
+    defer table.close();
+    try testing.expect(try table.get("b") == .tombstone);
+
+    // The iterator still returns the older value, after the tombstone.
+    var it = table.iterator();
+    try it.seek("b");
+    try expectEntry(entries[1], try it.next());
+    try expectEntry(entries[2], try it.next());
+    try expectEntry(entries[3], try it.next());
+    try testing.expect(try it.next() == null);
+}
+
+test "get returns a value that is newer than a tombstone for the same key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const entries = [_]Entry{
+        .{ .key = "a", .value = "a1", .sequence = 1 },
+        .{ .key = "b", .value = "b8", .sequence = 8 },
+        .{ .key = "b", .value = null, .sequence = 5 },
+        .{ .key = "c", .value = "c2", .sequence = 2 },
+    };
+    _ = try writeTable(tmp.dir, .{}, &entries);
+
+    var table: TestReader = try .open(tmp.dir);
+    defer table.close();
+    const lookup = try table.get("b");
+    try testing.expect(lookup == .value);
+    try testing.expectEqualSlices(u8, "b8", lookup.value);
+
+    // The iterator still returns the older tombstone, after the value.
+    var it = table.iterator();
+    try it.seek("b");
+    try expectEntry(entries[1], try it.next());
+    try expectEntry(entries[2], try it.next());
+    try expectEntry(entries[3], try it.next());
+    try testing.expect(try it.next() == null);
+}
+
+/// The length of a data block that holds two entries, each with a one-byte
+/// key and a 2-byte value. With this as the block size, a table of such
+/// entries has two entries in every data block.
+const pair_block_len = block_header_size + 2 * (entrySize(1, 2) + slot_size);
+
+test "entries for one key that start at the end of a block and go on in the next are all found" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two entries fill a block, so the blocks hold "a" and the newest "k",
+    // then the two older entries for "k", then "m".
+    const entries = [_]Entry{
+        .{ .key = "a", .value = "a3", .sequence = 3 },
+        .{ .key = "k", .value = "k9", .sequence = 9 },
+        .{ .key = "k", .value = "k6", .sequence = 6 },
+        .{ .key = "k", .value = "k2", .sequence = 2 },
+        .{ .key = "m", .value = "m5", .sequence = 5 },
+    };
+    _ = try writeTable(tmp.dir, .{ .block_size = pair_block_len }, &entries);
+    try expectTable(tmp.dir, &entries);
+
+    var table: TestReader = try .open(tmp.dir);
+    defer table.close();
+    try testing.expectEqual(@as(usize, 3), table.reader.blockCount());
+
+    // The newest entry for "k" is the last entry of the first block. The
+    // second block holds only older entries for "k".
+    const lookup = try table.get("k");
+    try testing.expect(lookup == .value);
+    try testing.expectEqualSlices(u8, "k9", lookup.value);
+
+    // A seek lands on the newest entry, and the iterator then crosses into
+    // the second block and the third.
+    var it = table.iterator();
+    try it.seek("k");
+    try expectEntry(entries[1], try it.next());
+    try expectEntry(entries[2], try it.next());
+    try expectEntry(entries[3], try it.next());
+    try expectEntry(entries[4], try it.next());
+    try testing.expect(try it.next() == null);
+
+    // A key between "k" and "m" is absent, and a seek to it skips every
+    // entry for "k".
+    try testing.expect(try table.get("l") == .absent);
+    try it.seek("l");
+    try expectEntry(entries[4], try it.next());
+    try testing.expect(try it.next() == null);
+}
+
+test "entries for one key that fill a block and go on in the next are all found" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two entries fill a block, so the blocks hold "a" and "b", then the two
+    // newest entries for "k", then the oldest entry for "k" and "m". The
+    // first two blocks both end with an entry for "k".
+    const entries = [_]Entry{
+        .{ .key = "a", .value = "a3", .sequence = 3 },
+        .{ .key = "b", .value = "b4", .sequence = 4 },
+        .{ .key = "k", .value = "k9", .sequence = 9 },
+        .{ .key = "k", .value = "k6", .sequence = 6 },
+        .{ .key = "k", .value = "k2", .sequence = 2 },
+        .{ .key = "m", .value = "m5", .sequence = 5 },
+    };
+    _ = try writeTable(tmp.dir, .{ .block_size = pair_block_len }, &entries);
+    try expectTable(tmp.dir, &entries);
+
+    var table: TestReader = try .open(tmp.dir);
+    defer table.close();
+    try testing.expectEqual(@as(usize, 3), table.reader.blockCount());
+
+    const lookup = try table.get("k");
+    try testing.expect(lookup == .value);
+    try testing.expectEqualSlices(u8, "k9", lookup.value);
+
+    var it = table.iterator();
+    try it.seek("k");
+    try expectEntry(entries[2], try it.next());
+    try expectEntry(entries[3], try it.next());
+    try expectEntry(entries[4], try it.next());
+    try expectEntry(entries[5], try it.next());
+    try testing.expect(try it.next() == null);
+}
+
+test "a table that holds only entries for one key, in two blocks, is read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Both data blocks end with an entry for "k", so the two index entries
+    // have the same key and differ only in their sequence numbers.
+    const entries = eightVersions("12345678");
+    const bytes = try eightTableBytes(tmp.dir, &entries);
+    defer testing.allocator.free(bytes);
+    try expectTable(tmp.dir, &entries);
+
+    var table: TestReader = try .open(tmp.dir);
+    defer table.close();
+    try testing.expectEqual(@as(usize, 2), table.reader.blockCount());
+
+    var it = table.iterator();
+    try it.seek("k");
+    try expectEntry(entries[0], try it.next());
+
+    try testing.expect(try table.get("j") == .absent);
+    try testing.expect(try table.get("l") == .absent);
+}
+
+test "the smallest and the largest sequence numbers are written and read back" {
+    const sequence_max = std.math.maxInt(u64);
+    const entries = [_]Entry{
+        .{ .key = "a", .value = "newest", .sequence = sequence_max },
+        .{ .key = "a", .value = "oldest", .sequence = 0 },
+        .{ .key = "b", .value = "zero", .sequence = 0 },
+        .{ .key = "c", .value = "max", .sequence = sequence_max },
+    };
+
+    // With the first block size every entry gets a block of its own, so
+    // each sequence number is also the one in an index entry. With the
+    // second, all four entries are in one block.
+    const block_sizes = [_]u32{ 48, block_size };
+    const block_counts = [_]usize{ 4, 1 };
+    for (block_sizes, block_counts) |table_block_size, block_count| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        _ = try writeTable(tmp.dir, .{ .block_size = table_block_size }, &entries);
+        try expectTable(tmp.dir, &entries);
+
+        var table: TestReader = try .open(tmp.dir);
+        defer table.close();
+        try testing.expectEqual(block_count, table.reader.blockCount());
+
+        // A search looks for the largest sequence number, so an entry that
+        // has that number must still be found.
+        const lookup_a = try table.get("a");
+        try testing.expect(lookup_a == .value);
+        try testing.expectEqualSlices(u8, "newest", lookup_a.value);
+
+        const lookup_c = try table.get("c");
+        try testing.expect(lookup_c == .value);
+        try testing.expectEqualSlices(u8, "max", lookup_c.value);
+
+        var it = table.iterator();
+        try it.seek("a");
+        try expectEntry(entries[0], try it.next());
+        try expectEntry(entries[1], try it.next());
+        try it.seek("c");
+        try expectEntry(entries[3], try it.next());
+        try testing.expect(try it.next() == null);
     }
-    return entries;
 }
 
 test "a block that fills its buffer exactly is written correctly" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Each entry takes 7 + 1 + 8 bytes and a 4-byte slot, so four of them
-    // and the 20-byte block header come to exactly 100 bytes. The writer's
-    // block buffer is also 100 bytes, so it has no free space left when the
+    // Each entry takes 15 + 1 + 8 bytes and a 4-byte slot, so four of them
+    // and the 20-byte block header come to exactly 132 bytes. The writer's
+    // block buffer is also 132 bytes, so it has no free space left when the
     // block is finished.
+    try testing.expectEqual(@as(usize, 132), eight_data_block_len);
     const entries = eightEntries("12345678", 8);
-    _ = try writeTable(tmp.dir, .{ .block_size = 100 }, &entries);
+    _ = try writeTable(tmp.dir, .{ .block_size = eight_data_block_len }, &entries);
     try expectTable(tmp.dir, &entries);
 
     var table: TestReader = try .open(tmp.dir);
     defer table.close();
     try testing.expectEqual(@as(usize, 2), table.reader.blockCount());
-    try testing.expectEqual(@as(usize, 100), table.reader.blockSizeMax());
+    try testing.expectEqual(@as(usize, eight_data_block_len), table.reader.blockSizeMax());
 }
 
 test "a block that nearly fills its buffer is written correctly" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Four entries make a block of 96 bytes in a buffer of 100. The free
+    // The values are one byte shorter than the block size is made for, so
+    // four entries make a block of 128 bytes in a buffer of 132. The free
     // space is 4 bytes and the slots take 16, so the slots overlap their own
     // destination when they are moved.
     const entries = eightEntries("1234567", 7);
-    _ = try writeTable(tmp.dir, .{ .block_size = 100 }, &entries);
+    _ = try writeTable(tmp.dir, .{ .block_size = eight_data_block_len }, &entries);
     try expectTable(tmp.dir, &entries);
 
     var table: TestReader = try .open(tmp.dir);
     defer table.close();
     try testing.expectEqual(@as(usize, 2), table.reader.blockCount());
-    try testing.expectEqual(@as(usize, 96), table.reader.blockSizeMax());
+    try testing.expectEqual(@as(usize, eight_data_block_len - 4), table.reader.blockSizeMax());
 }
 
 test "an entry that would take a block one byte past the block size starts a new block" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Three entries of 7 + 1 + 8 bytes, their slots and the 20-byte block
-    // header come to 80 bytes. The fourth entry is one byte longer: it takes
-    // 17 bytes and a 4-byte slot, which would make the block 101 bytes.
+    // Three entries of 15 + 1 + 8 bytes, their slots and the 20-byte block
+    // header come to 104 bytes. A fourth entry like them would fill the
+    // block exactly, to 132 bytes. But the fourth entry is one byte longer:
+    // it takes 25 bytes and a 4-byte slot, which would make the block 133
+    // bytes.
     const entries = [_]Entry{
-        .{ .key = "a", .value = "12345678" },
-        .{ .key = "b", .value = "12345678" },
-        .{ .key = "c", .value = "12345678" },
-        .{ .key = "d", .value = "123456789" },
+        .{ .key = "a", .value = "12345678", .sequence = 1 },
+        .{ .key = "b", .value = "12345678", .sequence = 2 },
+        .{ .key = "c", .value = "12345678", .sequence = 3 },
+        .{ .key = "d", .value = "123456789", .sequence = 4 },
     };
-    _ = try writeTable(tmp.dir, .{ .block_size = 100 }, &entries);
+    _ = try writeTable(tmp.dir, .{ .block_size = eight_data_block_len }, &entries);
     try expectTable(tmp.dir, &entries);
 
     var table: TestReader = try .open(tmp.dir);
     defer table.close();
     try testing.expectEqual(@as(usize, 2), table.reader.blockCount());
-    try testing.expectEqual(@as(usize, 80), table.reader.blockSizeMax());
+    const three_entry_block_len = block_header_size + 3 * (entrySize(1, 8) + slot_size);
+    try testing.expectEqual(@as(usize, three_entry_block_len), table.reader.blockSizeMax());
 }
 
 test "an entry larger than a block gets a block to itself" {
@@ -1782,9 +2185,9 @@ test "an entry larger than a block gets a block to itself" {
 
     const large_value: [1000]u8 = @splat('x');
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
-        .{ .key = "b", .value = &large_value },
-        .{ .key = "c", .value = "3" },
+        .{ .key = "a", .value = "1", .sequence = 1 },
+        .{ .key = "b", .value = &large_value, .sequence = 2 },
+        .{ .key = "c", .value = "3", .sequence = 3 },
     };
     _ = try writeTable(tmp.dir, .{ .block_size = 64 }, &entries);
     try expectTable(tmp.dir, &entries);
@@ -1800,14 +2203,16 @@ test "seek positions the cursor at the first key at or after the target" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A block size of 40 gives every entry a block of its own, so these
-    // seeks also cross from one block to the next.
+    // An entry takes 15 + 1 + 1 bytes and a 4-byte slot, so a block with one
+    // entry is 41 bytes and a second entry would make it 62. A block size of
+    // 48 therefore gives every entry a block of its own, so these seeks also
+    // cross from one block to the next.
     const entries = [_]Entry{
-        .{ .key = "b", .value = "1" },
-        .{ .key = "d", .value = "2" },
-        .{ .key = "f", .value = "3" },
+        .{ .key = "b", .value = "1", .sequence = 1 },
+        .{ .key = "d", .value = "2", .sequence = 2 },
+        .{ .key = "f", .value = "3", .sequence = 3 },
     };
-    _ = try writeTable(tmp.dir, .{ .block_size = 40 }, &entries);
+    _ = try writeTable(tmp.dir, .{ .block_size = 48 }, &entries);
 
     var table: TestReader = try .open(tmp.dir);
     defer table.close();
@@ -1850,16 +2255,18 @@ test "two iterators and get do not disturb each other" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // A block size of 48 gives every entry a block of its own.
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
-        .{ .key = "b", .value = "2" },
-        .{ .key = "c", .value = "3" },
-        .{ .key = "d", .value = "4" },
+        .{ .key = "a", .value = "1", .sequence = 1 },
+        .{ .key = "b", .value = "2", .sequence = 2 },
+        .{ .key = "c", .value = "3", .sequence = 3 },
+        .{ .key = "d", .value = "4", .sequence = 4 },
     };
-    _ = try writeTable(tmp.dir, .{ .block_size = 40 }, &entries);
+    _ = try writeTable(tmp.dir, .{ .block_size = 48 }, &entries);
 
     var table: TestReader = try .open(tmp.dir);
     defer table.close();
+    try testing.expectEqual(@as(usize, 4), table.reader.blockCount());
 
     const second_buffer = try testing.allocator.alloc(u8, table.reader.blockSizeMax());
     defer testing.allocator.free(second_buffer);
@@ -1894,9 +2301,9 @@ test "next keeps failing at a damaged block, and carries on once the block is wh
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Two blocks of exactly 100 bytes, four entries each.
+    // Two blocks that are exactly full, four entries each.
     const entries = eightEntries("12345678", 8);
-    _ = try writeTable(tmp.dir, .{ .block_size = 100 }, &entries);
+    _ = try writeTable(tmp.dir, .{ .block_size = eight_data_block_len }, &entries);
     const original = try readWholeFile(tmp.dir);
     defer testing.allocator.free(original);
 
@@ -1910,9 +2317,8 @@ test "next keeps failing at a damaged block, and carries on once the block is wh
     }
 
     // Damage one value byte of the first entry of the second block. The
-    // block starts at byte 100, and the value follows the block header, the
-    // entry header and the one-byte key.
-    const damage_offset = 100 + block_header_size + entry_header_size + 1 + 2;
+    // value follows the entry's one-byte key.
+    const damage_offset = eightTableKeyOffset(1, 0) + 1 + 2;
     try writeByte(tmp.dir, damage_offset, ~original[damage_offset]);
 
     try testing.expectError(error.Corrupt, it.next());
@@ -1932,9 +2338,9 @@ test "after a failed seek the cursor is at the end of the table" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Two blocks of exactly 100 bytes, four entries each.
+    // Two blocks that are exactly full, four entries each.
     const entries = eightEntries("12345678", 8);
-    _ = try writeTable(tmp.dir, .{ .block_size = 100 }, &entries);
+    _ = try writeTable(tmp.dir, .{ .block_size = eight_data_block_len }, &entries);
     const original = try readWholeFile(tmp.dir);
     defer testing.allocator.free(original);
 
@@ -1946,8 +2352,9 @@ test "after a failed seek the cursor is at the end of the table" {
     try expectEntry(entries[0], try it.next());
     try expectEntry(entries[1], try it.next());
 
-    // Damage one value byte of the first entry of the second block.
-    const damage_offset = 100 + block_header_size + entry_header_size + 1 + 2;
+    // Damage one value byte of the first entry of the second block. The
+    // value follows the entry's one-byte key.
+    const damage_offset = eightTableKeyOffset(1, 0) + 1 + 2;
     try writeByte(tmp.dir, damage_offset, ~original[damage_offset]);
 
     // "f" is in the second block. The cursor must not stay where it was,
@@ -1985,7 +2392,7 @@ test "a key and a value of exactly the longest size are accepted" {
     @memset(value, 'v');
 
     const entries = [_]Entry{
-        .{ .key = &key, .value = value },
+        .{ .key = &key, .value = value, .sequence = 1 },
     };
     _ = try writeTable(tmp.dir, .{}, &entries);
     try expectTable(tmp.dir, &entries);
@@ -2003,19 +2410,19 @@ test "an entry that does not fit in the block buffer is rejected and the writer 
     defer writer.close();
 
     // With a 64-byte buffer and a one-byte key, the largest value that fits
-    // is 32 bytes: 20 (block header) + 7 (entry header) + 1 + 32 + 4 (slot).
-    const too_large_value: [33]u8 = @splat('x');
-    const largest_value: [32]u8 = @splat('y');
+    // is 24 bytes: 20 (block header) + 15 (entry header) + 1 + 24 + 4 (slot).
+    const too_large_value: [25]u8 = @splat('x');
+    const largest_value: [24]u8 = @splat('y');
 
     // The rejected entry arrives while a block is partly filled.
-    try writer.add("a", "1");
-    try testing.expectError(error.EntryTooLarge, writer.add("b", &too_large_value));
-    try writer.add("c", &largest_value);
+    try writer.add("a", "1", 1);
+    try testing.expectError(error.EntryTooLarge, writer.add("b", &too_large_value, 2));
+    try writer.add("c", &largest_value, 3);
     _ = try writer.finish();
 
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
-        .{ .key = "c", .value = &largest_value },
+        .{ .key = "a", .value = "1", .sequence = 1 },
+        .{ .key = "c", .value = &largest_value, .sequence = 3 },
     };
     try expectTable(tmp.dir, &entries);
 }
@@ -2024,25 +2431,26 @@ test "a full index rejects an entry that would start a new block" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A block size of 40 gives every entry a block of its own. An index
-    // entry for a one-byte key takes 28 bytes with its slot, so this index
-    // buffer has room for exactly two data blocks.
-    var block_buffer: [40]u8 = undefined;
+    // A block size of 48 gives every entry a block of its own: a block with
+    // one of these entries is 41 bytes, and a second would make it 62. The
+    // index buffer has room for exactly two data blocks whose last keys are
+    // one byte long.
+    var block_buffer: [48]u8 = undefined;
     var index_buffer: [indexSizeMax(2, 1)]u8 = undefined;
     const buffers: Writer.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
-    const options: Options = .{ .block_size = 40 };
+    const options: Options = .{ .block_size = 48 };
     var writer: Writer = try .create(testing.io, tmp.dir, test_name, options, buffers);
     defer writer.close();
 
-    try writer.add("a", "1");
-    try writer.add("b", "2");
+    try writer.add("a", "1", 1);
+    try writer.add("b", "2", 2);
     // Adding this would close the second block and start a third.
-    try testing.expectError(error.TableFull, writer.add("c", "3"));
+    try testing.expectError(error.TableFull, writer.add("c", "3", 3));
     _ = try writer.finish();
 
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
-        .{ .key = "b", .value = "2" },
+        .{ .key = "a", .value = "1", .sequence = 1 },
+        .{ .key = "b", .value = "2", .sequence = 2 },
     };
     try expectTable(tmp.dir, &entries);
 }
@@ -2060,16 +2468,16 @@ test "a full index rejects an entry whose key would not fit in it" {
     var writer: Writer = try .create(testing.io, tmp.dir, test_name, options, buffers);
     defer writer.close();
 
-    try writer.add("a", "1");
+    try writer.add("a", "1", 1);
     // This would go into the same block, but the block's last key would then
     // be two bytes long.
-    try testing.expectError(error.TableFull, writer.add("bb", "2"));
-    try writer.add("c", "3");
+    try testing.expectError(error.TableFull, writer.add("bb", "2", 2));
+    try writer.add("c", "3", 3);
     _ = try writer.finish();
 
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
-        .{ .key = "c", .value = "3" },
+        .{ .key = "a", .value = "1", .sequence = 1 },
+        .{ .key = "c", .value = "3", .sequence = 3 },
     };
     try expectTable(tmp.dir, &entries);
 }
@@ -2079,16 +2487,18 @@ test "open fails if the index does not fit in the buffer" {
     defer tmp.cleanup();
 
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
+        .{ .key = "a", .value = "1", .sequence = 1 },
     };
     _ = try writeTable(tmp.dir, .{}, &entries);
 
-    // The index block is 48 bytes: a header and one 28-byte entry.
-    var small_buffer: [47]u8 = undefined;
+    // The index block is a header and one entry for a one-byte key.
+    const index_block_len = comptime indexSizeMax(1, 1);
+
+    var small_buffer: [index_block_len - 1]u8 = undefined;
     const result = Reader.open(testing.io, tmp.dir, test_name, &small_buffer);
     try testing.expectError(error.IndexTooLarge, result);
 
-    var exact_buffer: [48]u8 = undefined;
+    var exact_buffer: [index_block_len]u8 = undefined;
     var reader: Reader = try .open(testing.io, tmp.dir, test_name, &exact_buffer);
     reader.close();
 }
@@ -2105,19 +2515,22 @@ test "blockCountMax covers a table whose blocks are each just over half full" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Each entry takes 7 + 2 + 28 bytes and a 4-byte slot: 41 bytes. With a
+    // Each entry takes 15 + 2 + 20 bytes and a 4-byte slot: 41 bytes. With a
     // block size of 100, a block has 80 bytes for entries, so one entry
     // leaves room for 39 more bytes and the next entry does not fit. Every
     // entry gets a block of its own, which is the most blocks a table of
     // this size can have.
     const options: Options = .{ .block_size = 100 };
     const keys = "00010203040506070809101112131415161718192021222324252627282930313233343536373839";
-    const value: [28]u8 = @splat('v');
+    const value: [20]u8 = @splat('v');
     var entries: [40]Entry = undefined;
     for (&entries, 0..) |*entry, i| {
         entry.key = keys[i * 2 ..][0..2];
         entry.value = &value;
+        entry.sequence = i + 1;
     }
+    const entry_size_with_slot = entrySize(2, value.len) + slot_size;
+    try testing.expectEqual(@as(usize, 41), entry_size_with_slot);
     _ = try writeTable(tmp.dir, options, &entries);
 
     var table: TestReader = try .open(tmp.dir);
@@ -2125,7 +2538,7 @@ test "blockCountMax covers a table whose blocks are each just over half full" {
     try testing.expectEqual(@as(usize, 40), table.reader.blockCount());
 
     // 40 entries of 41 bytes are 1640 bytes: 2 * 1640 / 80 + 1.
-    const entries_size = entries.len * 41;
+    const entries_size = entries.len * entry_size_with_slot;
     try testing.expectEqual(@as(usize, 42), blockCountMax(options, entries_size));
     try testing.expect(table.reader.blockCount() <= blockCountMax(options, entries_size));
 }
@@ -2134,14 +2547,14 @@ test "indexSizeMax is a block header and one largest index entry for each data b
     // With no data blocks the index block is only its 20-byte header.
     try testing.expectEqual(@as(usize, 20), indexSizeMax(0, 10));
 
-    // An index entry for a one-byte key takes 7 (entry header) + 1 (key) +
-    // 16 (block location) + 4 (slot) = 28 bytes. Three of them and the
-    // header come to 20 + 3 * 28 = 104 bytes.
-    try testing.expectEqual(@as(usize, 104), indexSizeMax(3, 1));
+    // An index entry for a one-byte key takes 15 (entry header) + 1 (key) +
+    // 16 (block location) + 4 (slot) = 36 bytes. Three of them and the
+    // header come to 20 + 3 * 36 = 128 bytes.
+    try testing.expectEqual(@as(usize, 128), indexSizeMax(3, 1));
 
-    // For a ten-byte key the entry takes 7 + 10 + 16 + 4 = 37 bytes. Two of
-    // them and the header come to 20 + 2 * 37 = 94 bytes.
-    try testing.expectEqual(@as(usize, 94), indexSizeMax(2, 10));
+    // For a ten-byte key the entry takes 15 + 10 + 16 + 4 = 45 bytes. Two of
+    // them and the header come to 20 + 2 * 45 = 110 bytes.
+    try testing.expectEqual(@as(usize, 110), indexSizeMax(2, 10));
 }
 
 test "an index buffer of indexSizeMax is exactly enough when every entry gets its own block" {
@@ -2149,29 +2562,29 @@ test "an index buffer of indexSizeMax is exactly enough when every entry gets it
     defer tmp.cleanup();
 
     // Every key has the longest length, 3 bytes, so the index buffer has no
-    // byte to spare. An entry takes 7 + 3 + 1 bytes and a 4-byte slot, so a
-    // block with one entry is 35 bytes and a second entry would make it 50.
-    // A block size of 40 therefore gives every entry a block of its own.
+    // byte to spare. An entry takes 15 + 3 + 1 bytes and a 4-byte slot, so a
+    // block with one entry is 43 bytes and a second entry would make it 66.
+    // A block size of 48 therefore gives every entry a block of its own.
     const entries = [_]Entry{
-        .{ .key = "aaa", .value = "1" },
-        .{ .key = "bbb", .value = "2" },
-        .{ .key = "ccc", .value = "3" },
+        .{ .key = "aaa", .value = "1", .sequence = 1 },
+        .{ .key = "bbb", .value = "2", .sequence = 2 },
+        .{ .key = "ccc", .value = "3", .sequence = 3 },
     };
     const index_size = indexSizeMax(entries.len, 3);
     const index_buffer = try testing.allocator.alloc(u8, index_size);
     defer testing.allocator.free(index_buffer);
 
-    var block_buffer: [40]u8 = undefined;
+    var block_buffer: [48]u8 = undefined;
     const buffers: Writer.Buffers = .{ .block = &block_buffer, .index = index_buffer };
-    const options: Options = .{ .block_size = 40 };
+    const options: Options = .{ .block_size = 48 };
     var writer: Writer = try .create(testing.io, tmp.dir, test_name, options, buffers);
     defer writer.close();
 
     for (entries) |entry| {
-        try writer.add(entry.key, entry.value);
+        try writer.add(entry.key, entry.value, entry.sequence);
     }
     // The index buffer is full now: a fourth data block does not fit.
-    try testing.expectError(error.TableFull, writer.add("ddd", "4"));
+    try testing.expectError(error.TableFull, writer.add("ddd", "4", 4));
     _ = try writer.finish();
 
     try expectTable(tmp.dir, &entries);
@@ -2186,8 +2599,18 @@ test "an index buffer of indexSizeMax is exactly enough when every entry gets it
 
 const key_alphabet = "ab\x00\xff";
 
-fn entryKeyLessThan(_: void, a: Entry, b: Entry) bool {
-    return std.mem.order(u8, a.key, b.key) == .lt;
+/// Whether `a` comes before `b` in a table: its key is smaller, or the keys
+/// are the same and its sequence number is larger. This is the model's own
+/// statement of the order, and does not use the table's.
+fn modelSortsBefore(_: void, a: Entry, b: Entry) bool {
+    const key_order = std.mem.order(u8, a.key, b.key);
+    if (key_order == .lt) {
+        return true;
+    }
+    if (key_order == .gt) {
+        return false;
+    }
+    return a.sequence > b.sequence;
 }
 
 /// A random key. A small alphabet makes shared prefixes common.
@@ -2228,35 +2651,57 @@ fn randomValue(arena: std.mem.Allocator, random: std.Random, entry_number: usize
     return value;
 }
 
-/// Builds a sorted list of random entries with no key twice. It can hold
-/// fewer than `count` entries. Everything is allocated from `arena`.
+/// The key of model entry number `entry_number`, given the entries made
+/// before it. One time in three it is the key of an earlier entry, so that
+/// the model holds several entries for many of its keys. Otherwise it is a
+/// new random key.
+fn modelKey(
+    arena: std.mem.Allocator,
+    random: std.Random,
+    earlier_entries: []const Entry,
+    entry_number: usize,
+) ![]const u8 {
+    var reuses_a_key = false;
+    if (earlier_entries.len > 0) {
+        reuses_a_key = random.uintLessThan(u8, 3) == 0;
+    }
+    if (reuses_a_key) {
+        const earlier_number = random.uintLessThan(usize, earlier_entries.len);
+        return earlier_entries[earlier_number].key;
+    }
+    return try randomKey(arena, random, entry_number);
+}
+
+/// Builds a list of `count` random entries in the table's order: by key,
+/// and for one key from the largest sequence number to the smallest. Many
+/// keys have several entries. Every entry has a different sequence number.
+/// Everything is allocated from `arena`.
 fn makeModel(arena: std.mem.Allocator, seed: u64, count: usize) ![]Entry {
     var prng: std.Random.DefaultPrng = .init(seed);
     const random = prng.random();
 
+    // Every sequence number from 1 to `count`, in a random order, so that
+    // the order in which the entries for a key are made says nothing about
+    // which of them is the newest.
+    const sequences = try arena.alloc(u64, count);
+    for (sequences, 1..) |*sequence, number| {
+        sequence.* = number;
+    }
+    random.shuffle(u64, sequences);
+
     const entries = try arena.alloc(Entry, count);
     for (entries, 0..) |*entry, entry_number| {
-        entry.key = try randomKey(arena, random, entry_number);
+        const earlier_entries = entries[0..entry_number];
+        entry.key = try modelKey(arena, random, earlier_entries, entry_number);
         entry.value = try randomValue(arena, random, entry_number);
+        entry.sequence = sequences[entry_number];
     }
-    std.mem.sort(Entry, entries, {}, entryKeyLessThan);
-
-    // Remove duplicate keys, keeping the first of each.
-    var kept: usize = 0;
-    for (entries) |entry| {
-        var is_duplicate = false;
-        if (kept > 0) {
-            is_duplicate = std.mem.eql(u8, entries[kept - 1].key, entry.key);
-        }
-        if (!is_duplicate) {
-            entries[kept] = entry;
-            kept += 1;
-        }
-    }
-    return entries[0..kept];
+    std.mem.sort(Entry, entries, {}, modelSortsBefore);
+    return entries;
 }
 
-/// Returns the number of the first model entry whose key is >= `key`.
+/// Returns the number of the first model entry whose key is >= `key`. When
+/// the model has entries for `key`, that is the newest of them.
 fn modelLowerBound(model: []const Entry, key: []const u8) usize {
     var low: usize = 0;
     var high: usize = model.len;
@@ -2321,6 +2766,8 @@ fn expectProbes(dir: Io.Dir, model: []const Entry, seed: u64) !void {
             is_present = std.mem.eql(u8, model[model_index].key, probe);
         }
 
+        // A lookup finds the newest entry for the key, which is the first
+        // of the model's entries for it.
         const lookup = try table.get(probe);
         if (is_present) {
             try expectLookup(model[model_index], lookup);
@@ -2328,7 +2775,8 @@ fn expectProbes(dir: Io.Dir, model: []const Entry, seed: u64) !void {
             try testing.expect(lookup == .absent);
         }
 
-        // The three entries after a seek must be the next three of the model.
+        // The three entries after a seek must be the next three of the
+        // model, older entries for the same key included.
         try it.seek(probe);
         var offset: usize = 0;
         while (offset < 3) {
@@ -2341,6 +2789,22 @@ fn expectProbes(dir: Io.Dir, model: []const Entry, seed: u64) !void {
             offset += 1;
         }
     }
+}
+
+/// How many model entries have the same key as the entry before them. Each
+/// one is an older entry for a key that has a newer one.
+fn modelOlderEntryCount(model: []const Entry) usize {
+    var count: usize = 0;
+    var entry_number: usize = 1;
+    while (entry_number < model.len) {
+        const previous = model[entry_number - 1];
+        const entry = model[entry_number];
+        if (std.mem.eql(u8, previous.key, entry.key)) {
+            count += 1;
+        }
+        entry_number += 1;
+    }
+    return count;
 }
 
 test "random tables match a model" {
@@ -2356,6 +2820,13 @@ test "random tables match a model" {
 
             const seed = 1000 * @as(u64, model_block_size) + round;
             const model = try makeModel(arena_state.allocator(), seed, count);
+            try testing.expectEqual(count, model.len);
+            // The larger models must really hold several entries for some
+            // keys, or this test would not cover them.
+            if (count >= 300) {
+                try testing.expect(modelOlderEntryCount(model) >= count / 4);
+            }
+
             const summary = try writeTable(tmp.dir, .{ .block_size = model_block_size }, model);
             try testing.expectEqual(@as(u64, model.len), summary.entry_count);
 
@@ -2445,7 +2916,7 @@ test "bytes after the footer are detected" {
     defer tmp.cleanup();
 
     const entries = [_]Entry{
-        .{ .key = "a", .value = "1" },
+        .{ .key = "a", .value = "1", .sequence = 1 },
     };
     _ = try writeTable(tmp.dir, .{}, &entries);
 
@@ -2483,7 +2954,7 @@ test "a file that is only a footer is detected" {
     // even a block header.
     var footer = [_]u8{
         'b', 'e', 'a', 'n', 's', 's', 't', '1', // magic
-        1, 0, 0, 0, // version
+        2, 0, 0, 0, // version
         0, 0, 0, 0, 0, 0, 0, 0, // index block offset
         0, 0, 0, 0, // index block length
         0, 0, 0, 0, // index block header checksum
@@ -2580,12 +3051,23 @@ test "a table sealed by hand with nothing changed is still read" {
     try testing.expectEqualSlices(u8, small, small_sealed);
 
     const entries = eightEntries("12345678", 8);
-    const eight = try eightTableBytes(tmp.dir, "12345678");
+    const eight = try eightTableBytes(tmp.dir, &entries);
     defer testing.allocator.free(eight);
     const eight_sealed = try testing.allocator.dupe(u8, eight);
     defer testing.allocator.free(eight_sealed);
     sealTable(eight_sealed, eight_table_layout);
     try testing.expectEqualSlices(u8, eight, eight_sealed);
+
+    // The offset helpers find the entries: the last entry of the first
+    // block is "d", numbered 4, and the first index entry names it.
+    const last_entry_offset = eightTableEntryOffset(0, 3);
+    const last_key_offset = eightTableKeyOffset(0, 3);
+    try testing.expectEqual(@as(u8, 'd'), eight[last_key_offset]);
+    try testing.expectEqual(@as(u64, 4), readEntrySequence(eight, last_entry_offset));
+    const index_entry_offset = eightTableIndexEntryOffset(0);
+    const index_key_offset = eightTableIndexKeyOffset(0);
+    try testing.expectEqual(@as(u8, 'd'), eight[index_key_offset]);
+    try testing.expectEqual(@as(u64, 4), readEntrySequence(eight, index_entry_offset));
 
     // A change that keeps the structure whole is read back: the value of
     // "a" is the 8 bytes after its key.
@@ -2609,9 +3091,11 @@ test "a gap before a data block is detected" {
     const bytes = try smallTableBytes(tmp.dir);
     defer testing.allocator.free(bytes);
 
-    // The index entry is a 7-byte header, the key "b", and then the block
+    // The index entry is an entry header, the key "b", and then the block
     // location, which starts with the block's offset. It becomes 1.
-    const block_offset_bytes = bytes[small_index_body_start + 8 ..][0..8];
+    const block_location_start = small_index_body_start + entry_header_size + 1;
+    const block_offset_bytes = bytes[block_location_start..][0..8];
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, block_offset_bytes, .little));
     std.mem.writeInt(u64, block_offset_bytes, 1, .little);
     sealTable(bytes, small_table_layout);
     try writeWholeFile(tmp.dir, bytes);
@@ -2627,12 +3111,16 @@ test "data blocks that stop short of the index are detected" {
     defer testing.allocator.free(bytes);
 
     // The block's length follows its 8-byte offset in the block location.
-    // The index now says the data block is 44 bytes, and the footer agrees
-    // that 44 is the largest block, but the index block starts at byte 45.
-    const block_len_bytes = bytes[small_index_body_start + 16 ..][0..4];
-    std.mem.writeInt(u32, block_len_bytes, 44, .little);
+    // The index now says the data block is one byte shorter than it is, and
+    // the footer agrees that this is the largest block, but the index block
+    // starts one byte after the place where such a data block would end.
+    const block_location_start = small_index_body_start + entry_header_size + 1;
+    const block_len_bytes = bytes[block_location_start + 8 ..][0..4];
+    const block_len = std.mem.readInt(u32, block_len_bytes, .little);
+    try testing.expectEqual(@as(u32, small_data_block_len), block_len);
+    std.mem.writeInt(u32, block_len_bytes, small_data_block_len - 1, .little);
     const block_len_max_bytes = bytes[small_footer_start + 28 ..][0..4];
-    std.mem.writeInt(u32, block_len_max_bytes, 44, .little);
+    std.mem.writeInt(u32, block_len_max_bytes, small_data_block_len - 1, .little);
     sealTable(bytes, small_table_layout);
     try writeWholeFile(tmp.dir, bytes);
 
@@ -2643,14 +3131,16 @@ test "a footer whose largest block length is not the longest block is detected" 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The only data block is 45 bytes long. The largest block length is
-    // bytes 28 to 32 of the footer.
-    const lengths = [_]u32{ 44, 46, 0, 1 << 20 };
+    // The only data block is `small_data_block_len` bytes long. The largest
+    // block length is bytes 28 to 32 of the footer.
+    const lengths = [_]u32{ small_data_block_len - 1, small_data_block_len + 1, 0, 1 << 20 };
     for (lengths) |block_len_max| {
         const bytes = try smallTableBytes(tmp.dir);
         defer testing.allocator.free(bytes);
 
         const block_len_max_bytes = bytes[small_footer_start + 28 ..][0..4];
+        const block_len_max_before = std.mem.readInt(u32, block_len_max_bytes, .little);
+        try testing.expectEqual(@as(u32, small_data_block_len), block_len_max_before);
         std.mem.writeInt(u32, block_len_max_bytes, block_len_max, .little);
         sealTable(bytes, small_table_layout);
         try writeWholeFile(tmp.dir, bytes);
@@ -2669,10 +3159,12 @@ test "an index entry that is not a block location is detected" {
     const bytes = try smallTableBytes(tmp.dir);
     defer testing.allocator.free(bytes);
 
-    // The index entry's header is flags (1 byte), key length (2 bytes) and
-    // value length (4 bytes). The key grows from 1 byte to 2 and the value
-    // shrinks from 16 bytes to 15, so the entry is as long as it was but
-    // its value is no longer a block location.
+    // The index entry's header starts with flags (1 byte), key length (2
+    // bytes) and value length (4 bytes). The key grows from 1 byte to 2 and
+    // the value shrinks from 16 bytes to 15, so the entry is as long as it
+    // was but its value is no longer a block location.
+    try testing.expectEqual(@as(u8, 1), bytes[small_index_body_start + 1]);
+    try testing.expectEqual(@as(u8, 16), bytes[small_index_body_start + 3]);
     bytes[small_index_body_start + 1] = 2;
     bytes[small_index_body_start + 3] = 15;
     sealTable(bytes, small_table_layout);
@@ -2685,11 +3177,14 @@ test "index keys that do not increase are detected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The index keys are "d" and "h". Neither two equal keys nor a first
-    // key after the second is allowed.
+    // The index entries are "d", numbered 4, and "h", numbered 8. A first
+    // key after the second is not allowed. Two equal keys are allowed only
+    // when the first has the larger sequence number, and here it has the
+    // smaller one.
     const first_keys = [_]u8{ 'h', 'z' };
     for (first_keys) |first_key| {
-        const bytes = try eightTableBytes(tmp.dir, "12345678");
+        const entries = eightEntries("12345678", 8);
+        const bytes = try eightTableBytes(tmp.dir, &entries);
         defer testing.allocator.free(bytes);
 
         const key_offset = eightTableIndexKeyOffset(0);
@@ -2705,11 +3200,44 @@ test "index keys that do not increase are detected" {
     }
 }
 
+test "index entries for one key whose sequence numbers do not decrease are detected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Every entry is for "k", so the index entries are "k" numbered 5 and
+    // "k" numbered 1, and only the sequence numbers put them in order. The
+    // first must have the larger one. Neither two equal numbers nor a
+    // smaller number first is allowed.
+    const first_sequences = [_]u64{ 1, 0 };
+    for (first_sequences) |first_sequence| {
+        const entries = eightVersions("12345678");
+        const bytes = try eightTableBytes(tmp.dir, &entries);
+        defer testing.allocator.free(bytes);
+
+        const first_index_entry = eightTableIndexEntryOffset(0);
+        const second_index_entry = eightTableIndexEntryOffset(1);
+        try testing.expectEqual(@as(u64, 5), readEntrySequence(bytes, first_index_entry));
+        try testing.expectEqual(@as(u64, 1), readEntrySequence(bytes, second_index_entry));
+        writeEntrySequence(bytes, first_index_entry, first_sequence);
+        sealTable(bytes, eight_table_layout);
+        try writeWholeFile(tmp.dir, bytes);
+
+        expectOpenCorrupt(tmp.dir) catch |err| {
+            std.debug.print(
+                "the index sequence numbers {d}, 1 for one key went unnoticed\n",
+                .{first_sequence},
+            );
+            return err;
+        };
+    }
+}
+
 test "a data block whose last key is not its index key is detected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const bytes = try eightTableBytes(tmp.dir, "12345678");
+    const entries = eightEntries("12345678", 8);
+    const bytes = try eightTableBytes(tmp.dir, &entries);
     defer testing.allocator.free(bytes);
 
     // The last key of the second block becomes "i". The block's keys still
@@ -2728,6 +3256,39 @@ test "a data block whose last key is not its index key is detected" {
     try testing.expectError(error.Corrupt, table.get("h"));
     // The first block is not affected.
     try testing.expect(try table.get("a") == .value);
+}
+
+test "a data block whose last entry has its index key but another sequence number is detected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The last entry of the second block is "h", numbered 8, and the index
+    // says so. Its number becomes one more or one less. The block still ends
+    // with the key "h", so only the sequence number in the index entry can
+    // tell that this is not the entry the index names.
+    const last_sequences = [_]u64{ 9, 7 };
+    for (last_sequences) |last_sequence| {
+        const entries = eightEntries("12345678", 8);
+        const bytes = try eightTableBytes(tmp.dir, &entries);
+        defer testing.allocator.free(bytes);
+
+        const entry_offset = eightTableEntryOffset(1, 3);
+        const key_offset = eightTableKeyOffset(1, 3);
+        try testing.expectEqual(@as(u8, 'h'), bytes[key_offset]);
+        try testing.expectEqual(@as(u64, 8), readEntrySequence(bytes, entry_offset));
+        writeEntrySequence(bytes, entry_offset, last_sequence);
+        sealTable(bytes, eight_table_layout);
+        try writeWholeFile(tmp.dir, bytes);
+
+        try testing.expectError(error.Corrupt, scanTable(tmp.dir));
+
+        var table: TestReader = try .open(tmp.dir);
+        defer table.close();
+        try testing.expectError(error.Corrupt, table.get("e"));
+        try testing.expectError(error.Corrupt, table.get("h"));
+        // The first block is not affected.
+        try testing.expect(try table.get("a") == .value);
+    }
 }
 
 test "an index key past its block's last key is detected" {
@@ -2759,14 +3320,23 @@ test "a data block that starts at or before the previous block's last key is det
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const bytes = try eightTableBytes(tmp.dir, "12345678");
+    const entries = eightEntries("12345678", 8);
+    const bytes = try eightTableBytes(tmp.dir, &entries);
     defer testing.allocator.free(bytes);
 
     // The first key of the second block becomes "d", which is also the last
-    // key of the first block. The second block's keys still increase and
-    // its last key is still "h".
+    // key of the first block. The second block's last key is still "h".
+    //
+    // Two blocks may share a key, but then the later block must hold the
+    // older entries. Here the first block ends with "d" numbered 4 and the
+    // second now starts with "d" numbered 5, a newer entry, so the second
+    // block starts before the place where the first one ends.
+    const entry_offset = eightTableEntryOffset(1, 0);
     const key_offset = eightTableKeyOffset(1, 0);
+    const previous_index_entry_offset = eightTableIndexEntryOffset(0);
     try testing.expectEqual(@as(u8, 'e'), bytes[key_offset]);
+    try testing.expectEqual(@as(u64, 5), readEntrySequence(bytes, entry_offset));
+    try testing.expectEqual(@as(u64, 4), readEntrySequence(bytes, previous_index_entry_offset));
     bytes[key_offset] = 'd';
     sealTable(bytes, eight_table_layout);
     try writeWholeFile(tmp.dir, bytes);
@@ -2778,11 +3348,57 @@ test "a data block that starts at or before the previous block's last key is det
     try testing.expectError(error.Corrupt, table.get("f"));
 }
 
+test "a data block that starts at or before the previous block's last entry by sequence number alone is detected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Every entry is for "k". The first block ends with the entry numbered
+    // 5, and the second block starts with the entry numbered 4. That number
+    // becomes 5, the same entry the first block ends with, or 6, a newer
+    // one. The keys cannot tell that anything is wrong, and the second
+    // block still ends with the entry its index entry names, numbered 1.
+    const first_sequences = [_]u64{ 5, 6 };
+    for (first_sequences) |first_sequence| {
+        const entries = eightVersions("12345678");
+        const bytes = try eightTableBytes(tmp.dir, &entries);
+        defer testing.allocator.free(bytes);
+
+        const entry_offset = eightTableEntryOffset(1, 0);
+        const previous_index_entry_offset = eightTableIndexEntryOffset(0);
+        try testing.expectEqual(@as(u64, 5), readEntrySequence(bytes, previous_index_entry_offset));
+        try testing.expectEqual(@as(u64, 4), readEntrySequence(bytes, entry_offset));
+        writeEntrySequence(bytes, entry_offset, first_sequence);
+        sealTable(bytes, eight_table_layout);
+        try writeWholeFile(tmp.dir, bytes);
+
+        testing.expectError(error.Corrupt, scanTable(tmp.dir)) catch |err| {
+            std.debug.print(
+                "a second block that starts with sequence number {d} went unnoticed\n",
+                .{first_sequence},
+            );
+            return err;
+        };
+
+        // A lookup of "k" reads only the first block, which is not affected.
+        var table: TestReader = try .open(tmp.dir);
+        defer table.close();
+        try testing.expect(try table.get("k") == .value);
+
+        // An iterator reads the first block and then fails at the second.
+        var it = table.iterator();
+        for (entries[0..4]) |expected| {
+            try expectEntry(expected, try it.next());
+        }
+        try testing.expectError(error.Corrupt, it.next());
+    }
+}
+
 test "a changed entry count in a block header is detected by the header checksum" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const bytes = try eightTableBytes(tmp.dir, "12345678");
+    const entries = eightEntries("12345678", 8);
+    const bytes = try eightTableBytes(tmp.dir, &entries);
     defer testing.allocator.free(bytes);
 
     // The first block's entry count, at bytes 12 to 16 of its header, goes
@@ -2793,12 +3409,18 @@ test "a changed entry count in a block header is detected by the header checksum
     try testing.expectEqual(@as(u8, 4), bytes[entry_count_offset]);
     bytes[entry_count_offset] = 3;
 
-    // The index is made to agree that the block ends with "c". The index
-    // block and the footer get new checksums, but the data block's header
-    // does not: only its header checksum can notice the changed count.
+    // The index is made to agree that the block ends with "c", numbered 3.
+    // The index block and the footer get new checksums, but the data
+    // block's header does not: only its header checksum can notice the
+    // changed count.
+    const index_entry_offset = eightTableIndexEntryOffset(0);
     const index_key_offset = eightTableIndexKeyOffset(0);
     try testing.expectEqual(@as(u8, 'd'), bytes[index_key_offset]);
+    try testing.expectEqual(@as(u64, 4), readEntrySequence(bytes, index_entry_offset));
+    const third_entry_offset = eightTableEntryOffset(0, 2);
+    try testing.expectEqual(@as(u64, 3), readEntrySequence(bytes, third_entry_offset));
     bytes[index_key_offset] = 'c';
+    writeEntrySequence(bytes, index_entry_offset, 3);
     sealIndexAndFooter(bytes, eight_table_layout);
     try writeWholeFile(tmp.dir, bytes);
 
@@ -2809,15 +3431,19 @@ test "a data block from another table with the same keys is detected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Two tables with the same keys and the same layout, but other values.
-    const other = try eightTableBytes(tmp.dir, "abcdefgh");
+    // Two tables with the same keys, the same sequence numbers and the same
+    // layout, but other values.
+    const other_entries = eightEntries("abcdefgh", 8);
+    const other = try eightTableBytes(tmp.dir, &other_entries);
     defer testing.allocator.free(other);
-    const bytes = try eightTableBytes(tmp.dir, "12345678");
+    const entries = eightEntries("12345678", 8);
+    const bytes = try eightTableBytes(tmp.dir, &entries);
     defer testing.allocator.free(bytes);
 
     // The first block of the other table passes its own checksums, has the
-    // right length and ends with the right key. Only the header checksum
-    // that the index holds for the block notices that it is the wrong one.
+    // right length and ends with the right key and sequence number. Only
+    // the header checksum that the index holds for the block notices that
+    // it is the wrong one.
     const first_block_len = eight_table_layout.data_block_len;
     @memcpy(bytes[0..first_block_len], other[0..first_block_len]);
     try writeWholeFile(tmp.dir, bytes);
@@ -2843,19 +3469,21 @@ test "a bad entry behind valid checksums is detected" {
     defer tmp.cleanup();
 
     // The data body starts at byte 20. The first entry is at bytes 20 to
-    // 29: flags (20), key length (21 and 22), value length (23 to 26), the
-    // key "a" and the value "1". The entries take 17 bytes in all. The slot
-    // of the first entry is the last four bytes of the body, bytes 41 to 45.
+    // 37: flags (20), key length (21 and 22), value length (23 to 26), the
+    // sequence number (27 to 34), the key "a" and the value "1". The entries
+    // take 33 bytes in all. The slot of the first entry is the last four
+    // bytes of the body, bytes 57 to 61.
     const first_entry = small_data_body_start;
-    const first_slot = 41;
+    const first_slot = small_data_block_len - slot_size;
     const changes = [_]ByteChange{
         .{ .what = "flags the format does not define", .offset = first_entry, .value = 2 },
         .{ .what = "a tombstone with a value length of 1", .offset = first_entry, .value = 1 },
         .{ .what = "a key length of 257", .offset = first_entry + 2, .value = 1 },
         .{ .what = "a value length of 257", .offset = first_entry + 4, .value = 1 },
         .{ .what = "a slot that points past the entries", .offset = first_slot, .value = 200 },
-        // An entry header takes 7 bytes, and only 5 are left after byte 12.
-        .{ .what = "a slot with no room for an entry header", .offset = first_slot, .value = 12 },
+        // An entry header takes 15 bytes, and only 13 of the 33 bytes of
+        // entries are left after byte 20.
+        .{ .what = "a slot with no room for an entry header", .offset = first_slot, .value = 20 },
     };
 
     for (changes) |change| {
@@ -2877,11 +3505,13 @@ test "a bad entry count behind valid checksums is detected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The data block's body is 25 bytes, so it has room for six slots at
+    // The data block's body is 41 bytes, so it has room for ten slots at
     // most. A data block is never empty, so a count of 0 is wrong too. The
     // last count is so large that four bytes for each slot would not fit in
     // 32 bits.
-    const entry_counts = [_]u32{ 0, 7, 0x4000_0000, 0xffff_ffff };
+    const body_len = small_data_block_len - block_header_size;
+    try testing.expectEqual(@as(usize, 10), body_len / slot_size);
+    const entry_counts = [_]u32{ 0, 11, 0x4000_0000, 0xffff_ffff };
     for (entry_counts) |entry_count| {
         const bytes = try smallTableBytes(tmp.dir);
         defer testing.allocator.free(bytes);

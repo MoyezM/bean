@@ -213,6 +213,12 @@ const Bench = struct {
     key_buffer: [key_size_max]u8,
     /// The value every put writes: `value_size` bytes of noise.
     value: []u8,
+    /// Holds each value the single-threaded lookups read. Long enough for
+    /// any value the store can hold, because the store in `--db` may have
+    /// been written with a larger `--value_size` than this run's.
+    read_buffer: []u8,
+    /// The memory the scans work in.
+    scan_buffers: kv.Store.IteratorBuffers,
 
     fn open(io: Io, gpa: std.mem.Allocator, config: Config) !Bench {
         var dir = try Io.Dir.cwd().createDirPathOpen(io, config.db, .{});
@@ -223,8 +229,13 @@ const Bench = struct {
         errdefer batch.deinit(gpa);
 
         const value = try gpa.alloc(u8, config.value_size);
+        errdefer gpa.free(value);
         var value_prng: std.Random.DefaultPrng = .init(config.seed);
         value_prng.random().bytes(value);
+
+        const read_buffer = try gpa.alloc(u8, value_size_max);
+        errdefer gpa.free(read_buffer);
+        const scan_buffers: kv.Store.IteratorBuffers = try .init(gpa);
 
         return .{
             .io = io,
@@ -236,6 +247,8 @@ const Bench = struct {
             .prng = .init(config.seed),
             .key_buffer = undefined,
             .value = value,
+            .read_buffer = read_buffer,
+            .scan_buffers = scan_buffers,
         };
     }
 
@@ -244,6 +257,8 @@ const Bench = struct {
         self.batch.deinit(self.gpa);
         self.dir.close(self.io);
         self.gpa.free(self.value);
+        self.gpa.free(self.read_buffer);
+        self.scan_buffers.deinit(self.gpa);
     }
 
     /// Replaces the store with a new, empty one in the same directory. If
@@ -460,7 +475,7 @@ const Bench = struct {
         const start_ns = nowNs(self.io);
         while (result.operations < self.config.readCount()) {
             const key = self.makeKey(self.randomKeyNumber());
-            const value = try self.store.get(key);
+            const value = try self.store.get(key, self.read_buffer);
             if (value != null) {
                 result.found.? += 1;
                 result.bytes += key.len + value.?.len;
@@ -622,7 +637,7 @@ const Bench = struct {
         var result: Result = .{ .operations = 0, .bytes = 0, .elapsed_ns = 0 };
 
         const start_ns = nowNs(self.io);
-        var entries = self.store.iterator();
+        var entries = self.store.iterator(&self.scan_buffers);
         while (result.operations < self.config.readCount()) {
             const entry = try entries.next();
             if (entry == null) {
@@ -639,7 +654,7 @@ const Bench = struct {
         var result: Result = .{ .operations = 0, .bytes = 0, .elapsed_ns = 0, .found = 0 };
 
         const start_ns = nowNs(self.io);
-        var entries = self.store.iterator();
+        var entries = self.store.iterator(&self.scan_buffers);
         while (result.operations < self.config.readCount()) {
             try entries.seek(self.makeKey(self.randomKeyNumber()));
 

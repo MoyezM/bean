@@ -27,9 +27,10 @@
 //! threads there are, the more operations share each sync.
 //!
 //! Threads can also read through the committer. The store cannot be read
-//! while it is written to, so readers share a lock that the leader holds
-//! alone for the whole time it writes a group, sync included. A read sees all
-//! of a group or none of it.
+//! while it is written to, and it reads a table through one buffer of its
+//! own, so a reader takes a lock alone, and the leader holds the same lock
+//! for the whole time it writes a group, sync included. A read sees all of a
+//! group or none of it.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -76,10 +77,7 @@ pub const GroupCommitter = struct {
         ValueTooLarge,
     } || kv.Store.WriteError;
 
-    pub const GetError = error{
-        /// The value is longer than the buffer given to `get`.
-        BufferTooSmall,
-    } || kv.Store.ReadError;
+    pub const GetError = kv.Store.GetError;
 
     /// Allocates the two batches. `gpa` is not retained. The committer must
     /// not be moved once a thread is using it, and `store` must outlive it.
@@ -139,25 +137,16 @@ pub const GroupCommitter = struct {
     /// Copies the value for `key` into `buffer` and returns the copy, or
     /// returns `null` if the key is not present. Safe to call from many
     /// threads at once, while other threads write. A read waits while a
-    /// group is being written.
+    /// group is being written, and while another read is in progress: the
+    /// store reads a table through one buffer of its own, so only one
+    /// thread may be in `Store.get` at a time.
     ///
-    /// The value is copied because the store's own bytes are only safe to
-    /// look at while readers hold the lock.
+    /// Reports `BufferTooSmall` if the value does not fit in `buffer`.
     pub fn get(self: *GroupCommitter, key: []const u8, buffer: []u8) GetError!?[]u8 {
-        self.readers.lockSharedUncancelable(self.io);
-        defer self.readers.unlockShared(self.io);
+        self.readers.lockUncancelable(self.io);
+        defer self.readers.unlock(self.io);
 
-        const found = try self.store.get(key);
-        if (found == null) {
-            return null;
-        }
-        const value = found.?;
-        if (value.len > buffer.len) {
-            return error.BufferTooSmall;
-        }
-        const copy = buffer[0..value.len];
-        @memcpy(copy, value);
-        return copy;
+        return self.store.get(key, buffer);
     }
 
     /// How many groups have been written without an error. Each one was one
@@ -278,8 +267,9 @@ test "one thread writes through the committer" {
     // With one thread there is nobody to share a sync with.
     try testing.expectEqual(@as(u64, 3), committer.groupsWritten());
     try testing.expectEqual(@as(u64, 3), store.opLatest());
-    try testing.expect(try store.get("a") == null);
-    try testing.expectEqualSlices(u8, "2", (try store.get("b")).?);
+    var value_buffer: [8]u8 = undefined;
+    try testing.expect(try store.get("a", &value_buffer) == null);
+    try testing.expectEqualSlices(u8, "2", (try store.get("b", &value_buffer)).?);
 }
 
 test "a key over the limit is rejected and the committer stays usable" {
@@ -297,7 +287,8 @@ test "a key over the limit is rejected and the committer stays usable" {
 
     try committer.put("a", "1");
     try testing.expectEqual(@as(u64, 1), committer.groupsWritten());
-    try testing.expectEqualSlices(u8, "1", (try store.get("a")).?);
+    var value_buffer: [8]u8 = undefined;
+    try testing.expectEqualSlices(u8, "1", (try store.get("a", &value_buffer)).?);
 }
 
 const test_thread_count = 8;
@@ -351,11 +342,12 @@ test "many threads share syncs and every write is there" {
     try testing.expectEqual(groups_written, store.opLatest());
 
     var key_buffer: [16]u8 = undefined;
+    var value_buffer: [16]u8 = undefined;
     var entries_found: usize = 0;
     for (0..test_thread_count) |thread_number| {
         for (0..test_puts_per_thread) |put_number| {
             const key = try std.fmt.bufPrint(&key_buffer, "t{d:0>2}-{d:0>4}", .{ thread_number, put_number });
-            const value = try store.get(key);
+            const value = try store.get(key, &value_buffer);
             try testing.expect(value != null);
             try testing.expectEqualSlices(u8, key, value.?);
             entries_found += 1;

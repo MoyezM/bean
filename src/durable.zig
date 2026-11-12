@@ -59,7 +59,33 @@ fn fullSync(io: Io, file: Io.File) Io.File.SyncError!void {
     }
 }
 
+/// Blocks until the names of the files in `dir` are in permanent storage.
+/// A file that was just created or deleted is only certain to be there, or
+/// gone, after a crash once its directory has been synced.
+pub fn syncDir(io: Io, dir: Io.Dir) (Io.Dir.OpenError || Io.File.SyncError)!void {
+    // `dir` may stand for the current directory without being an open
+    // handle, and only an open handle can be synced. Opening "." gives one.
+    var opened = try dir.openDir(io, ".", .{});
+    defer opened.close(io);
+
+    const dir_as_file: Io.File = .{
+        .handle = opened.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    try sync(io, dir_as_file);
+}
+
 const testing = std.testing;
+
+test "syncDir succeeds on a directory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile(testing.io, "created", .{});
+    file.close(testing.io);
+    try syncDir(testing.io, tmp.dir);
+    try syncDir(testing.io, Io.Dir.cwd());
+}
 
 test "sync succeeds on a file and leaves its contents alone" {
     var tmp = testing.tmpDir(.{});
