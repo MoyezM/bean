@@ -243,8 +243,14 @@ pub const MemTable = struct {
 
     /// Empties the table, keeping its memory. Invalidates all slices and
     /// iterators obtained from it.
+    ///
+    /// The table is then exactly as `init` left it, the source of node
+    /// heights included. So the same writes take the same room in a table
+    /// that was reset as in a new one, which is what lets the store replay
+    /// a log into a new table and know that it fits.
     pub fn reset(self: *MemTable) void {
         self.arena.reset();
+        self.prng = .init(0);
         self.head = self.createNode(max_height, "", null, 0).?;
     }
 

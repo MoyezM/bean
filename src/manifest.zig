@@ -550,7 +550,8 @@ pub const TableSet = struct {
     /// left afterwards fit, and its file numbers do not go backwards. A log
     /// number that differs from the set's must be one no file has had. The
     /// flushed op and flushed sequence number stay as they are while the
-    /// log stays, and do not go down when the log changes.
+    /// log stays, and do not go down when the log changes. No two level 0
+    /// tables hold the same sequence number.
     ///
     /// The store checks an edit with this before it writes it to the
     /// manifest, so that the manifest never holds an edit that cannot be
@@ -615,6 +616,11 @@ pub const TableSet = struct {
             if (table.file_number == edit.logNumber()) {
                 return error.InvalidEdit;
             }
+            if (table.level == 0) {
+                if (self.overlapsLevelZero(edit, table, added_index)) {
+                    return error.InvalidEdit;
+                }
+            }
             added_index += 1;
         }
 
@@ -622,6 +628,52 @@ pub const TableSet = struct {
         if (count_after_removals + edit.addedCount() > tables_max) {
             return error.InvalidEdit;
         }
+    }
+
+    /// Whether the sequence numbers of `table`, a level 0 table the edit
+    /// adds at position `index`, overlap those of another level 0 table:
+    /// one the set keeps once the edit's removals are made, or one the
+    /// edit adds earlier.
+    ///
+    /// Each level 0 table is one flushed memtable, so no sequence number is
+    /// in two of them. A reader relies on that to visit them from the
+    /// newest to the oldest.
+    fn overlapsLevelZero(self: *const TableSet, edit: EncodedEdit, table: Table, index: usize) bool {
+        for (self.slots) |slot| {
+            if (!slot.in_use) {
+                continue;
+            }
+            if (slot.table.level != 0) {
+                continue;
+            }
+            if (isRemovedBefore(edit, slot.table.file_number, edit.removedCount())) {
+                continue;
+            }
+            if (sequencesOverlap(table, slot.table)) {
+                return true;
+            }
+        }
+
+        var added = edit.added();
+        var position: usize = 0;
+        while (position < index) {
+            const earlier = added.next().?;
+            if (earlier.level == 0 and sequencesOverlap(table, earlier)) {
+                return true;
+            }
+            position += 1;
+        }
+        return false;
+    }
+
+    fn sequencesOverlap(a: Table, b: Table) bool {
+        if (a.sequence_max < b.sequence_min) {
+            return false;
+        }
+        if (b.sequence_max < a.sequence_min) {
+            return false;
+        }
+        return true;
     }
 
     /// Whether the edit removes `file_number` earlier than at position
@@ -963,7 +1015,8 @@ test "the encoding of a small edit, byte for byte" {
         .key_max = "bc",
     };
     const tables = [_]Table{table};
-    const removed = [_]u64{1};
+    // One table added and two removed, so that the two counts differ.
+    const removed = [_]u64{ 1, 3 };
     const bytes = encode(.{
         .added = &tables,
         .removed = &removed,
@@ -975,7 +1028,7 @@ test "the encoding of a small edit, byte for byte" {
 
     const expected = [_]u8{
         1, 0, 0, 0, // tables added
-        1, 0, 0, 0, // tables removed
+        2, 0, 0, 0, // tables removed
         7, 0, 0, 0, 0, 0, 0, 0, // log number
         8, 0, 0, 0, 0, 0, 0, 0, // next file number
         5, 0, 0, 0, 0, 0, 0, 0, // flushed op
@@ -991,6 +1044,7 @@ test "the encoding of a small edit, byte for byte" {
         'a', // smallest key
         'b', 'c', // largest key
         1, 0, 0, 0, 0, 0, 0, 0, // removed file number
+        3, 0, 0, 0, 0, 0, 0, 0, // removed file number
     };
     try testing.expectEqualSlices(u8, &expected, bytes);
 }
@@ -1019,28 +1073,291 @@ test "validate rejects an edit cut short or with bytes after it" {
     try testing.expectError(error.InvalidEdit, validate(longer[0 .. whole.len + 1]));
 }
 
-/// Encodes an edit that adds `table` and nothing else, bypassing `encode`,
-/// which refuses to write an edit that is not well-formed.
-fn encodeUnchecked(buffer: []u8, header: EditHeader, table: Table) []const u8 {
+/// Writes an edit's bytes with whatever header, tables and removed file
+/// numbers it is given, bypassing `encode`, which refuses to write an edit
+/// that is not well-formed.
+fn encodeRaw(buffer: []u8, header: EditHeader, tables: []const Table, removed: []const u64) []const u8 {
     @memcpy(buffer[0..edit_header_size], header.toBytes());
-    const table_header: TableHeader = .{
-        .file_number = table.file_number,
-        .file_size = table.file_size,
-        .sequence_min = table.sequence_min,
-        .sequence_max = table.sequence_max,
-        .checksum = table.checksum,
-        .key_min_len = @intCast(table.key_min.len),
-        .key_max_len = @intCast(table.key_max.len),
-        .level = table.level,
-    };
     var offset: usize = edit_header_size;
-    @memcpy(buffer[offset..][0..table_header_size], table_header.toBytes());
-    offset += table_header_size;
-    @memcpy(buffer[offset..][0..table.key_min.len], table.key_min);
-    offset += table.key_min.len;
-    @memcpy(buffer[offset..][0..table.key_max.len], table.key_max);
-    offset += table.key_max.len;
+
+    for (tables) |table| {
+        const table_header: TableHeader = .{
+            .file_number = table.file_number,
+            .file_size = table.file_size,
+            .sequence_min = table.sequence_min,
+            .sequence_max = table.sequence_max,
+            .checksum = table.checksum,
+            .key_min_len = @intCast(table.key_min.len),
+            .key_max_len = @intCast(table.key_max.len),
+            .level = table.level,
+        };
+        @memcpy(buffer[offset..][0..table_header_size], table_header.toBytes());
+        offset += table_header_size;
+        @memcpy(buffer[offset..][0..table.key_min.len], table.key_min);
+        offset += table.key_min.len;
+        @memcpy(buffer[offset..][0..table.key_max.len], table.key_max);
+        offset += table.key_max.len;
+    }
+
+    for (removed) |file_number| {
+        std.mem.writeInt(u64, buffer[offset..][0..file_number_size], file_number, .little);
+        offset += file_number_size;
+    }
     return buffer[0..offset];
+}
+
+/// Encodes an edit that adds `table` and nothing else, bypassing `encode`.
+fn encodeUnchecked(buffer: []u8, header: EditHeader, table: Table) []const u8 {
+    const tables = [_]Table{table};
+    return encodeRaw(buffer, header, &tables, &.{});
+}
+
+test "validate rejects a removed file number that does not make sense" {
+    var buffer: [edit_size_max]u8 = undefined;
+    const header: EditHeader = .{
+        .added_count = 0,
+        .removed_count = 1,
+        .log_number = 5,
+        .file_number_next = 6,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    };
+
+    // The largest number a file can have had.
+    try validate(encodeRaw(&buffer, header, &.{}, &.{5}));
+    // No file is number 0.
+    try testing.expectError(error.InvalidEdit, validate(encodeRaw(&buffer, header, &.{}, &.{0})));
+    // No file has had the next number yet.
+    try testing.expectError(error.InvalidEdit, validate(encodeRaw(&buffer, header, &.{}, &.{6})));
+
+    // Every removed number is checked, not only the first.
+    var two_removed = header;
+    two_removed.removed_count = 2;
+    try validate(encodeRaw(&buffer, two_removed, &.{}, &.{ 2, 3 }));
+    try testing.expectError(error.InvalidEdit, validate(encodeRaw(&buffer, two_removed, &.{}, &.{ 2, 0 })));
+    try testing.expectError(error.InvalidEdit, validate(encodeRaw(&buffer, two_removed, &.{}, &.{ 2, 6 })));
+}
+
+test "validate rejects more tables than a store holds, however well-formed they are" {
+    const buffer = try testing.allocator.alloc(u8, 2 * edit_size_max);
+    defer testing.allocator.free(buffer);
+
+    // One table and one removed number more than the limit, each of them
+    // whole and valid, so that only the count is wrong.
+    var tables: [tables_max + 1]Table = undefined;
+    var removed: [tables_max + 1]u64 = undefined;
+    for (&tables, &removed, 0..) |*table, *removed_number, index| {
+        table.* = testTable(2 + index, "a", "z");
+        removed_number.* = 2 + index;
+    }
+    const file_number_next = 2 + tables.len;
+
+    const too_many_added: EditHeader = .{
+        .added_count = tables_max + 1,
+        .removed_count = 0,
+        .log_number = 1,
+        .file_number_next = file_number_next,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    };
+    try testing.expectError(error.InvalidEdit, validate(encodeRaw(buffer, too_many_added, &tables, &.{})));
+
+    const too_many_removed: EditHeader = .{
+        .added_count = 0,
+        .removed_count = tables_max + 1,
+        .log_number = 1,
+        .file_number_next = file_number_next,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    };
+    try testing.expectError(error.InvalidEdit, validate(encodeRaw(buffer, too_many_removed, &.{}, &removed)));
+
+    // Exactly the limit of each is accepted.
+    const at_the_limit: EditHeader = .{
+        .added_count = tables_max,
+        .removed_count = tables_max,
+        .log_number = 1,
+        .file_number_next = file_number_next,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    };
+    try validate(encodeRaw(buffer, at_the_limit, tables[0..tables_max], removed[0..tables_max]));
+}
+
+test "the largest edit fills a buffer of edit_size_max exactly, and is applied" {
+    const buffer = try testing.allocator.alloc(u8, edit_size_max);
+    defer testing.allocator.free(buffer);
+    var set: TableSet = try .init(testing.allocator);
+    defer set.deinit(testing.allocator);
+
+    // A full set, with the log as file 1 and the tables numbered from 2.
+    var file_number: u64 = 2;
+    while (file_number < 2 + tables_max) {
+        try applyEdit(&set, .{
+            .added = &.{testTable(file_number, "a", "z")},
+            .removed = &.{},
+            .log_number = 1,
+            .file_number_next = file_number + 1,
+            .op_flushed = test_op_flushed,
+            .sequence_flushed = test_sequence_flushed,
+        });
+        file_number += 1;
+    }
+
+    // Every table removed, and as many added, each with two keys of the
+    // longest size.
+    const longest_key: [key_size_max]u8 = @splat('k');
+    var removed: [tables_max]u64 = undefined;
+    var added: [tables_max]Table = undefined;
+    for (&removed, &added, 0..) |*removed_number, *added_table, index| {
+        removed_number.* = 2 + index;
+        added_table.* = testTable(2 + tables_max + index, &longest_key, &longest_key);
+    }
+    const bytes = encode(.{
+        .added = &added,
+        .removed = &removed,
+        .log_number = 1,
+        .file_number_next = 2 + 2 * tables_max,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, buffer);
+    try testing.expectEqual(@as(usize, edit_size_max), bytes.len);
+    try validate(bytes);
+
+    const edit: EncodedEdit = .init(bytes);
+    try set.check(edit);
+    set.apply(edit);
+    try testing.expectEqual(@as(usize, tables_max), set.count());
+    const last = set.find(2 + 2 * tables_max - 1).?;
+    try testing.expectEqualSlices(u8, &longest_key, last.key_min);
+    try testing.expectEqualSlices(u8, &longest_key, last.key_max);
+}
+
+test "a table's level is read back and kept" {
+    // The test needs a level other than the one `testTable` gives.
+    try testing.expect(level_count > 1);
+    var set: TableSet = try .init(testing.allocator);
+    defer set.deinit(testing.allocator);
+
+    var table = testTable(2, "a", "m");
+    table.level = level_count - 1;
+    const tables = [_]Table{table};
+
+    var buffer: [edit_size_max]u8 = undefined;
+    const edit: EncodedEdit = .init(encode(.{
+        .added = &tables,
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 3,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer));
+
+    var added = edit.added();
+    try testing.expectEqual(@as(u8, level_count - 1), added.next().?.level);
+
+    try set.check(edit);
+    set.apply(edit);
+    try testing.expectEqual(@as(u8, level_count - 1), set.find(2).?.level);
+}
+
+test "check rejects level 0 tables whose sequence numbers overlap" {
+    var set: TableSet = try .init(testing.allocator);
+    defer set.deinit(testing.allocator);
+    // testTable gives table 2 the sequence numbers 20 to 29.
+    try applyEdit(&set, .{
+        .added = &.{testTable(2, "a", "m")},
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 3,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    });
+
+    var buffer: [edit_size_max]u8 = undefined;
+
+    // A new table that shares one sequence number with a table in the set.
+    var shares_last = testTable(3, "n", "z");
+    shares_last.sequence_min = 29;
+    shares_last.sequence_max = 35;
+    const overlaps_set: EncodedEdit = .init(encode(.{
+        .added = &.{shares_last},
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 4,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer));
+    try testing.expectError(error.InvalidEdit, set.check(overlaps_set));
+
+    var shares_first = testTable(3, "n", "z");
+    shares_first.sequence_min = 15;
+    shares_first.sequence_max = 20;
+    const overlaps_set_below: EncodedEdit = .init(encode(.{
+        .added = &.{shares_first},
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 4,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer));
+    try testing.expectError(error.InvalidEdit, set.check(overlaps_set_below));
+
+    // The same table is fine once the edit removes the one it overlaps.
+    const replaces: EncodedEdit = .init(encode(.{
+        .added = &.{shares_last},
+        .removed = &.{2},
+        .log_number = 1,
+        .file_number_next = 4,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer));
+    try set.check(replaces);
+
+    // Two new tables that overlap each other.
+    var first = testTable(3, "a", "m");
+    first.sequence_min = 40;
+    first.sequence_max = 50;
+    var second = testTable(4, "n", "z");
+    second.sequence_min = 50;
+    second.sequence_max = 60;
+    const overlap_each_other: EncodedEdit = .init(encode(.{
+        .added = &.{ first, second },
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 5,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer));
+    try testing.expectError(error.InvalidEdit, set.check(overlap_each_other));
+
+    // Tables whose sequence numbers are next to each other do not overlap.
+    second.sequence_min = 51;
+    const side_by_side: EncodedEdit = .init(encode(.{
+        .added = &.{ first, second },
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 5,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer));
+    try set.check(side_by_side);
+
+    // Above level 0 the rule does not apply: a merged table covers the
+    // sequence numbers of everything that went into it.
+    if (level_count > 1) {
+        var merged = shares_last;
+        merged.level = 1;
+        const overlaps_at_level_one: EncodedEdit = .init(encode(.{
+            .added = &.{merged},
+            .removed = &.{},
+            .log_number = 1,
+            .file_number_next = 4,
+            .op_flushed = test_op_flushed,
+            .sequence_flushed = test_sequence_flushed,
+        }, &buffer));
+        try set.check(overlaps_at_level_one);
+    }
 }
 
 test "validate rejects a table that does not make sense" {
@@ -1164,6 +1481,11 @@ test "validate accepts keys of the longest size and rejects longer ones" {
 
     const too_long = testTable(4, &longest_key, &too_long_key);
     try testing.expectError(error.InvalidEdit, validate(encodeUnchecked(&buffer, header, too_long)));
+
+    // The smallest key is held to the same limit. "z" sorts after it, so
+    // only its length is wrong.
+    const too_long_min = testTable(4, &too_long_key, "z");
+    try testing.expectError(error.InvalidEdit, validate(encodeUnchecked(&buffer, header, too_long_min)));
 }
 
 /// Encodes `edit` and applies it to `set`, as a store does once it has
@@ -1273,6 +1595,18 @@ test "a full table set can have every table replaced by one edit" {
     }
     try testing.expectEqual(@as(usize, tables_max), set.count());
 
+    // The cursor gives every table of a full set, each once.
+    var seen: [tables_max]bool = @splat(false);
+    var tables = set.iterator();
+    var tables_given: usize = 0;
+    while (tables.next()) |table| {
+        const index: usize = @intCast(table.file_number - table_number_first);
+        try testing.expect(!seen[index]);
+        seen[index] = true;
+        tables_given += 1;
+    }
+    try testing.expectEqual(@as(usize, tables_max), tables_given);
+
     // One more table does not fit.
     var buffer: [edit_size_max]u8 = undefined;
     const one_more: EncodedEdit = .init(encode(.{
@@ -1352,6 +1686,18 @@ test "check rejects an edit that does not fit the tables the set has" {
         .sequence_flushed = test_sequence_flushed,
     }, &buffer));
     try testing.expectError(error.InvalidEdit, set.check(reuses_number));
+
+    // Adds a table under a number an earlier file had, though no table in
+    // the set has it now.
+    const reuses_old_number: EncodedEdit = .init(encode(.{
+        .added = &.{testTable(1, "a", "m")},
+        .removed = &.{},
+        .log_number = 4,
+        .file_number_next = 5,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer));
+    try testing.expectError(error.InvalidEdit, set.check(reuses_old_number));
 
     // Adds two tables under one number.
     const adds_twice: EncodedEdit = .init(encode(.{
@@ -1459,6 +1805,17 @@ test "check rejects a log number that a file has already had" {
         .sequence_flushed = test_sequence_flushed,
     }, &buffer));
     try set.check(same_log);
+
+    // With the log kept, the next file number still may not go backwards.
+    const same_log_next_backwards: EncodedEdit = .init(encode(.{
+        .added = &.{},
+        .removed = &.{},
+        .log_number = 3,
+        .file_number_next = 9,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer));
+    try testing.expectError(error.InvalidEdit, set.check(same_log_next_backwards));
 }
 
 test "the flushed numbers move only with the log, and only forwards" {
@@ -1521,6 +1878,26 @@ test "the flushed numbers move only with the log, and only forwards" {
         .sequence_flushed = 51,
     }, &buffer));
     try testing.expectError(error.InvalidEdit, set.check(same_log_new_sequence));
+
+    const same_log_op_backwards: EncodedEdit = .init(encode(.{
+        .added = &.{},
+        .removed = &.{},
+        .log_number = 3,
+        .file_number_next = 4,
+        .op_flushed = 19,
+        .sequence_flushed = 50,
+    }, &buffer));
+    try testing.expectError(error.InvalidEdit, set.check(same_log_op_backwards));
+
+    const same_log_sequence_backwards: EncodedEdit = .init(encode(.{
+        .added = &.{},
+        .removed = &.{},
+        .log_number = 3,
+        .file_number_next = 4,
+        .op_flushed = 20,
+        .sequence_flushed = 49,
+    }, &buffer));
+    try testing.expectError(error.InvalidEdit, set.check(same_log_sequence_backwards));
 
     // The log changes, so the numbers may rise, but not fall.
     const new_log_op_backwards: EncodedEdit = .init(encode(.{

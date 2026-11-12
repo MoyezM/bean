@@ -65,7 +65,10 @@ fn fullSync(io: Io, file: Io.File) Io.File.SyncError!void {
 pub fn syncDir(io: Io, dir: Io.Dir) (Io.Dir.OpenError || Io.File.SyncError)!void {
     // `dir` may stand for the current directory without being an open
     // handle, and only an open handle can be synced. Opening "." gives one.
-    var opened = try dir.openDir(io, ".", .{});
+    //
+    // It is opened for listing because on Linux a directory opened any
+    // other way is only a reference to a path, which cannot be synced.
+    var opened = try dir.openDir(io, ".", .{ .iterate = true });
     defer opened.close(io);
 
     const dir_as_file: Io.File = .{

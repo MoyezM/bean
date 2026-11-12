@@ -101,6 +101,12 @@ const log_payload_size_max: u32 = write_batch.size_max;
 /// The file number of the log a new store starts with.
 const log_number_first: u64 = 1;
 
+/// The largest op, sequence number or file number that a store accepts
+/// from its files when it is opened. A store that counted up from zero
+/// cannot have reached it, and stopping here leaves all the room there
+/// could ever be to count on without overflowing.
+const number_recovered_max: u64 = std.math.maxInt(u64) / 2;
+
 /// The most places a scan reads from: the two memtables and every table.
 const sources_max = 2 + tables_max;
 
@@ -280,6 +286,8 @@ pub const Store = struct {
         UnsupportedVersion,
         /// A table's index is larger than any table this code writes.
         IndexTooLarge,
+        /// A table has a data block longer than any this code writes.
+        BlockTooLarge,
     } || Allocator.Error || FlushError || Io.File.SetLengthError || Io.Dir.Iterator.Error;
 
     /// What writing a batch that holds at least one operation can report.
@@ -445,6 +453,10 @@ pub const Store = struct {
                 // The sources are left standing on this key, so that the
                 // value stays valid until the next call. The key is copied
                 // because moving a source past it can overwrite it.
+                if (version.key.len > self.key_buffer.len) {
+                    // No table the store wrote holds a key this long.
+                    return error.Corrupt;
+                }
                 const key_copy = self.key_buffer[0..version.key.len];
                 @memcpy(key_copy, version.key);
                 self.key_last = key_copy;
@@ -1229,13 +1241,14 @@ pub const Store = struct {
             return;
         }
 
-        const log_number_newer_found = try self.removeStrayFiles();
+        // First, everything the manifest says is checked against the
+        // directory, and nothing in the directory is changed. A manifest
+        // that has lost its last edits names files that are gone, and
+        // would have the files that hold the data deleted as strays.
+        const log_number_newer_found = try self.findNewerLog();
 
         errdefer self.closeTables();
         try self.openTables();
-
-        self.manifest_writer = try manifest.Writer.open(self.io, self.dir, manifest_end.?);
-        errdefer self.manifest_writer.close();
 
         // The log the manifest names holds the writes that are in no table.
         // It was created and synced before the manifest named it, so it is
@@ -1254,19 +1267,23 @@ pub const Store = struct {
             return error.Corrupt;
         }
 
-        self.active_index = 0;
-        self.sequence_last = named.sequence_last;
-        self.log_number = log_number_named;
-        self.file_number_next = self.tables.file_number_next;
-        var log_end = named.end;
-
         // A log newer than that one was started by a flush that a crash
         // interrupted. It holds the writes made after the first log's
         // memtable was frozen.
         var newer: ?ReplayedLog = null;
         var log_number_newer: u64 = 0;
+        var newer_is_incomplete = false;
         if (log_number_newer_found != null) {
             log_number_newer = log_number_newer_found.?;
+            // A log started after the manifest's last edit took a file
+            // number the manifest had not handed out.
+            if (log_number_newer < self.tables.file_number_next) {
+                return error.Corrupt;
+            }
+            if (log_number_newer > number_recovered_max) {
+                return error.Corrupt;
+            }
+
             const replayed = self.replayLog(
                 log_number_newer,
                 &self.memtables[1],
@@ -1275,13 +1292,9 @@ pub const Store = struct {
             if (replayed) |replayed_log| {
                 newer = replayed_log;
             } else |err| switch (err) {
-                error.IncompleteLog => {
-                    // The crash came while the new log was being created.
-                    // It holds nothing, and nothing was frozen yet.
-                    var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-                    const log_name = manifest.fileName(&name_buffer, .log, log_number_newer);
-                    try self.dir.deleteFile(self.io, log_name);
-                },
+                // The crash came while the new log was being created. It
+                // holds nothing, and nothing was frozen yet.
+                error.IncompleteLog => newer_is_incomplete = true,
                 else => |other| return other,
             }
         }
@@ -1303,11 +1316,33 @@ pub const Store = struct {
             if (self.tables.count() == tables_max) {
                 return error.Corrupt;
             }
+        }
 
+        // The directory is what the manifest describes. From here on files
+        // are changed: strays are deleted, the manifest and the log lose a
+        // record that a crash left half-written, and an interrupted flush
+        // is run again.
+        try self.removeStrayFiles();
+        if (newer_is_incomplete) {
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const log_name = manifest.fileName(&name_buffer, .log, log_number_newer);
+            try self.dir.deleteFile(self.io, log_name);
+        }
+
+        self.manifest_writer = try manifest.Writer.open(self.io, self.dir, manifest_end.?);
+        errdefer self.manifest_writer.close();
+
+        self.active_index = 0;
+        self.sequence_last = named.sequence_last;
+        self.log_number = log_number_named;
+        self.file_number_next = self.tables.file_number_next;
+        var log_end = named.end;
+
+        if (newer != null) {
             self.active_index = 1;
             self.sequence_last = newer.?.sequence_last;
             self.log_number = log_number_newer;
-            self.file_number_next = @max(self.file_number_next, log_number_newer + 1);
+            self.file_number_next = log_number_newer + 1;
             log_end = newer.?.end;
 
             // Run the interrupted flush again, from the start.
@@ -1320,12 +1355,6 @@ pub const Store = struct {
             try self.flushComplete();
         }
 
-        if (log_end.last.op == std.math.maxInt(u64)) {
-            // The log ends on the largest op, so there is no op number left
-            // for the next batch. A store cannot write that many batches,
-            // so this is a log the store did not write.
-            return error.Corrupt;
-        }
         var name_buffer: [manifest.file_name_size_max]u8 = undefined;
         const log_name = manifest.fileName(&name_buffer, .log, self.log_number);
         self.log = try wal.Writer.open(self.io, self.dir, log_name, log_payload_size_max, log_end);
@@ -1356,7 +1385,23 @@ pub const Store = struct {
         if (edit_count == 0) {
             return null;
         }
-        return reader.end();
+
+        // The store counts on from each of these, so none may be so large
+        // that counting on could overflow.
+        const manifest_end = reader.end();
+        if (manifest_end.last.op > number_recovered_max) {
+            return error.Corrupt;
+        }
+        if (self.tables.op_flushed > number_recovered_max) {
+            return error.Corrupt;
+        }
+        if (self.tables.sequence_flushed > number_recovered_max) {
+            return error.Corrupt;
+        }
+        if (self.tables.file_number_next > number_recovered_max) {
+            return error.Corrupt;
+        }
+        return manifest_end;
     }
 
     /// Creates a new store: its first log, then a manifest whose first edit
@@ -1448,13 +1493,44 @@ pub const Store = struct {
         };
     }
 
+    /// Looks in the directory for a log newer than the one the manifest
+    /// names, and returns its file number. There is at most one: the log a
+    /// flush started before a crash. Nothing is changed.
+    fn findNewerLog(self: *Store) OpenError!?u64 {
+        var log_number_newer: ?u64 = null;
+
+        var listing = try self.dir.openDir(self.io, ".", .{ .iterate = true });
+        defer listing.close(self.io);
+        var entries = listing.iterate();
+        while (true) {
+            const entry = try entries.next(self.io);
+            if (entry == null) {
+                return log_number_newer;
+            }
+            const parsed = manifest.parseFileName(entry.?.name);
+            if (parsed == null) {
+                continue;
+            }
+            if (parsed.?.kind != .log) {
+                continue;
+            }
+            if (parsed.?.file_number <= self.tables.log_number) {
+                continue;
+            }
+            if (log_number_newer != null) {
+                return error.Corrupt;
+            }
+            log_number_newer = parsed.?.file_number;
+        }
+    }
+
     /// Deletes the numbered files that the manifest does not account for: a
     /// table it does not hold, which a flush wrote before a crash, and a
     /// log older than the one it names, which a flush had finished with.
     ///
-    /// A log newer than the one the manifest names is not deleted: it holds
-    /// writes. There is at most one, and its file number is returned.
-    fn removeStrayFiles(self: *Store) OpenError!?u64 {
+    /// A log newer than the one the manifest names is left alone: it holds
+    /// writes. The caller has checked the manifest against the directory.
+    fn removeStrayFiles(self: *Store) OpenError!void {
         while (true) {
             // File numbers are collected while the directory is listed and
             // the files deleted afterwards, a few at a time, so that
@@ -1462,7 +1538,6 @@ pub const Store = struct {
             var stray: [16]manifest.ParsedFileName = undefined;
             var stray_count: usize = 0;
             var stray_left_over = false;
-            var log_number_newer: ?u64 = null;
 
             {
                 var listing = try self.dir.openDir(self.io, ".", .{ .iterate = true });
@@ -1490,12 +1565,6 @@ pub const Store = struct {
                             if (file.file_number < self.tables.log_number) {
                                 is_stray = true;
                             }
-                            if (file.file_number > self.tables.log_number) {
-                                if (log_number_newer != null) {
-                                    return error.Corrupt;
-                                }
-                                log_number_newer = file.file_number;
-                            }
                         },
                     }
                     if (!is_stray) {
@@ -1516,7 +1585,7 @@ pub const Store = struct {
                 try self.dir.deleteFile(self.io, name);
             }
             if (!stray_left_over) {
-                return log_number_newer;
+                return;
             }
         }
     }
@@ -1547,6 +1616,10 @@ pub const Store = struct {
             }
             if (reader.checksum() != table.checksum) {
                 return error.Corrupt;
+            }
+            // Reads go through buffers of this size.
+            if (reader.blockSizeMax() > sstable.block_size_max) {
+                return error.BlockTooLarge;
             }
 
             self.slots[slot_index] = .{
@@ -1596,9 +1669,10 @@ pub const Store = struct {
             const batch_bytes = record.?.payload;
 
             try write_batch.validate(batch_bytes);
-            // `commit` makes the same check before it logs a batch, and a
-            // memtable fills the same way every time, so this only fails
-            // for a log the store did not write.
+            // `commit` makes the same check before it logs a batch. A
+            // memtable fills the same way every time, whether it is new or
+            // has been reset, so this only fails for a log the store did
+            // not write.
             if (memtableSizeMax(batch_bytes) > memtable.bytesFree()) {
                 return error.LogTooLargeForMemtable;
             }
@@ -1990,6 +2064,7 @@ test "a table holds every entry of the memtable, older ones and tombstones too" 
 
     var store = try openStore(tmp.dir);
     defer store.close(testing.allocator);
+    try store.put("a", "oldest");
     try store.put("a", "old");
     try store.put("a", "new");
     try store.delete("b");
@@ -2000,20 +2075,29 @@ test "a table holds every entry of the memtable, older ones and tombstones too" 
     defer testing.allocator.free(block_buffer);
     var entries = slot.reader.iterator(block_buffer);
 
-    const first = (try entries.next()).?;
-    try testing.expectEqualSlices(u8, "a", first.key);
-    try testing.expectEqualSlices(u8, "new", first.value.?);
-    try testing.expectEqual(@as(u64, 2), first.sequence);
+    const first = try entries.next();
+    try testing.expect(first != null);
+    try testing.expectEqualSlices(u8, "a", first.?.key);
+    try testing.expectEqualSlices(u8, "new", first.?.value.?);
+    try testing.expectEqual(@as(u64, 3), first.?.sequence);
 
-    const second = (try entries.next()).?;
-    try testing.expectEqualSlices(u8, "a", second.key);
-    try testing.expectEqualSlices(u8, "old", second.value.?);
-    try testing.expectEqual(@as(u64, 1), second.sequence);
+    const second = try entries.next();
+    try testing.expect(second != null);
+    try testing.expectEqualSlices(u8, "a", second.?.key);
+    try testing.expectEqualSlices(u8, "old", second.?.value.?);
+    try testing.expectEqual(@as(u64, 2), second.?.sequence);
 
-    const third = (try entries.next()).?;
-    try testing.expectEqualSlices(u8, "b", third.key);
-    try testing.expect(third.value == null);
-    try testing.expectEqual(@as(u64, 3), third.sequence);
+    const third = try entries.next();
+    try testing.expect(third != null);
+    try testing.expectEqualSlices(u8, "a", third.?.key);
+    try testing.expectEqualSlices(u8, "oldest", third.?.value.?);
+    try testing.expectEqual(@as(u64, 1), third.?.sequence);
+
+    const fourth = try entries.next();
+    try testing.expect(fourth != null);
+    try testing.expectEqualSlices(u8, "b", fourth.?.key);
+    try testing.expect(fourth.?.value == null);
+    try testing.expectEqual(@as(u64, 4), fourth.?.sequence);
 
     try testing.expect(try entries.next() == null);
 }
@@ -2396,10 +2480,28 @@ test "a crash at any step of a flush loses nothing" {
             try testing.expectEqual(writesBeforeCrash(point), store.opLatest());
             try testing.expectEqual(writesBeforeCrash(point), store.sequenceLatest());
 
+            // If the crash came before the manifest named the new log, the
+            // new log was replayed into the second memtable, and that is
+            // the one that takes the writes now.
+            var active_index_expected: usize = 0;
+            if (point == .frozen or point == .writing or point == .table_written) {
+                active_index_expected = 1;
+            }
+            try testing.expectEqual(active_index_expected, store.active_index);
+            try testing.expect(store.otherMemtable().isEmpty());
+
             // The store carries on from there.
             try store.put("zz", "after the crash");
             try testing.expectEqual(writesBeforeCrash(point) + 1, store.opLatest());
             try testing.expectEqual(writesBeforeCrash(point) + 1, store.sequenceLatest());
+
+            // A flush writes out whichever memtable is active.
+            try store.flush();
+            try testing.expectEqual(@as(usize, 2), store.tables.count());
+            try testing.expect(store.memtables[0].isEmpty());
+            try testing.expect(store.memtables[1].isEmpty());
+            try expectAfterCrash(&store, point);
+            try expectValue(&store, "zz", "after the crash");
         }
 
         // And it opens again, this time with nothing to repair.
@@ -2409,7 +2511,7 @@ test "a crash at any step of a flush loses nothing" {
         try expectValue(&store, "zz", "after the crash");
         try testing.expectEqual(writesBeforeCrash(point) + 1, store.opLatest());
         try testing.expectEqual(writesBeforeCrash(point) + 1, store.sequenceLatest());
-        try expectNumberedFiles(tmp.dir, &.{ "000002.log", "000003.sst" });
+        try expectNumberedFiles(tmp.dir, &.{ "000003.sst", "000004.log", "000005.sst" });
     }
 }
 
@@ -2767,7 +2869,7 @@ test "a log record that is not a batch is reported" {
     try testing.expectError(error.InvalidBatch, openStore(tmp.dir));
 }
 
-test "a log that ends on the largest op is reported" {
+test "a manifest whose flushed op is too large to count on from is reported" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2934,8 +3036,13 @@ test "a store with every table slot taken and a full memtable rejects a write, s
     defer store.close(testing.allocator);
     try testing.expectEqual(@as(usize, tables_max), store.tables.count());
     try testing.expectEqual(count + 1, store.opLatest());
-    try expectNumbered(&store, 0);
-    try expectNumbered(&store, count - 1);
+    // Every table was opened again: each key is read from the table that
+    // holds it.
+    var number: u64 = 0;
+    while (number < count) {
+        try expectNumbered(&store, number);
+        number += 1;
+    }
     try expectValue(&store, "small", "1");
 }
 
@@ -3052,6 +3159,521 @@ test "a flush that fails partway breaks the store, keeps it readable, and is red
     try expectNumberedScan(&store, count);
     try putNumbered(&store, count);
     try expectNumbered(&store, count);
+}
+
+test "a store whose memtables have been used more than once opens again" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var key_buffer: [8]u8 = undefined;
+    var value_buffer: [test_value_size]u8 = undefined;
+
+    // Enough small writes to fill and reuse both memtables several times,
+    // and to leave the last log nearly as full as a memtable gets.
+    const put_count = 4378;
+    {
+        var store = try openSmallStore(tmp.dir);
+        defer store.close(testing.allocator);
+        var number: u64 = 0;
+        while (number < put_count) {
+            const value = numberedValue(&value_buffer, number)[0..40];
+            try store.put(numberedKey(&key_buffer, number), value);
+            number += 1;
+        }
+        // The active memtable has been through a reset.
+        try testing.expect(store.tables.count() >= 4);
+    }
+
+    // The last log is replayed into a new memtable, where its writes must
+    // take the room they took in the one that had been reset.
+    var store = try openSmallStore(tmp.dir);
+    defer store.close(testing.allocator);
+    try testing.expectEqual(@as(u64, put_count), store.opLatest());
+    try expectValue(&store, numberedKey(&key_buffer, 0), numberedValue(&value_buffer, 0)[0..40]);
+    try expectValue(
+        &store,
+        numberedKey(&key_buffer, put_count - 1),
+        numberedValue(&value_buffer, put_count - 1)[0..40],
+    );
+}
+
+/// Fills `batch` with numbered puts, starting at `number_first`, until one
+/// more would make it too large for an empty small memtable. Returns the
+/// number after the last one.
+fn fillBatchNearlyAMemtable(batch: *WriteBatch, number_first: u64) !u64 {
+    var key_buffer: [8]u8 = undefined;
+    var value_buffer: [test_value_size]u8 = undefined;
+    const room = test_memtable_size - MemTable.buffer_size_min;
+    const put_size = MemTable.entrySizeMax(8, test_value_size);
+
+    batch.clear();
+    var number = number_first;
+    var size: usize = 0;
+    while (size + put_size <= room) {
+        try batch.put(numberedKey(&key_buffer, number), numberedValue(&value_buffer, number));
+        size += put_size;
+        number += 1;
+    }
+    return number;
+}
+
+/// Brings a small store to the point where a flush is in progress and the
+/// active memtable has no room for another numbered put. `count` numbered
+/// entries have been written when this is called, and the new count is
+/// returned.
+fn fillWithFlushStillGoing(store: *Store, count_before: u64) !u64 {
+    var batch: WriteBatch = try .init(testing.allocator);
+    defer batch.deinit(testing.allocator);
+
+    // Something for the flush to write.
+    var count = count_before;
+    const frozen_count = 40;
+    while (count < count_before + frozen_count) {
+        try putNumbered(store, count);
+        count += 1;
+    }
+    const log_number_before = store.log_number;
+
+    // One batch that fills most of an empty memtable. It does not fit, so
+    // it freezes the memtable and goes into the other one. The write that
+    // freezes a memtable does no share of the flush it starts.
+    count = try fillBatchNearlyAMemtable(&batch, count);
+    try store.write(&batch);
+    try testing.expect(store.log_number != log_number_before);
+
+    // A few more puts fill the active memtable. Their shares of the flush
+    // are too small to finish it.
+    while (MemTable.entrySizeMax(8, test_value_size) <= store.activeMemtable().bytesFree()) {
+        try putNumbered(store, count);
+        count += 1;
+    }
+    try testing.expect(store.flushing != null);
+    try testing.expectEqual(Store.FlushStage.writing, store.flushing.?.stage);
+    return count;
+}
+
+test "a flush still going when the active memtable fills is finished first" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openSmallStore(tmp.dir);
+    defer store.close(testing.allocator);
+
+    var count = try fillWithFlushStillGoing(&store, 0);
+    try testing.expectEqual(@as(usize, 0), store.tables.count());
+    try testing.expectEqual(@as(u64, 2), store.log_number);
+
+    // This put does not fit. The first flush is finished, the memtable is
+    // frozen, and a second flush begins.
+    try putNumbered(&store, count);
+    count += 1;
+    try testing.expectEqual(@as(usize, 1), store.tables.count());
+    try testing.expect(store.flushing != null);
+    try testing.expectEqual(@as(u64, 4), store.log_number);
+    try expectNumberedScan(&store, count);
+
+    try store.flush();
+    try expectNumberedScan(&store, count);
+}
+
+test "a store is full only once the flush still going has taken its slot" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openSmallStore(tmp.dir);
+    defer store.close(testing.allocator);
+
+    // All but one of the table slots.
+    var count: u64 = 0;
+    while (store.tables.count() < tables_max - 1) {
+        try putNumbered(&store, count);
+        count += 1;
+        try store.flush();
+    }
+
+    // A flush in progress will take the last slot.
+    count = try fillWithFlushStillGoing(&store, count);
+    try testing.expectEqual(@as(usize, tables_max - 1), store.tables.count());
+
+    // The put that does not fit finishes that flush, and then has no slot
+    // to freeze the active memtable into.
+    try testing.expectError(error.StoreFull, putNumbered(&store, count));
+    try testing.expectEqual(@as(usize, tables_max), store.tables.count());
+    try testing.expect(store.flushing == null);
+    try expectNumberedScan(&store, count);
+}
+
+test "a scan crosses blocks that hold one entry each" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openStore(tmp.dir);
+    defer store.close(testing.allocator);
+    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+    defer buffers.deinit(testing.allocator);
+
+    // Two of these do not fit in one block, so every block holds one entry,
+    // and each key is at the same place in its block. Reading the next
+    // block overwrites the key the scan returned last.
+    const value = try testing.allocator.alloc(u8, sstable.block_size / 2 + 1);
+    defer testing.allocator.free(value);
+    @memset(value, 'v');
+    try store.put("k1", value);
+    try store.put("k2", value);
+    try store.put("k3", value);
+    try store.put("k4", value);
+    try store.flush();
+
+    var it = store.iterator(&buffers);
+    try expectEntry(try it.next(), "k1", value);
+    try expectEntry(try it.next(), "k2", value);
+    try expectEntry(try it.next(), "k3", value);
+    try expectEntry(try it.next(), "k4", value);
+    try testing.expect(try it.next() == null);
+}
+
+test "seekToFirst right after an entry gives that entry again" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openStore(tmp.dir);
+    defer store.close(testing.allocator);
+    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+    defer buffers.deinit(testing.allocator);
+    try store.put("a", "1");
+    try store.put("b", "2");
+
+    var it = store.iterator(&buffers);
+    try expectEntry(try it.next(), "a", "1");
+    it.seekToFirst();
+    try expectEntry(try it.next(), "a", "1");
+    try expectEntry(try it.next(), "b", "2");
+}
+
+test "a write whose freeze fails breaks the store" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openSmallStore(tmp.dir);
+    defer store.close(testing.allocator);
+
+    const count = try fillFirstMemtable(&store);
+    // The freeze will give its log file number 2 and its table number 3.
+    try writeFile(tmp.dir, "000003.sst", "in the way");
+    try testing.expectError(error.PathAlreadyExists, putNumbered(&store, count));
+    try testing.expectError(error.StoreBroken, putNumbered(&store, count));
+    try expectNumbered(&store, 0);
+}
+
+test "a flush does not record a table that is not the one it wrote" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openStore(tmp.dir);
+    defer store.close(testing.allocator);
+    try store.put("a", "1");
+    try store.put("b", "2");
+
+    try store.freeze();
+    try store.flushWriteEntries(std.math.maxInt(usize));
+    try store.flushFinishTable();
+
+    // A whole table of the same length takes the file's place.
+    try replaceTable(tmp.dir, "a", "1", "b", "X");
+
+    try testing.expectError(error.Corrupt, store.flushRecordTable());
+    try testing.expectEqual(Store.FlushStage.table_written, store.flushing.?.stage);
+    try testing.expectEqual(@as(usize, 0), store.tables.count());
+    try testing.expect(try fileExists(tmp.dir, "000001.log"));
+}
+
+test "open deletes nothing when the manifest has lost its last edit" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeStoreWithOneTable(tmp.dir);
+
+    // Damage the last byte of the manifest. The edit that recorded the
+    // flush no longer counts, so the manifest names the first log, which
+    // the flush deleted, and holds no table.
+    {
+        const file = try tmp.dir.openFile(testing.io, manifest.file_name, .{ .mode = .read_write });
+        defer file.close(testing.io);
+        const len = try file.length(testing.io);
+        var last: [1]u8 = undefined;
+        _ = try file.readPositionalAll(testing.io, &last, len - 1);
+        last[0] ^= 0xff;
+        try file.writePositionalAll(testing.io, &last, len - 1);
+    }
+    const manifest_len_before = blk: {
+        const file = try tmp.dir.openFile(testing.io, manifest.file_name, .{ .mode = .read_only });
+        defer file.close(testing.io);
+        break :blk try file.length(testing.io);
+    };
+
+    try testing.expectError(error.Corrupt, openStore(tmp.dir));
+
+    // The table that holds the data is still there, and so is all of the
+    // manifest.
+    try expectNumberedFiles(tmp.dir, &.{ "000002.log", "000003.sst" });
+    const file = try tmp.dir.openFile(testing.io, manifest.file_name, .{ .mode = .read_only });
+    defer file.close(testing.io);
+    try testing.expectEqual(manifest_len_before, try file.length(testing.io));
+}
+
+/// Makes a store in `dir` that holds one write in its first log, closes
+/// it, and returns the last record of that log.
+fn makeStoreWithOneWrite(dir: Io.Dir) !wal.RecordId {
+    var store = try openStore(dir);
+    defer store.close(testing.allocator);
+    try store.put("a", "1");
+    return store.log.last;
+}
+
+/// Creates an empty log file that says it carries on from `previous`.
+fn createLogAfter(dir: Io.Dir, name: []const u8, previous: wal.RecordId) !void {
+    var log: wal.Writer = try .create(testing.io, dir, name, log_payload_size_max, previous);
+    log.close();
+}
+
+test "a newer log is accepted only if it carries on from the manifest's log" {
+    // The right record: the store opens, and flushes the first log.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const last = try makeStoreWithOneWrite(tmp.dir);
+        try createLogAfter(tmp.dir, "000002.log", last);
+
+        var store = try openStore(tmp.dir);
+        defer store.close(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), store.tables.count());
+        try expectValue(&store, "a", "1");
+    }
+    // The right checksum and the wrong op.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const last = try makeStoreWithOneWrite(tmp.dir);
+        try createLogAfter(tmp.dir, "000002.log", .{ .op = last.op + 1, .checksum = last.checksum });
+        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    }
+    // The right op and the wrong checksum.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const last = try makeStoreWithOneWrite(tmp.dir);
+        try createLogAfter(tmp.dir, "000002.log", .{ .op = last.op, .checksum = last.checksum ^ 1 });
+        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    }
+    // Two logs that both carry on from it.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const last = try makeStoreWithOneWrite(tmp.dir);
+        try createLogAfter(tmp.dir, "000002.log", last);
+        try createLogAfter(tmp.dir, "000003.log", last);
+        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    }
+    // A file number too large to count on from.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const last = try makeStoreWithOneWrite(tmp.dir);
+        try createLogAfter(tmp.dir, "18446744073709551615.log", last);
+        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    }
+}
+
+test "a newer log beside a log that holds nothing is reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openStore(tmp.dir);
+        defer store.close(testing.allocator);
+    }
+    // A memtable is only frozen when it holds something, so a first log
+    // with no records never has a log after it.
+    try createLogAfter(tmp.dir, "000002.log", .none);
+    try testing.expectError(error.Corrupt, openStore(tmp.dir));
+}
+
+test "a newer log under a file number the manifest has handed out is reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var last: wal.RecordId = undefined;
+    {
+        var store = try openStore(tmp.dir);
+        defer store.close(testing.allocator);
+        try store.put("a", "1");
+        try store.flush();
+        try store.put("b", "2");
+        last = store.log.last;
+        // The manifest's log is 2 and its table is 3.
+        try testing.expectEqual(@as(u64, 4), store.tables.file_number_next);
+    }
+    try createLogAfter(tmp.dir, "000003.log", last);
+    try testing.expectError(error.Corrupt, openStore(tmp.dir));
+}
+
+test "a newer log beside a store with every table slot taken is reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var last: wal.RecordId = undefined;
+    var log_number_next: u64 = 0;
+    {
+        var store = try openStore(tmp.dir);
+        defer store.close(testing.allocator);
+        var number: u64 = 0;
+        while (store.tables.count() < tables_max) {
+            try putNumbered(&store, number);
+            number += 1;
+            try store.flush();
+        }
+        try putNumbered(&store, number);
+        last = store.log.last;
+        log_number_next = store.file_number_next;
+    }
+    // A memtable is only frozen when a table slot is free for it.
+    var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+    try createLogAfter(tmp.dir, logName(&name_buffer, log_number_next), last);
+    try testing.expectError(error.Corrupt, openStore(tmp.dir));
+}
+
+test "a later log with no manifest is not taken for a new store" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createLogAfter(tmp.dir, "000002.log", .none);
+
+    try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    try expectNumberedFiles(tmp.dir, &.{"000002.log"});
+}
+
+/// Makes a store by hand: an empty first log, and a manifest that follows
+/// `manifest_previous` and holds the one edit given.
+fn makeStoreByHand(dir: Io.Dir, edit: manifest.Edit, manifest_previous: wal.RecordId) !void {
+    try createLogAfter(dir, "000001.log", .{ .op = edit.op_flushed, .checksum = 0 });
+
+    const edit_buffer = try testing.allocator.alloc(u8, manifest.edit_size_max);
+    defer testing.allocator.free(edit_buffer);
+    const edit_bytes = manifest.encode(edit, edit_buffer);
+
+    var log: wal.Writer = try .create(
+        testing.io,
+        dir,
+        manifest.file_name,
+        manifest.edit_size_max,
+        manifest_previous,
+    );
+    defer log.close();
+    _ = try log.append(edit_bytes);
+}
+
+test "a manifest whose numbers are too large to count on from is reported" {
+    const largest = std.math.maxInt(u64);
+    const first_edit: manifest.Edit = .{
+        .added = &.{},
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 2,
+        .op_flushed = 0,
+        .sequence_flushed = 0,
+    };
+
+    // The same store with ordinary numbers opens.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try makeStoreByHand(tmp.dir, first_edit, .none);
+        var store = try openStore(tmp.dir);
+        defer store.close(testing.allocator);
+        try store.put("a", "1");
+        try expectValue(&store, "a", "1");
+    }
+    // The largest sequence number: the next write would have none.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var edit = first_edit;
+        edit.sequence_flushed = largest;
+        try makeStoreByHand(tmp.dir, edit, .none);
+        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    }
+    // The largest file number: the next flush would have none.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var edit = first_edit;
+        edit.file_number_next = largest;
+        try makeStoreByHand(tmp.dir, edit, .none);
+        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    }
+    // A manifest whose own last record has the largest op: the next edit
+    // would have none.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try makeStoreByHand(tmp.dir, first_edit, .{ .op = largest - 1, .checksum = 0 });
+        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    }
+}
+
+test "a table with a block longer than the store's buffers is reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A table as a build with a larger block size would write it: 200
+    // entries in one block.
+    const entry_count = 200;
+    const block_size_large = 4 * sstable.block_size_max;
+    const block_buffer = try testing.allocator.alloc(u8, block_size_large);
+    defer testing.allocator.free(block_buffer);
+    const index_buffer = try testing.allocator.alloc(u8, sstable.indexSizeMax(2, key_size_max));
+    defer testing.allocator.free(index_buffer);
+
+    var key_buffer: [8]u8 = undefined;
+    var value_buffer: [test_value_size]u8 = undefined;
+    var summary: sstable.Writer.Summary = undefined;
+    {
+        var writer: sstable.Writer = try .create(
+            testing.io,
+            tmp.dir,
+            "000002.sst",
+            .{ .block_size = block_size_large },
+            .{ .block = block_buffer, .index = index_buffer },
+        );
+        defer writer.close();
+        var number: u64 = 0;
+        while (number < entry_count) {
+            const key = numberedKey(&key_buffer, number);
+            const value = numberedValue(&value_buffer, number);
+            try writer.add(key, value, number + 1);
+            number += 1;
+        }
+        summary = try writer.finish();
+    }
+
+    var key_min_buffer: [8]u8 = undefined;
+    var key_max_buffer: [8]u8 = undefined;
+    const table: manifest.Table = .{
+        .file_number = 2,
+        .level = 0,
+        .file_size = summary.file_size,
+        .checksum = summary.checksum,
+        .sequence_min = 1,
+        .sequence_max = entry_count,
+        .key_min = numberedKey(&key_min_buffer, 0),
+        .key_max = numberedKey(&key_max_buffer, entry_count - 1),
+    };
+    try makeStoreByHand(tmp.dir, .{
+        .added = &.{table},
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 3,
+        .op_flushed = 0,
+        .sequence_flushed = entry_count,
+    }, .none);
+
+    try testing.expectError(error.BlockTooLarge, openStore(tmp.dir));
 }
 
 const model_key_count = 48;
