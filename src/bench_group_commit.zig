@@ -31,6 +31,17 @@
 //! own, so a reader takes a lock alone, and the leader holds the same lock
 //! for the whole time it writes a group, sync included. A read sees all of a
 //! group or none of it.
+//!
+//! Readers and the leader take turns. The lock by itself does not see to
+//! that: a leader that has just let go of it can take it again for the next
+//! group before a waiting reader has woken, and with a thread that writes
+//! without pause the readers then hardly ever get in. So before a leader
+//! writes a group, it waits for as many reads to finish as were waiting when
+//! the group before it was done. That is roughly what a server which takes
+//! requests in turn would do: the reads that arrived during a sync run
+//! before the next write. It is only roughly that, because the reads that
+//! finish need not be the very ones that were waiting, and because the
+//! leader waits by spinning, which uses a core while the reads run.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -45,10 +56,10 @@ pub const GroupCommitter = struct {
     io: Io,
     /// Only the thread that is leading a group writes to the store.
     store: *kv.Store,
-    /// Held shared by a thread that is reading from the store, and held
-    /// alone by the leader while it writes a group to the store.
+    /// Held alone by a thread that is reading from the store, and by the
+    /// leader while it writes a group to the store. Never held shared.
     readers: Io.RwLock,
-    /// Guards every field below.
+    /// Guards every field below but the three that count reads.
     mutex: Io.Mutex,
     /// Signalled each time a group has been written.
     group_written: Io.Condition,
@@ -69,6 +80,13 @@ pub const GroupCommitter = struct {
     failed_from_group: u64,
     /// How many groups have been written without an error.
     groups_written: u64,
+    /// How many threads are in `get`, waiting to read or reading.
+    reads_waiting: std.atomic.Value(u64),
+    /// How many calls to `get` have finished.
+    reads_finished: std.atomic.Value(u64),
+    /// The next group is not written until `reads_finished` has reached
+    /// this. Only the leader reads and writes it.
+    reads_owed_until: u64,
 
     pub const Error = error{
         /// The key is longer than `write_batch.key_size_max`.
@@ -100,6 +118,9 @@ pub const GroupCommitter = struct {
             .failure = null,
             .failed_from_group = 0,
             .groups_written = 0,
+            .reads_waiting = .init(0),
+            .reads_finished = .init(0),
+            .reads_owed_until = 0,
         };
     }
 
@@ -143,10 +164,15 @@ pub const GroupCommitter = struct {
     ///
     /// Reports `BufferTooSmall` if the value does not fit in `buffer`.
     pub fn get(self: *GroupCommitter, key: []const u8, buffer: []u8) GetError!?[]u8 {
-        self.readers.lockUncancelable(self.io);
-        defer self.readers.unlock(self.io);
+        _ = self.reads_waiting.fetchAdd(1, .seq_cst);
 
-        return self.store.get(key, buffer);
+        self.readers.lockUncancelable(self.io);
+        const result = self.store.get(key, buffer);
+        self.readers.unlock(self.io);
+
+        _ = self.reads_waiting.fetchSub(1, .seq_cst);
+        _ = self.reads_finished.fetchAdd(1, .seq_cst);
+        return result;
     }
 
     /// How many groups have been written without an error. Each one was one
@@ -243,9 +269,26 @@ pub const GroupCommitter = struct {
     /// Writes the group in `writing` to the store, with readers kept out.
     /// Only the leader calls this, with the mutex released.
     fn writeToStore(self: *GroupCommitter) kv.Store.WriteError!void {
+        // As many reads as were waiting when the group before this one was
+        // done go first. Each thread that was counted is in `get` and will
+        // finish, so this loop ends.
+        while (self.reads_finished.load(.seq_cst) < self.reads_owed_until) {
+            std.Thread.yield() catch {};
+        }
+
         self.readers.lockUncancelable(self.io);
-        defer self.readers.unlock(self.io);
-        try self.store.write(&self.writing);
+        const result = self.store.write(&self.writing);
+
+        // `reads_finished` is read before `reads_waiting`. A thread leaves
+        // `reads_waiting` before it joins `reads_finished`, so every thread
+        // counted as waiting here has yet to be counted as finished, and
+        // the sum is a count that will be reached.
+        const finished = self.reads_finished.load(.seq_cst);
+        const waiting = self.reads_waiting.load(.seq_cst);
+        self.reads_owed_until = finished + waiting;
+        self.readers.unlock(self.io);
+
+        return result;
     }
 };
 

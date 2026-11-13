@@ -12,9 +12,16 @@
 //!     --key_size=N          bytes in each key, at least 8
 //!     --value_size=N        bytes in each value
 //!     --batch_size=N        operations in each write batch
-//!     --threads=N           threads that work at once. Each writes `num`
+//!     --writes=N            writes each thread makes in a write workload;
+//!                           defaults to `--num`. Keys picked at random
+//!                           still come from the first `num`
+//!     --threads=N           threads that work at once. Each writes `writes`
 //!                           keys one at a time, or does `reads` lookups
 //!     --seek_nexts=N        entries read after each seek in `seekrandom`
+//!     --duration=N          stop a workload of random reads or writes after
+//!                           N seconds, if it has not finished by then
+//!     --histogram=1         time every operation, and print the spread of
+//!                           the times after the workload's result
 //!     --seed=N              seed for the random keys
 //!     --db=PATH             directory of the store
 //!     --use_existing_db=1   keep the store's contents for `fillseq` and
@@ -26,13 +33,20 @@
 //! readers out while a batch is written. That batching is the client's, not
 //! the store's.
 //!
-//! Two things differ from `db_bench`. Every write batch is synced to disk
+//! Four things differ from `db_bench`. Every write batch is synced to disk
 //! before the write returns, because bean has no unsynced mode, which is
-//! what `db_bench --sync=1` does. And a store holds only what fits in its
-//! memtable until flushing is built, so a workload that fills it stops early
-//! and says so.
+//! what `db_bench --sync=1` does. A store holds at most `kv.tables_max`
+//! tables until compaction is built, so a workload that fills it stops early
+//! and says so. With `--histogram=1` the times are exact, where `db_bench`
+//! counts them in buckets of whole microseconds and estimates within a
+//! bucket. And with `--duration` a workload still stops at its count of
+//! operations, where `db_bench` then ignores the count; give a count the
+//! workload will not reach to have the time alone decide. With
+//! `--histogram=1` room is set aside to time every one of those operations,
+//! eight bytes each, so the count cannot be made as large as you like.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 
 const GroupCommitter = @import("bench_group_commit.zig").GroupCommitter;
@@ -53,24 +67,39 @@ const key_number_size = @sizeOf(u64);
 /// The most threads `--threads` accepts.
 const threads_max = 64;
 
+/// The most operations `--histogram=1` will set aside room to time: eight
+/// bytes each, so 2 GiB.
+const samples_max = 256 * 1024 * 1024;
+
 const Benchmark = enum {
     /// Writes every key once, in key order, into an empty store.
     fillseq,
-    /// Writes `num` keys picked at random, into an empty store.
+    /// Writes `writes` keys picked at random, into an empty store.
     fillrandom,
-    /// Writes `num` keys picked at random, into the store as it is.
+    /// Writes `writes` keys picked at random, into the store as it is.
     overwrite,
     /// Looks up `reads` keys picked at random. With `--threads` above 1,
     /// every thread looks up `reads` keys.
     readrandom,
-    /// The same lookups from `--threads` threads, while one more thread
-    /// writes keys picked at random, one at a time, until they finish.
+    /// The same, but every key is one the workloads never write: a written
+    /// key with one more byte on the end, as in `db_bench`. Such a key sorts
+    /// between two written keys, so only looking in the tables can rule it
+    /// out.
+    readmissing,
+    /// The lookups of `readrandom` from `--threads` threads, while one
+    /// more thread writes keys picked at random, one at a time, until they
+    /// finish.
     readwhilewriting,
     /// Reads `reads` entries in key order from the start of the store.
     readseq,
     /// Seeks to `reads` keys picked at random, and reads `seek_nexts`
-    /// entries after each.
+    /// entries from each, or one entry if `seek_nexts` is 0.
     seekrandom,
+    /// Writes everything the memtables hold to tables, so that every entry
+    /// is in a table and the logs are empty.
+    flush,
+    /// Prints how many tables the store has, and their size.
+    levelstats,
 };
 
 const Config = struct {
@@ -81,11 +110,17 @@ const Config = struct {
     key_size: usize = 16,
     value_size: usize = 100,
     batch_size: u64 = 1,
+    /// `null` means the same as `num`.
+    writes: ?u64 = null,
     threads: u64 = 1,
     seek_nexts: u64 = 0,
     seed: u64 = 0,
     db: []const u8 = ".zig-cache/bean-bench",
     use_existing_db: bool = false,
+    histogram: bool = false,
+    /// Seconds after which a workload of random reads or writes stops.
+    /// 0 means no limit.
+    duration: u64 = 0,
 
     fn readCount(config: Config) u64 {
         if (config.reads) |reads| {
@@ -93,7 +128,145 @@ const Config = struct {
         }
         return config.num;
     }
+
+    fn writeCount(config: Config) u64 {
+        if (config.writes) |writes| {
+            return writes;
+        }
+        return config.num;
+    }
 };
+
+/// How the times of a workload's operations were spread.
+const LatencySummary = struct {
+    /// What was timed: "write", "read" or "seek", as `db_bench` names them.
+    operation: []const u8,
+    count: u64,
+    average_ns: f64,
+    min_ns: u64,
+    max_ns: u64,
+    p50_ns: u64,
+    p75_ns: u64,
+    p99_ns: u64,
+    p999_ns: u64,
+    p9999_ns: u64,
+};
+
+/// Returns the smallest time in `sorted_ns` that at least
+/// `per_ten_thousand` in every 10,000 of the times are no longer than.
+fn percentile(sorted_ns: []const u64, per_ten_thousand: u64) u64 {
+    assert(sorted_ns.len > 0);
+    assert(per_ten_thousand <= 10_000);
+    const count: u64 = sorted_ns.len;
+    var rank = (count * per_ten_thousand + 9_999) / 10_000;
+    if (rank == 0) {
+        rank = 1;
+    }
+    return sorted_ns[@intCast(rank - 1)];
+}
+
+/// Sorts `samples_ns` and summarizes them. Returns `null` if there are none.
+fn summarizeLatencies(operation: []const u8, samples_ns: []u64) ?LatencySummary {
+    if (samples_ns.len == 0) {
+        return null;
+    }
+    std.mem.sort(u64, samples_ns, {}, std.sort.asc(u64));
+
+    var total_ns: f64 = 0;
+    for (samples_ns) |sample_ns| {
+        total_ns += @floatFromInt(sample_ns);
+    }
+    const count: f64 = @floatFromInt(samples_ns.len);
+
+    return .{
+        .operation = operation,
+        .count = samples_ns.len,
+        .average_ns = total_ns / count,
+        .min_ns = samples_ns[0],
+        .max_ns = samples_ns[samples_ns.len - 1],
+        .p50_ns = percentile(samples_ns, 5_000),
+        .p75_ns = percentile(samples_ns, 7_500),
+        .p99_ns = percentile(samples_ns, 9_900),
+        .p999_ns = percentile(samples_ns, 9_990),
+        .p9999_ns = percentile(samples_ns, 9_999),
+    };
+}
+
+/// When a workload must stop, if it was given a time limit.
+const Deadline = struct {
+    io: Io,
+    /// A reading of `nowNs`. 0 when there is no limit.
+    end_ns: u64,
+
+    /// Starts the time now. `seconds` of 0 means no limit.
+    fn start(io: Io, seconds: u64) Deadline {
+        if (seconds == 0) {
+            return .{ .io = io, .end_ns = 0 };
+        }
+        return .{ .io = io, .end_ns = nowNs(io) + seconds * std.time.ns_per_s };
+    }
+
+    fn passed(deadline: Deadline) bool {
+        if (deadline.end_ns == 0) {
+            return false;
+        }
+        return nowNs(deadline.io) >= deadline.end_ns;
+    }
+};
+
+/// Times one thread's operations, one at a time, when `--histogram=1`.
+/// Without it, `samples_ns` is empty and the timer does nothing.
+const OperationTimer = struct {
+    io: Io,
+    /// One place for each operation the thread may time.
+    samples_ns: []u64,
+    /// How many operations have been timed.
+    count: usize,
+    /// When the operation being timed began.
+    start_ns: u64,
+
+    fn init(io: Io, samples_ns: []u64) OperationTimer {
+        return .{ .io = io, .samples_ns = samples_ns, .count = 0, .start_ns = 0 };
+    }
+
+    /// Call just before an operation.
+    fn begin(timer: *OperationTimer) void {
+        if (timer.samples_ns.len == 0) {
+            return;
+        }
+        timer.start_ns = nowNs(timer.io);
+    }
+
+    /// Call just after the operation `begin` was called for. An operation
+    /// that failed is not timed: leave this call out.
+    fn end(timer: *OperationTimer) void {
+        if (timer.samples_ns.len == 0) {
+            return;
+        }
+        assert(timer.count < timer.samples_ns.len);
+        timer.samples_ns[timer.count] = nowNs(timer.io) - timer.start_ns;
+        timer.count += 1;
+    }
+};
+
+/// Returns thread `thread_number`'s part of `samples_ns`, which holds
+/// `per_thread` places for each thread, or nothing if `samples_ns` is empty.
+fn threadSamples(samples_ns: []u64, thread_number: usize, per_thread: usize) []u64 {
+    if (samples_ns.len == 0) {
+        return samples_ns;
+    }
+    return samples_ns[thread_number * per_thread ..][0..per_thread];
+}
+
+/// Moves the times `timer` recorded to `samples_ns[gathered..]`, and returns
+/// how many times `samples_ns` then holds at its start. `timer` must have
+/// recorded into a part of `samples_ns` that starts at or after `gathered`,
+/// which holds when the threads' timers are gathered in thread order.
+fn gatherSamples(samples_ns: []u64, gathered: usize, timer: OperationTimer) usize {
+    const recorded = timer.samples_ns[0..timer.count];
+    std.mem.copyForwards(u64, samples_ns[gathered..][0..recorded.len], recorded);
+    return gathered + recorded.len;
+}
 
 /// What one workload did.
 const Result = struct {
@@ -107,12 +280,15 @@ const Result = struct {
     store_full: bool = false,
     /// How many threads did the operations.
     threads: u64 = 1,
-    /// For writes made through a group committer, how many groups the
-    /// operations went to the store in. `null` for other workloads.
+    /// For writes, how many batches the operations went to the store in.
+    /// Each batch is one sync. `null` for other workloads.
     groups: ?u64 = null,
     /// For `readwhilewriting`, how many writes the writer thread made.
     /// `null` for other workloads.
     writes_meanwhile: ?u64 = null,
+    /// With `--histogram=1`, how the times of the operations were spread.
+    /// With several threads these are the times of all of them together.
+    latency: ?LatencySummary = null,
 };
 
 const ArgumentError = error{InvalidArgument};
@@ -147,6 +323,8 @@ fn parseArgument(config: *Config, argument: []const u8) ArgumentError!void {
         config.value_size = @intCast(try parseNumber(name, value));
     } else if (std.mem.eql(u8, name, "batch_size")) {
         config.batch_size = try parseNumber(name, value);
+    } else if (std.mem.eql(u8, name, "writes")) {
+        config.writes = try parseNumber(name, value);
     } else if (std.mem.eql(u8, name, "threads")) {
         config.threads = try parseNumber(name, value);
     } else if (std.mem.eql(u8, name, "seek_nexts")) {
@@ -157,6 +335,10 @@ fn parseArgument(config: *Config, argument: []const u8) ArgumentError!void {
         config.db = value;
     } else if (std.mem.eql(u8, name, "use_existing_db")) {
         config.use_existing_db = (try parseNumber(name, value)) != 0;
+    } else if (std.mem.eql(u8, name, "histogram")) {
+        config.histogram = (try parseNumber(name, value)) != 0;
+    } else if (std.mem.eql(u8, name, "duration")) {
+        config.duration = try parseNumber(name, value);
     } else {
         std.debug.print("bean-bench: unknown flag --{s}\n", .{name});
         return error.InvalidArgument;
@@ -175,6 +357,28 @@ fn checkConfig(config: Config) ArgumentError!void {
     }
     if (config.num == 0 or config.batch_size == 0) {
         std.debug.print("bean-bench: --num and --batch_size must be at least 1\n", .{});
+        return error.InvalidArgument;
+    }
+    if (config.writes != null and config.writes.? == 0) {
+        std.debug.print("bean-bench: --writes must be at least 1\n", .{});
+        return error.InvalidArgument;
+    }
+    if (config.histogram) {
+        // Room is set aside to time every operation a workload may do.
+        var operations_max = config.readCount();
+        if (config.writeCount() > operations_max) {
+            operations_max = config.writeCount();
+        }
+        const samples = std.math.mul(u64, operations_max, config.threads) catch samples_max + 1;
+        if (samples > samples_max) {
+            std.debug.print("bean-bench: with --histogram=1, --reads and --writes times --threads must be at most {d}\n", .{samples_max});
+            return error.InvalidArgument;
+        }
+    }
+    // `readmissing` looks up keys one byte longer than `--key_size`.
+    const reads_missing = std.mem.indexOf(u8, config.benchmarks, "readmissing") != null;
+    if (reads_missing and config.key_size == key_size_max) {
+        std.debug.print("bean-bench: with readmissing, --key_size must be below {d}\n", .{key_size_max});
         return error.InvalidArgument;
     }
 
@@ -285,44 +489,126 @@ const Bench = struct {
     /// Returns key number `key_number`: the number as eight big-endian
     /// bytes, then '0' up to the key size. Valid until the next call.
     fn makeKey(self: *Bench, key_number: u64) []const u8 {
-        const key = self.key_buffer[0..self.config.key_size];
+        return self.makeKeyOfSize(key_number, self.config.key_size);
+    }
+
+    /// The same, for a key of `key_size` bytes.
+    fn makeKeyOfSize(self: *Bench, key_number: u64, key_size: usize) []const u8 {
+        const key = self.key_buffer[0..key_size];
         std.mem.writeInt(u64, key[0..key_number_size], key_number, .big);
         @memset(key[key_number_size..], '0');
         return key;
+    }
+
+    /// Which keys a lookup workload asks for.
+    const KeyChoice = enum {
+        /// Keys the write workloads write.
+        written,
+        /// Keys they never write: one byte longer than a written key.
+        missing,
+    };
+
+    /// The size of the keys a lookup workload asks for.
+    fn lookupKeySize(self: *const Bench, key_choice: KeyChoice) usize {
+        switch (key_choice) {
+            .written => return self.config.key_size,
+            .missing => return self.config.key_size + 1,
+        }
+    }
+
+    /// Returns room for each of `thread_count` threads to time `per_thread`
+    /// operations, or nothing without `--histogram=1`. The caller frees it.
+    fn allocSamples(self: *Bench, thread_count: usize, per_thread: usize) ![]u64 {
+        if (!self.config.histogram) {
+            return &.{};
+        }
+        return self.gpa.alloc(u64, thread_count * per_thread);
     }
 
     fn randomKeyNumber(self: *Bench) u64 {
         return self.prng.random().uintLessThan(u64, self.config.num);
     }
 
-    fn run(self: *Bench, benchmark: Benchmark) !Result {
+    /// Runs one workload. Returns `null` for a workload that prints what
+    /// it has to say itself.
+    fn run(self: *Bench, benchmark: Benchmark) !?Result {
         switch (benchmark) {
             .fillseq => {
                 if (!self.config.use_existing_db) {
                     self.startFromEmpty();
                 }
-                return self.writeKeys(.sequential);
+                return try self.writeKeys(.sequential);
             },
             .fillrandom => {
                 if (!self.config.use_existing_db) {
                     self.startFromEmpty();
                 }
-                return self.writeKeys(.random);
+                return try self.writeKeys(.random);
             },
-            .overwrite => return self.writeKeys(.random),
+            .overwrite => return try self.writeKeys(.random),
             .readrandom => {
                 if (self.config.threads > 1) {
-                    return self.readFromThreads(.no_writer);
+                    return try self.readFromThreads(.written, .no_writer);
                 }
-                return self.readRandom();
+                return try self.readRandom(.written);
             },
-            .readwhilewriting => return self.readFromThreads(.with_writer),
-            .readseq => return self.readSequential(),
-            .seekrandom => return self.seekRandom(),
+            .readmissing => {
+                if (self.config.threads > 1) {
+                    return try self.readFromThreads(.missing, .no_writer);
+                }
+                return try self.readRandom(.missing);
+            },
+            .readwhilewriting => return try self.readFromThreads(.written, .with_writer),
+            .readseq => return try self.readSequential(),
+            .seekrandom => return try self.seekRandom(),
+            .flush => return try self.flushStore(),
+            .levelstats => {
+                self.printTables();
+                return null;
+            },
         }
     }
 
+    /// Writes the memtables to tables. One operation, however much it wrote.
+    fn flushStore(self: *Bench) !Result {
+        var result: Result = .{ .operations = 1, .bytes = 0, .elapsed_ns = 0 };
+
+        const start_ns = nowNs(self.io);
+        self.store.flush() catch |err| switch (err) {
+            error.StoreFull => {
+                result.store_full = true;
+            },
+            else => |other| return other,
+        };
+        result.elapsed_ns = nowNs(self.io) - start_ns;
+        return result;
+    }
+
+    /// Prints how many tables the store has and how large they are together.
+    /// Entries still in a memtable are in no table.
+    fn printTables(self: *Bench) void {
+        var table_count: u64 = 0;
+        var table_bytes: u64 = 0;
+        for (self.store.tables.slots) |slot| {
+            if (slot.in_use) {
+                table_count += 1;
+                table_bytes += slot.table.file_size;
+            }
+        }
+        const megabytes = @as(f64, @floatFromInt(table_bytes)) / (1024 * 1024);
+        std.debug.print("Tables: {d} of at most {d}, {d:.1} MB\n", .{ table_count, kv.tables_max, megabytes });
+    }
+
     const KeyOrder = enum { sequential, random };
+
+    /// The time limit for a write workload, in seconds. As in `db_bench`,
+    /// `--duration` limits only writes of keys picked at random.
+    fn writeDuration(config: Config, order: KeyOrder) u64 {
+        switch (order) {
+            .sequential => return 0,
+            .random => return config.duration,
+        }
+    }
 
     /// Writes keys with one thread or with several, as `--threads` says.
     fn writeKeys(self: *Bench, order: KeyOrder) !Result {
@@ -338,6 +624,8 @@ const Bench = struct {
         committer: *GroupCommitter,
         order: KeyOrder,
         thread_number: u64,
+        /// Times each write, from the call to its being durable.
+        timer: OperationTimer,
         /// How many keys the thread wrote.
         operations: u64,
         /// Whether the thread stopped because the store was full.
@@ -345,14 +633,16 @@ const Bench = struct {
         /// Any other error that stopped the thread.
         failure: ?GroupCommitter.Error,
 
-        /// Writes `num` keys, one at a time, each durable before the next.
+        /// Writes `writes` keys, one at a time, each durable before the
+        /// next. Stops early at the time limit, if there is one.
         fn run(writer: *WriterThread) void {
             const config = writer.bench.config;
             var prng: std.Random.DefaultPrng = .init(config.seed + writer.thread_number);
             var key_buffer: [key_size_max]u8 = undefined;
             const key = key_buffer[0..config.key_size];
+            const deadline: Deadline = .start(writer.bench.io, writeDuration(config, writer.order));
 
-            while (writer.operations < config.num) {
+            while (writer.operations < config.writeCount() and !deadline.passed()) {
                 var key_number = writer.operations;
                 if (writer.order == .random) {
                     key_number = prng.random().uintLessThan(u64, config.num);
@@ -360,6 +650,7 @@ const Bench = struct {
                 std.mem.writeInt(u64, key[0..key_number_size], key_number, .big);
                 @memset(key[key_number_size..], '0');
 
+                writer.timer.begin();
                 writer.committer.put(key, writer.bench.value) catch |err| switch (err) {
                     error.StoreFull => {
                         writer.store_full = true;
@@ -370,12 +661,13 @@ const Bench = struct {
                         return;
                     },
                 };
+                writer.timer.end();
                 writer.operations += 1;
             }
         }
     };
 
-    /// Starts `threads` threads that each write `num` keys one at a time
+    /// Starts `threads` threads that each write `writes` keys one at a time
     /// through a group committer, as `db_bench` does with its threads.
     fn writeKeysFromThreads(self: *Bench, order: KeyOrder) !Result {
         const operation_bytes = self.config.key_size + self.config.value_size;
@@ -383,6 +675,10 @@ const Bench = struct {
 
         var committer: GroupCommitter = try .init(self.gpa, self.io, &self.store);
         defer committer.deinit(self.gpa);
+
+        const writes_per_thread: usize = @intCast(self.config.writeCount());
+        const samples_ns = try self.allocSamples(thread_count, writes_per_thread);
+        defer self.gpa.free(samples_ns);
 
         var writers: [threads_max]WriterThread = undefined;
         var threads: [threads_max]std.Thread = undefined;
@@ -392,6 +688,7 @@ const Bench = struct {
                 .committer = &committer,
                 .order = order,
                 .thread_number = thread_number,
+                .timer = .init(self.io, threadSamples(samples_ns, thread_number, writes_per_thread)),
                 .operations = 0,
                 .store_full = false,
                 .failure = null,
@@ -416,6 +713,7 @@ const Bench = struct {
             .threads = self.config.threads,
             .groups = committer.groupsWritten(),
         };
+        var gathered: usize = 0;
         for (writers[0..thread_count]) |writer| {
             if (writer.failure) |err| {
                 return err;
@@ -425,19 +723,30 @@ const Bench = struct {
             }
             result.operations += writer.operations;
             result.bytes += writer.operations * operation_bytes;
+            gathered = gatherSamples(samples_ns, gathered, writer.timer);
         }
+        result.latency = summarizeLatencies("write", samples_ns[0..gathered]);
         return result;
     }
 
-    /// Writes `num` keys in batches of `batch_size`, and stops early if the
-    /// store fills up.
+    /// Writes `writes` keys in batches of `batch_size`, and stops early if
+    /// the store fills up or at the time limit. With `--histogram=1` each
+    /// batch is timed, not each key, as in `db_bench`.
     fn writeKeysInBatches(self: *Bench, order: KeyOrder) !Result {
         const operation_bytes = self.config.key_size + self.config.value_size;
+        const write_count = self.config.writeCount();
         var result: Result = .{ .operations = 0, .bytes = 0, .elapsed_ns = 0 };
 
+        const batch_count: usize = @intCast(std.math.divCeil(u64, write_count, self.config.batch_size) catch unreachable);
+        const samples_ns = try self.allocSamples(1, batch_count);
+        defer self.gpa.free(samples_ns);
+        var timer: OperationTimer = .init(self.io, samples_ns);
+        const deadline: Deadline = .start(self.io, writeDuration(self.config, order));
+        var batches_written: u64 = 0;
+
         const start_ns = nowNs(self.io);
-        while (result.operations < self.config.num) {
-            const operations_left = self.config.num - result.operations;
+        while (result.operations < write_count and !deadline.passed()) {
+            const operations_left = write_count - result.operations;
             const batch_operations = @min(self.config.batch_size, operations_left);
 
             self.batch.clear();
@@ -452,6 +761,7 @@ const Bench = struct {
                 added += 1;
             }
 
+            timer.begin();
             self.store.write(&self.batch) catch |err| switch (err) {
                 error.StoreFull => {
                     result.store_full = true;
@@ -462,20 +772,33 @@ const Bench = struct {
                 // every batch hold at least one operation.
                 else => |other| return other,
             };
+            timer.end();
+            batches_written += 1;
             result.operations += batch_operations;
             result.bytes += batch_operations * operation_bytes;
         }
         result.elapsed_ns = nowNs(self.io) - start_ns;
+        result.groups = batches_written;
+        result.latency = summarizeLatencies("write", samples_ns[0..timer.count]);
         return result;
     }
 
-    fn readRandom(self: *Bench) !Result {
+    fn readRandom(self: *Bench, key_choice: KeyChoice) !Result {
         var result: Result = .{ .operations = 0, .bytes = 0, .elapsed_ns = 0, .found = 0 };
+        const key_size = self.lookupKeySize(key_choice);
+
+        const read_count: usize = @intCast(self.config.readCount());
+        const samples_ns = try self.allocSamples(1, read_count);
+        defer self.gpa.free(samples_ns);
+        var timer: OperationTimer = .init(self.io, samples_ns);
+        const deadline: Deadline = .start(self.io, self.config.duration);
 
         const start_ns = nowNs(self.io);
-        while (result.operations < self.config.readCount()) {
-            const key = self.makeKey(self.randomKeyNumber());
+        while (result.operations < self.config.readCount() and !deadline.passed()) {
+            const key = self.makeKeyOfSize(self.randomKeyNumber(), key_size);
+            timer.begin();
             const value = try self.store.get(key, self.read_buffer);
+            timer.end();
             if (value != null) {
                 result.found.? += 1;
                 result.bytes += key.len + value.?.len;
@@ -483,6 +806,7 @@ const Bench = struct {
             result.operations += 1;
         }
         result.elapsed_ns = nowNs(self.io) - start_ns;
+        result.latency = summarizeLatencies("read", samples_ns[0..timer.count]);
         return result;
     }
 
@@ -491,6 +815,10 @@ const Bench = struct {
         bench: *Bench,
         committer: *GroupCommitter,
         thread_number: u64,
+        /// The size of the keys to look up.
+        key_size: usize,
+        /// Times each lookup, the wait for its turn included.
+        timer: OperationTimer,
         /// Holds each value read. As long as the values the benchmark
         /// writes.
         value_buffer: []u8,
@@ -500,22 +828,26 @@ const Bench = struct {
         /// An error that stopped the thread.
         failure: ?GroupCommitter.GetError,
 
-        /// Looks up `reads` keys picked at random.
+        /// Looks up `reads` keys picked at random. Stops early at the time
+        /// limit, if there is one.
         fn run(reader: *ReaderThread) void {
             const config = reader.bench.config;
             var prng: std.Random.DefaultPrng = .init(config.seed + reader.thread_number);
             var key_buffer: [key_size_max]u8 = undefined;
-            const key = key_buffer[0..config.key_size];
+            const key = key_buffer[0..reader.key_size];
+            const deadline: Deadline = .start(reader.bench.io, config.duration);
 
-            while (reader.operations < config.readCount()) {
+            while (reader.operations < config.readCount() and !deadline.passed()) {
                 const key_number = prng.random().uintLessThan(u64, config.num);
                 std.mem.writeInt(u64, key[0..key_number_size], key_number, .big);
                 @memset(key[key_number_size..], '0');
 
+                reader.timer.begin();
                 const value = reader.committer.get(key, reader.value_buffer) catch |err| {
                     reader.failure = err;
                     return;
                 };
+                reader.timer.end();
                 if (value != null) {
                     reader.found += 1;
                     reader.bytes += key.len + value.?.len;
@@ -561,8 +893,13 @@ const Bench = struct {
     /// Starts `threads` threads that each look up `reads` keys through a
     /// group committer. With `.with_writer`, one more thread writes until
     /// they have finished.
-    fn readFromThreads(self: *Bench, writer_choice: WriterChoice) !Result {
+    fn readFromThreads(self: *Bench, key_choice: KeyChoice, writer_choice: WriterChoice) !Result {
         const thread_count: usize = @intCast(self.config.threads);
+        const key_size = self.lookupKeySize(key_choice);
+
+        const reads_per_thread: usize = @intCast(self.config.readCount());
+        const samples_ns = try self.allocSamples(thread_count, reads_per_thread);
+        defer self.gpa.free(samples_ns);
 
         var committer: GroupCommitter = try .init(self.gpa, self.io, &self.store);
         defer committer.deinit(self.gpa);
@@ -578,6 +915,8 @@ const Bench = struct {
                 .bench = self,
                 .committer = &committer,
                 .thread_number = thread_number,
+                .key_size = key_size,
+                .timer = .init(self.io, threadSamples(samples_ns, thread_number, reads_per_thread)),
                 .value_buffer = value_buffers[buffer_start..][0..self.config.value_size],
                 .operations = 0,
                 .found = 0,
@@ -622,6 +961,7 @@ const Bench = struct {
         if (writer_choice == .with_writer) {
             result.writes_meanwhile = writer.operations;
         }
+        var gathered: usize = 0;
         for (readers[0..thread_count]) |reader| {
             if (reader.failure) |err| {
                 return err;
@@ -629,7 +969,9 @@ const Bench = struct {
             result.operations += reader.operations;
             result.found.? += reader.found;
             result.bytes += reader.bytes;
+            gathered = gatherSamples(samples_ns, gathered, reader.timer);
         }
+        result.latency = summarizeLatencies("read", samples_ns[0..gathered]);
         return result;
     }
 
@@ -650,30 +992,57 @@ const Bench = struct {
         return result;
     }
 
+    /// Seeks to keys picked at random and reads on from each. A seek counts
+    /// as found when it lands on the very key it asked for, as in
+    /// `db_bench`, not when it lands on any entry.
     fn seekRandom(self: *Bench) !Result {
         var result: Result = .{ .operations = 0, .bytes = 0, .elapsed_ns = 0, .found = 0 };
 
-        const start_ns = nowNs(self.io);
-        var entries = self.store.iterator(&self.scan_buffers);
-        while (result.operations < self.config.readCount()) {
-            try entries.seek(self.makeKey(self.randomKeyNumber()));
+        // `db_bench` moves its cursor on `seek_nexts` times after a seek.
+        // Reading an entry here moves the cursor on once, so this reads
+        // `seek_nexts` entries. It reads one even when `seek_nexts` is 0,
+        // because the only way to see where a seek landed is to read.
+        var entries_wanted = self.config.seek_nexts;
+        if (entries_wanted == 0) {
+            entries_wanted = 1;
+        }
 
-            // The entry the seek lands on, then `seek_nexts` more.
+        const read_count: usize = @intCast(self.config.readCount());
+        const samples_ns = try self.allocSamples(1, read_count);
+        defer self.gpa.free(samples_ns);
+        var timer: OperationTimer = .init(self.io, samples_ns);
+        const deadline: Deadline = .start(self.io, self.config.duration);
+
+        const start_ns = nowNs(self.io);
+        while (result.operations < self.config.readCount() and !deadline.passed()) {
+            const target = self.makeKey(self.randomKeyNumber());
+            var landed_on_target = false;
+
+            // A new cursor for every seek, as in `db_bench`.
+            timer.begin();
+            var entries = self.store.iterator(&self.scan_buffers);
+            try entries.seek(target);
             var entries_read: u64 = 0;
-            while (entries_read <= self.config.seek_nexts) {
+            while (entries_read < entries_wanted) {
                 const entry = try entries.next();
                 if (entry == null) {
                     break;
                 }
+                if (entries_read == 0 and std.mem.eql(u8, entry.?.key, target)) {
+                    landed_on_target = true;
+                }
                 result.bytes += entry.?.key.len + entry.?.value.len;
                 entries_read += 1;
             }
-            if (entries_read > 0) {
+            timer.end();
+
+            if (landed_on_target) {
                 result.found.? += 1;
             }
             result.operations += 1;
         }
         result.elapsed_ns = nowNs(self.io) - start_ns;
+        result.latency = summarizeLatencies("seek", samples_ns[0..timer.count]);
         return result;
     }
 };
@@ -721,6 +1090,36 @@ fn printResult(name: []const u8, result: Result) void {
         std.debug.print(" (stopped: the store is full)", .{});
     }
     std.debug.print("\n", .{});
+
+    if (result.latency) |latency| {
+        printLatency(latency);
+    }
+}
+
+fn microseconds(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_us;
+}
+
+/// Prints the spread of the times in the layout `db_bench --histogram=1`
+/// uses, without its standard deviation and its table of buckets.
+fn printLatency(latency: LatencySummary) void {
+    std.debug.print("Microseconds per {s}:\n", .{latency.operation});
+    std.debug.print("Count: {d} Average: {d:.4}\n", .{
+        latency.count,
+        latency.average_ns / std.time.ns_per_us,
+    });
+    std.debug.print("Min: {d:.2} Median: {d:.2} Max: {d:.2}\n", .{
+        microseconds(latency.min_ns),
+        microseconds(latency.p50_ns),
+        microseconds(latency.max_ns),
+    });
+    std.debug.print("Percentiles: P50: {d:.2} P75: {d:.2} P99: {d:.2} P99.9: {d:.2} P99.99: {d:.2}\n", .{
+        microseconds(latency.p50_ns),
+        microseconds(latency.p75_ns),
+        microseconds(latency.p99_ns),
+        microseconds(latency.p999_ns),
+        microseconds(latency.p9999_ns),
+    });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -736,6 +1135,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Keys:       {d} bytes each\n", .{config.key_size});
     std.debug.print("Values:     {d} bytes each\n", .{config.value_size});
     std.debug.print("Entries:    {d}\n", .{config.num});
+    std.debug.print("Writes:     {d} for each thread\n", .{config.writeCount()});
     std.debug.print("Batch size: {d}\n", .{config.batch_size});
     std.debug.print("Threads:    {d}\n", .{config.threads});
     std.debug.print("Sync:       every write batch\n", .{});
@@ -752,6 +1152,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
         const result = try bench.run(benchmark.?);
-        printResult(name, result);
+        if (result != null) {
+            printResult(name, result.?);
+        }
     }
 }
