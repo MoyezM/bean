@@ -57,12 +57,20 @@ def allocate_and_write(fd, path, size):
     # Reserves the space and writes zeros over all of it, so that later
     # writes change only data and never the file's metadata.
     os.posix_fallocate(fd, 0, size)
-    zeros = bytes(1024 * 1024)
+    # The descriptor may be open for direct I/O, so the zeros come from an
+    # aligned mapping, and are sliced through a view so that no unaligned
+    # copy is made.
+    zeros = mmap.mmap(-1, 1024 * 1024)
+    view = memoryview(zeros)
     offset = 0
     while offset < size:
-        length = min(len(zeros), size - offset)
-        os.pwrite(fd, zeros[:length], offset)
+        length = min(len(view), size - offset)
+        written = os.pwrite(fd, view[:length], offset)
+        if written != length:
+            raise RuntimeError("short write while preparing the file")
         offset += length
+    view.release()
+    zeros.close()
     sync_file_and_directory(fd, path)
 
 

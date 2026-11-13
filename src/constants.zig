@@ -79,3 +79,9 @@ pub const tables_max = 8;
 /// The number of levels tables are arranged in. A table written from the
 /// memtable is at level 0.
 pub const level_count = 2;
+
+/// How many I/O operations can be queued for the kernel at once on Linux,
+/// where they are handed over in one system call. It must be a power of
+/// two. More operations than this can be in flight: a full queue is handed
+/// over early to make room.
+pub const async_io_ring_entries = 128;
