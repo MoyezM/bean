@@ -625,11 +625,21 @@ pub const Storage = struct {
             return;
         }
         const file = &self.files[operation.file.index];
+        const durable_was_current = file.durable_version == file.visible_version;
         self.writeInto(&file.visible, operation.offset, operation.buffer);
         file.visible_version += 1;
         if (operation.durability == .durable) {
-            self.gpa.free(file.durable);
-            file.durable = self.gpa.dupe(u8, file.visible) catch outOfMemory();
+            // The sync that follows a durable write makes the whole file
+            // durable, not only this write.
+            if (durable_was_current) {
+                // Only this write separates the two copies, so applying it
+                // to the durable copy brings that one up to date without
+                // copying the whole file.
+                self.writeInto(&file.durable, operation.offset, operation.buffer);
+            } else {
+                self.gpa.free(file.durable);
+                file.durable = self.gpa.dupe(u8, file.visible) catch outOfMemory();
+            }
             file.durable_version = file.visible_version;
         }
         operation.result = {};

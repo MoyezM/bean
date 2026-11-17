@@ -411,7 +411,7 @@ const Bench = struct {
     gpa: std.mem.Allocator,
     config: Config,
     dir: Io.Dir,
-    store: kv.Store,
+    store: kv.DiskStore,
     batch: WriteBatch,
     prng: std.Random.DefaultPrng,
     key_buffer: [key_size_max]u8,
@@ -422,12 +422,12 @@ const Bench = struct {
     /// been written with a larger `--value_size` than this run's.
     read_buffer: []u8,
     /// The memory the scans work in.
-    scan_buffers: kv.Store.IteratorBuffers,
+    scan_buffers: kv.DiskStore.IteratorBuffers,
 
     fn open(io: Io, gpa: std.mem.Allocator, config: Config) !Bench {
         var dir = try Io.Dir.cwd().createDirPathOpen(io, config.db, .{});
         errdefer dir.close(io);
-        var store: kv.Store = try .open(gpa, io, dir, .{});
+        var store: kv.DiskStore = try .open(gpa, io, dir, .{});
         errdefer store.close(gpa);
         var batch: WriteBatch = try .init(gpa);
         errdefer batch.deinit(gpa);
@@ -439,7 +439,7 @@ const Bench = struct {
 
         const read_buffer = try gpa.alloc(u8, value_size_max);
         errdefer gpa.free(read_buffer);
-        const scan_buffers: kv.Store.IteratorBuffers = try .init(gpa);
+        const scan_buffers: kv.DiskStore.IteratorBuffers = try .init(gpa);
 
         return .{
             .io = io,

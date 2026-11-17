@@ -69,24 +69,12 @@ const Io = std.Io;
 const async_io = @import("async_io.zig");
 const AsyncIo = async_io.AsyncIo;
 const constants = @import("constants.zig");
-const durable = @import("durable.zig");
 const manifest = @import("manifest.zig");
 const MemTable = @import("memtable.zig").MemTable;
 const sector_log = @import("sector_log.zig");
 const sstable = @import("sstable.zig");
-const Storage = @import("storage.zig").Storage;
+const DiskStorage = @import("storage.zig").Storage;
 const wal = @import("wal.zig");
-
-/// The store's write-ahead logs, on the real disk.
-const Log = sector_log.LogType(Storage);
-
-/// The writer and the reader of the store's manifest.
-const ManifestWriter = manifest.WriterType(Storage);
-const ManifestReader = manifest.ReaderType(Storage);
-
-/// The writer and the reader of the store's table files.
-const TableWriter = sstable.WriterType(Storage);
-const TableReader = sstable.ReaderType(Storage);
 const write_batch = @import("write_batch.zig");
 const WriteBatch = write_batch.WriteBatch;
 
@@ -103,12 +91,6 @@ pub const tables_max = manifest.tables_max;
 /// How many bytes of the frozen memtable a write flushes for every byte it
 /// may add to the active one.
 const flush_pace = constants.flush_pace;
-
-/// The name of the file a store holds locked for as long as it is open, so
-/// that a directory is never open in two stores at once. The file is empty,
-/// and is left in the directory when the store is closed or when `open`
-/// fails: only the lock on it means anything.
-const lock_file_name = "LOCK";
 
 /// The longest payload the store's logs accept: one batch.
 const log_payload_size_max: u32 = write_batch.size_max;
@@ -175,1646 +157,1667 @@ pub const Options = struct {
     create_if_missing: bool = true,
 };
 
-pub const Store = struct {
-    io: Io,
-    /// The store's directory. The caller keeps it open for as long as the
-    /// store is.
-    dir: Io.Dir,
-    /// Held locked from `open` to `close`.
-    lock_file: Io.File,
+/// A store on a real disk.
+pub const DiskStore = StoreType(DiskStorage);
 
-    /// The event loop the store's log I/O runs on, and the storage layer
-    /// over it. They are allocated apart from the store because operations
-    /// in flight hold pointers to them.
-    event_loop: *AsyncIo,
-    storage: *Storage,
+/// A store whose files are kept by a `Storage`: the real one in
+/// `storage.zig`, or the simulated one in `testing/storage.zig`.
+pub fn StoreType(comptime Storage: type) type {
+    return struct {
+        const Store = @This();
 
-    /// The two memtables. They are allocated apart from the store so that a
-    /// flush's cursor into one stays valid if the `Store` value is moved.
-    memtables: *[2]MemTable,
-    /// Which of the two takes the writes. The other one is empty, unless it
-    /// is frozen and being flushed.
-    active_index: usize,
-    /// The sequence number of the last operation written, or 0 if there has
-    /// been none.
-    sequence_last: u64,
+        /// The store's write-ahead logs.
+        const Log = sector_log.LogType(Storage);
 
-    /// The log the active memtable's writes go to.
-    log: Log.Writer,
-    /// Holds one log record: the one being appended, or the one being
-    /// replayed in `open`. Creating a log also writes the file out from it.
-    log_buffer: []align(sector_size) u8,
-    /// The length of each log file this store creates.
-    log_file_size: u64,
-    /// The file number of that log.
-    log_number: u64,
-    /// The next file number to hand out. It runs ahead of the manifest's,
-    /// which only learns of a number when an edit is written.
-    file_number_next: u64,
+        /// The writer and the reader of the store's manifest.
+        const ManifestWriter = manifest.WriterType(Storage);
+        const ManifestReader = manifest.ReaderType(Storage);
 
-    /// The tables the store has, as the manifest records them.
-    tables: manifest.TableSet,
-    manifest_writer: ManifestWriter,
-    /// One open table file for each table in `tables`.
-    slots: [tables_max]TableSlot,
-    /// The flush in progress, if there is one.
-    flushing: ?Flush,
+        /// The writer and the reader of the store's table files.
+        const TableWriter = sstable.WriterType(Storage);
+        const TableReader = sstable.ReaderType(Storage);
 
-    /// A batch for `put` and `delete` to build their one operation in. Its
-    /// buffer also holds each record while a log is replayed in `open`.
-    scratch: WriteBatch,
-    /// Holds one manifest edit, while it is read or written.
-    edit_buffer: []u8,
-    /// Room for the index of every table: `tables_max` parts of
-    /// `sstable.index_size_max` bytes, one for each slot.
-    index_storage: []u8,
-    /// Holds the data block a flush is filling.
-    flush_block_buffer: []u8,
-    /// Holds the data block `get` is reading.
-    get_block_buffer: []u8,
+        /// Where the store's files are. The store holds its lock from `open`
+        /// to `close`. Operations in flight hold pointers to the storage, so it
+        /// does not move.
+        storage: *Storage,
+        /// The event loop under the storage, when `open` made both and the
+        /// store owns them. `null` when the caller gave the store its storage.
+        event_loop_owned: ?*AsyncIo,
 
-    /// Set when a write to a file has failed. The state of the files is
-    /// then unknown, so every later write is refused.
-    broken: bool,
-    /// How many times a write or a flush has been asked for. A scan
-    /// remembers this number, to tell that nothing has changed under it.
-    write_count: u64,
+        /// The two memtables. They are allocated apart from the store so that a
+        /// flush's cursor into one stays valid if the `Store` value is moved.
+        memtables: *[2]MemTable,
+        /// Which of the two takes the writes. The other one is empty, unless it
+        /// is frozen and being flushed.
+        active_index: usize,
+        /// The sequence number of the last operation written, or 0 if there has
+        /// been none.
+        sequence_last: u64,
 
-    /// One table file, open for reading.
-    const TableSlot = struct {
-        in_use: bool,
-        /// Only meaningful while the slot is in use.
-        file_number: u64,
-        reader: TableReader,
-    };
+        /// The log the active memtable's writes go to.
+        log: Log.Writer,
+        /// Holds one log record: the one being appended, or the one being
+        /// replayed in `open`. Creating a log also writes the file out from it.
+        log_buffer: []align(sector_size) u8,
+        /// The length of each log file this store creates.
+        log_file_size: u64,
+        /// The file number of that log.
+        log_number: u64,
+        /// The next file number to hand out. It runs ahead of the manifest's,
+        /// which only learns of a number when an edit is written.
+        file_number_next: u64,
 
-    /// How far a flush has got.
-    const FlushStage = enum {
-        /// Entries are being written to the table file.
-        writing,
-        /// The table file is complete and synced.
-        table_written,
-        /// The manifest names the table and the new log.
-        table_recorded,
-        /// A step failed. The frozen memtable is kept for reads, and the
-        /// flush is run again when the store is next opened.
-        failed,
-    };
+        /// The tables the store has, as the manifest records them.
+        tables: manifest.TableSet,
+        manifest_writer: ManifestWriter,
+        /// One open table file for each table in `tables`.
+        slots: [tables_max]TableSlot,
+        /// The flush in progress, if there is one.
+        flushing: ?Flush,
 
-    /// A flush in progress: the frozen memtable, and the table it is being
-    /// written to.
-    const Flush = struct {
-        stage: FlushStage,
-        /// Which memtable is frozen.
-        memtable_index: usize,
-        /// The file number of the frozen memtable's log, which is deleted
-        /// when the flush is done.
-        log_number_old: u64,
-        /// The last op and the last sequence number in the frozen memtable.
-        /// They were noted when it was frozen: by the time the flush ends,
-        /// the store's own have moved on.
-        op_flushed: u64,
-        sequence_flushed: u64,
+        /// A batch for `put` and `delete` to build their one operation in. Its
+        /// buffer also holds each record while a log is replayed in `open`.
+        scratch: WriteBatch,
+        /// Holds one manifest edit, while it is read or written.
+        edit_buffer: []u8,
+        /// Room for the index of every table: `tables_max` parts of
+        /// `sstable.index_size_max` bytes, one for each slot.
+        index_storage: []u8,
+        /// Holds the data block a flush is filling.
+        flush_block_buffer: []u8,
+        /// Holds the data block `get` is reading.
+        get_block_buffer: []u8,
 
-        /// The file number of the table being written.
-        table_number: u64,
-        /// The slot the table will be opened in. The writer builds the
-        /// table's index in that slot's part of `index_storage`.
-        slot_index: usize,
-        /// Open while the stage is `writing`.
-        writer: TableWriter,
-        cursor: MemTable.Iterator,
-        /// The entry to write next, or `null` once every entry is written.
-        entry_next: ?MemTable.Entry,
-
-        /// What the manifest will record about the table. The keys point
-        /// into the frozen memtable.
-        key_min: []const u8,
-        key_max: []const u8,
-        sequence_min: u64,
-        sequence_max: u64,
-        /// Set once the stage is past `writing`.
-        summary: TableWriter.Summary,
-    };
-
-    /// What a flush can report.
-    pub const FlushError = error{
-        /// The table that was just written does not read back as written.
-        Corrupt,
-    } || Io.File.OpenError || Io.File.WritePositionalError || Io.File.SyncError ||
-        Io.File.LengthError || Io.File.ReadPositionalError ||
-        Io.Dir.OpenError || Io.Dir.DeleteFileError ||
-        Log.Writer.CreateError || Storage.WriteError;
-
-    /// What `open` can report. Opening a log can also report
-    /// `IncompleteLog`, which is not here: `open` handles it itself.
-    pub const OpenError = error{
-        /// `dir` holds no store and `create_if_missing` is false.
-        StoreNotFound,
-        /// Another store has `dir` open, in this process or another one.
-        StoreAlreadyOpen,
-        /// The manifest or a log does not start with a valid file header.
-        NotALog,
-        /// A file is missing or damaged in a way that a crash cannot
-        /// explain.
-        Corrupt,
-        /// A log holds a record that is not a valid batch.
-        InvalidBatch,
-        /// The manifest holds a record that is not a valid edit, or an edit
-        /// that does not fit the edits before it.
-        InvalidEdit,
-        /// A log holds more than fits in a memtable.
-        LogTooLargeForMemtable,
-        /// A table is of a format version this code does not read.
-        UnsupportedVersion,
-        /// A table's index is larger than any table this code writes.
-        IndexTooLarge,
-        /// A table has a data block longer than any this code writes.
-        BlockTooLarge,
-    } || Allocator.Error || FlushError || Io.File.SetLengthError || Io.Dir.Iterator.Error ||
-        async_io.InitError || Storage.OpenError || Storage.ReadError || Storage.SizeError;
-
-    /// What writing a batch that holds at least one operation can report.
-    pub const CommitError = error{
-        /// The active memtable has no room for the batch, and every table
-        /// slot is taken, so the memtable cannot be flushed to make room.
-        StoreFull,
-        /// An earlier write failed, and the store must be closed and opened
-        /// again before it is written to.
-        StoreBroken,
-    } || FlushError;
-
-    /// `write` also rejects a batch with nothing in it.
-    pub const WriteError = error{
-        /// The batch holds no operations.
-        EmptyBatch,
-    } || CommitError;
-
-    /// `put` also rejects a key or value over the limit.
-    pub const PutError = error{
-        /// The key is longer than `write_batch.key_size_max`.
-        KeyTooLarge,
-        /// The value is longer than `write_batch.value_size_max`.
-        ValueTooLarge,
-    } || CommitError;
-
-    /// `delete` also rejects a key over the limit.
-    pub const DeleteError = error{
-        /// The key is longer than `write_batch.key_size_max`.
-        KeyTooLarge,
-    } || CommitError;
-
-    /// What a read can report: a table's data block is damaged, or cannot
-    /// be read.
-    pub const ReadError = TableReader.ReadError;
-
-    /// What `get` can report.
-    pub const GetError = error{
-        /// The value is longer than the buffer given to `get`.
-        BufferTooSmall,
-    } || ReadError;
-
-    pub const Entry = struct {
-        key: []const u8,
-        value: []const u8,
-    };
-
-    /// The memory one scan works in. The caller allocates it once and can
-    /// use it for one scan after another, but only for one at a time.
-    pub const IteratorBuffers = struct {
-        /// Room for one data block of every table: `tables_max` parts of
-        /// `sstable.block_size_max` bytes.
-        blocks: []u8,
-        /// Holds a copy of the key the scan returned last.
-        key: []u8,
-
-        pub fn init(gpa: Allocator) Allocator.Error!IteratorBuffers {
-            const blocks = try gpa.alloc(u8, tables_max * sstable.block_size_max);
-            errdefer gpa.free(blocks);
-            const key = try gpa.alloc(u8, key_size_max);
-            return .{ .blocks = blocks, .key = key };
-        }
-
-        /// `gpa` must be the allocator passed to `init`.
-        pub fn deinit(self: *IteratorBuffers, gpa: Allocator) void {
-            gpa.free(self.blocks);
-            gpa.free(self.key);
-            self.* = undefined;
-        }
-
-        /// The part of `blocks` that belongs to one table slot.
-        fn block(self: *const IteratorBuffers, slot_index: usize) []u8 {
-            const start = slot_index * sstable.block_size_max;
-            return self.blocks[start..][0..sstable.block_size_max];
-        }
-    };
-
-    /// A forward-only cursor over the store's live entries in key order.
-    /// Deleted keys are skipped.
-    ///
-    /// An entry the cursor returned is valid until the next call on the
-    /// cursor. The cursor itself is valid until the next write to the
-    /// store, or the next `flush`.
-    ///
-    /// The cursor points at the store it came from, so the store must not be
-    /// moved or closed while the cursor is in use.
-    pub const Iterator = struct {
-        store: *const Store,
-        /// The store's `write_count` when the cursor was made.
+        /// Set when a write to a file has failed. The state of the files is
+        /// then unknown, so every later write is refused.
+        broken: bool,
+        /// How many times a write or a flush has been asked for. A scan
+        /// remembers this number, to tell that nothing has changed under it.
         write_count: u64,
-        sources: [sources_max]Source,
-        source_count: usize,
-        /// Holds a copy of the key returned last.
-        key_buffer: []u8,
-        /// The key returned last, in `key_buffer`, while the sources may
-        /// still be standing on entries for it. `null` once they have all
-        /// been moved past it.
-        key_last: ?[]const u8,
 
-        /// One place a scan reads from, and the entry it is standing on.
-        const Source = struct {
-            cursor: SourceCursor,
-            /// Whether `current` has been read since the cursor last moved.
-            loaded: bool,
-            /// The entry the source is standing on, or `null` at its end.
-            /// Only meaningful while `loaded` is true.
-            current: ?Version,
+        /// One table file, open for reading.
+        const TableSlot = struct {
+            in_use: bool,
+            /// Only meaningful while the slot is in use.
+            file_number: u64,
+            reader: TableReader,
         };
 
-        const SourceCursor = union(enum) {
-            memtable: MemTable.Iterator,
-            table: TableReader.Iterator,
+        /// How far a flush has got.
+        const FlushStage = enum {
+            /// Entries are being written to the table file.
+            writing,
+            /// The table file is complete and synced.
+            table_written,
+            /// The manifest names the table and the new log.
+            table_recorded,
+            /// A step failed. The frozen memtable is kept for reads, and the
+            /// flush is run again when the store is next opened.
+            failed,
         };
 
-        /// One entry of one source. A `null` value is a tombstone.
-        const Version = struct {
+        /// A flush in progress: the frozen memtable, and the table it is being
+        /// written to.
+        const Flush = struct {
+            stage: FlushStage,
+            /// Which memtable is frozen.
+            memtable_index: usize,
+            /// The file number of the frozen memtable's log, which is deleted
+            /// when the flush is done.
+            log_number_old: u64,
+            /// The last op and the last sequence number in the frozen memtable.
+            /// They were noted when it was frozen: by the time the flush ends,
+            /// the store's own have moved on.
+            op_flushed: u64,
+            sequence_flushed: u64,
+
+            /// The file number of the table being written.
+            table_number: u64,
+            /// The slot the table will be opened in. The writer builds the
+            /// table's index in that slot's part of `index_storage`.
+            slot_index: usize,
+            /// Open while the stage is `writing`.
+            writer: TableWriter,
+            cursor: MemTable.Iterator,
+            /// The entry to write next, or `null` once every entry is written.
+            entry_next: ?MemTable.Entry,
+
+            /// What the manifest will record about the table. The keys point
+            /// into the frozen memtable.
+            key_min: []const u8,
+            key_max: []const u8,
+            sequence_min: u64,
+            sequence_max: u64,
+            /// Set once the stage is past `writing`.
+            summary: TableWriter.Summary,
+        };
+
+        /// What a flush can report.
+        pub const FlushError = error{
+            /// The table that was just written does not read back as written.
+            Corrupt,
+        } || Storage.CreateError || Storage.OpenError || Storage.WriteError || Storage.SyncError ||
+            Storage.SizeError || Storage.ReadError || Storage.SyncDirError || Storage.DeleteError;
+
+        /// What `open` can report. Opening a log can also report
+        /// `IncompleteLog`, which is not here: `open` handles it itself.
+        pub const OpenError = error{
+            /// `dir` holds no store and `create_if_missing` is false.
+            StoreNotFound,
+            /// Another store has `dir` open, in this process or another one.
+            StoreAlreadyOpen,
+            /// The manifest or a log does not start with a valid file header.
+            NotALog,
+            /// A file is missing or damaged in a way that a crash cannot
+            /// explain.
+            Corrupt,
+            /// A log holds a record that is not a valid batch.
+            InvalidBatch,
+            /// The manifest holds a record that is not a valid edit, or an edit
+            /// that does not fit the edits before it.
+            InvalidEdit,
+            /// A log holds more than fits in a memtable.
+            LogTooLargeForMemtable,
+            /// A table is of a format version this code does not read.
+            UnsupportedVersion,
+            /// A table's index is larger than any table this code writes.
+            IndexTooLarge,
+            /// A table has a data block longer than any this code writes.
+            BlockTooLarge,
+        } || Allocator.Error || FlushError || Storage.TruncateError || Storage.ListError ||
+            Storage.LockError || async_io.InitError;
+
+        /// What writing a batch that holds at least one operation can report.
+        pub const CommitError = error{
+            /// The active memtable has no room for the batch, and every table
+            /// slot is taken, so the memtable cannot be flushed to make room.
+            StoreFull,
+            /// An earlier write failed, and the store must be closed and opened
+            /// again before it is written to.
+            StoreBroken,
+        } || FlushError;
+
+        /// `write` also rejects a batch with nothing in it.
+        pub const WriteError = error{
+            /// The batch holds no operations.
+            EmptyBatch,
+        } || CommitError;
+
+        /// `put` also rejects a key or value over the limit.
+        pub const PutError = error{
+            /// The key is longer than `write_batch.key_size_max`.
+            KeyTooLarge,
+            /// The value is longer than `write_batch.value_size_max`.
+            ValueTooLarge,
+        } || CommitError;
+
+        /// `delete` also rejects a key over the limit.
+        pub const DeleteError = error{
+            /// The key is longer than `write_batch.key_size_max`.
+            KeyTooLarge,
+        } || CommitError;
+
+        /// What a read can report: a table's data block is damaged, or cannot
+        /// be read.
+        pub const ReadError = TableReader.ReadError;
+
+        /// What `get` can report.
+        pub const GetError = error{
+            /// The value is longer than the buffer given to `get`.
+            BufferTooSmall,
+        } || ReadError;
+
+        pub const Entry = struct {
             key: []const u8,
-            value: ?[]const u8,
-            sequence: u64,
+            value: []const u8,
         };
 
-        /// Positions the cursor at the first entry.
-        pub fn seekToFirst(self: *Iterator) void {
-            assert(self.store.write_count == self.write_count);
-            for (self.sources[0..self.source_count]) |*source| {
-                switch (source.cursor) {
-                    .memtable => |*cursor| cursor.seekToFirst(),
-                    .table => |*cursor| cursor.seekToFirst(),
-                }
-                source.loaded = false;
+        /// The memory one scan works in. The caller allocates it once and can
+        /// use it for one scan after another, but only for one at a time.
+        pub const IteratorBuffers = struct {
+            /// Room for one data block of every table: `tables_max` parts of
+            /// `sstable.block_size_max` bytes.
+            blocks: []u8,
+            /// Holds a copy of the key the scan returned last.
+            key: []u8,
+
+            pub fn init(gpa: Allocator) Allocator.Error!IteratorBuffers {
+                const blocks = try gpa.alloc(u8, tables_max * sstable.block_size_max);
+                errdefer gpa.free(blocks);
+                const key = try gpa.alloc(u8, key_size_max);
+                return .{ .blocks = blocks, .key = key };
             }
-            self.key_last = null;
-        }
 
-        /// Positions the cursor at the first entry whose key is >= `key`.
-        /// If this fails, the cursor must be positioned again before it is
-        /// read.
-        pub fn seek(self: *Iterator, key: []const u8) ReadError!void {
-            assert(self.store.write_count == self.write_count);
-            for (self.sources[0..self.source_count]) |*source| {
-                switch (source.cursor) {
-                    .memtable => |*cursor| cursor.seek(key),
-                    .table => |*cursor| try cursor.seek(key),
-                }
-                source.loaded = false;
+            /// `gpa` must be the allocator passed to `init`.
+            pub fn deinit(self: *IteratorBuffers, gpa: Allocator) void {
+                gpa.free(self.blocks);
+                gpa.free(self.key);
+                self.* = undefined;
             }
-            self.key_last = null;
-        }
 
-        /// Returns the entry at the cursor and advances past it, or returns
-        /// `null` after the last entry.
-        pub fn next(self: *Iterator) ReadError!?Entry {
-            assert(self.store.write_count == self.write_count);
-            while (true) {
-                try self.skipKeyLast();
-
-                const found = try self.newestOfSmallestKey();
-                if (found == null) {
-                    return null;
-                }
-                const version = found.?;
-
-                // The sources are left standing on this key, so that the
-                // value stays valid until the next call. The key is copied
-                // because moving a source past it can overwrite it.
-                if (version.key.len > self.key_buffer.len) {
-                    // No table the store wrote holds a key this long.
-                    return error.Corrupt;
-                }
-                const key_copy = self.key_buffer[0..version.key.len];
-                @memcpy(key_copy, version.key);
-                self.key_last = key_copy;
-
-                // A tombstone means the key was deleted.
-                if (version.value == null) {
-                    continue;
-                }
-                return .{ .key = key_copy, .value = version.value.? };
+            /// The part of `blocks` that belongs to one table slot.
+            fn block(self: *const IteratorBuffers, slot_index: usize) []u8 {
+                const start = slot_index * sstable.block_size_max;
+                return self.blocks[start..][0..sstable.block_size_max];
             }
-        }
+        };
 
-        /// Moves every source past the key returned last, if any source may
-        /// still be standing on it. Older entries for that key, in any
-        /// source, are passed over here.
-        fn skipKeyLast(self: *Iterator) ReadError!void {
-            if (self.key_last == null) {
-                return;
-            }
-            const key = self.key_last.?;
-            for (self.sources[0..self.source_count]) |*source| {
-                while (true) {
-                    try load(source);
-                    if (source.current == null) {
-                        break;
-                    }
-                    if (!std.mem.eql(u8, source.current.?.key, key)) {
-                        break;
+        /// A forward-only cursor over the store's live entries in key order.
+        /// Deleted keys are skipped.
+        ///
+        /// An entry the cursor returned is valid until the next call on the
+        /// cursor. The cursor itself is valid until the next write to the
+        /// store, or the next `flush`.
+        ///
+        /// The cursor points at the store it came from, so the store must not be
+        /// moved or closed while the cursor is in use.
+        pub const Iterator = struct {
+            store: *const Store,
+            /// The store's `write_count` when the cursor was made.
+            write_count: u64,
+            sources: [sources_max]Source,
+            source_count: usize,
+            /// Holds a copy of the key returned last.
+            key_buffer: []u8,
+            /// The key returned last, in `key_buffer`, while the sources may
+            /// still be standing on entries for it. `null` once they have all
+            /// been moved past it.
+            key_last: ?[]const u8,
+
+            /// One place a scan reads from, and the entry it is standing on.
+            const Source = struct {
+                cursor: SourceCursor,
+                /// Whether `current` has been read since the cursor last moved.
+                loaded: bool,
+                /// The entry the source is standing on, or `null` at its end.
+                /// Only meaningful while `loaded` is true.
+                current: ?Version,
+            };
+
+            const SourceCursor = union(enum) {
+                memtable: MemTable.Iterator,
+                table: TableReader.Iterator,
+            };
+
+            /// One entry of one source. A `null` value is a tombstone.
+            const Version = struct {
+                key: []const u8,
+                value: ?[]const u8,
+                sequence: u64,
+            };
+
+            /// Positions the cursor at the first entry.
+            pub fn seekToFirst(self: *Iterator) void {
+                assert(self.store.write_count == self.write_count);
+                for (self.sources[0..self.source_count]) |*source| {
+                    switch (source.cursor) {
+                        .memtable => |*cursor| cursor.seekToFirst(),
+                        .table => |*cursor| cursor.seekToFirst(),
                     }
                     source.loaded = false;
                 }
+                self.key_last = null;
             }
-            self.key_last = null;
+
+            /// Positions the cursor at the first entry whose key is >= `key`.
+            /// If this fails, the cursor must be positioned again before it is
+            /// read.
+            pub fn seek(self: *Iterator, key: []const u8) ReadError!void {
+                assert(self.store.write_count == self.write_count);
+                for (self.sources[0..self.source_count]) |*source| {
+                    switch (source.cursor) {
+                        .memtable => |*cursor| cursor.seek(key),
+                        .table => |*cursor| try cursor.seek(key),
+                    }
+                    source.loaded = false;
+                }
+                self.key_last = null;
+            }
+
+            /// Returns the entry at the cursor and advances past it, or returns
+            /// `null` after the last entry.
+            pub fn next(self: *Iterator) ReadError!?Entry {
+                assert(self.store.write_count == self.write_count);
+                while (true) {
+                    try self.skipKeyLast();
+
+                    const found = try self.newestOfSmallestKey();
+                    if (found == null) {
+                        return null;
+                    }
+                    const version = found.?;
+
+                    // The sources are left standing on this key, so that the
+                    // value stays valid until the next call. The key is copied
+                    // because moving a source past it can overwrite it.
+                    if (version.key.len > self.key_buffer.len) {
+                        // No table the store wrote holds a key this long.
+                        return error.Corrupt;
+                    }
+                    const key_copy = self.key_buffer[0..version.key.len];
+                    @memcpy(key_copy, version.key);
+                    self.key_last = key_copy;
+
+                    // A tombstone means the key was deleted.
+                    if (version.value == null) {
+                        continue;
+                    }
+                    return .{ .key = key_copy, .value = version.value.? };
+                }
+            }
+
+            /// Moves every source past the key returned last, if any source may
+            /// still be standing on it. Older entries for that key, in any
+            /// source, are passed over here.
+            fn skipKeyLast(self: *Iterator) ReadError!void {
+                if (self.key_last == null) {
+                    return;
+                }
+                const key = self.key_last.?;
+                for (self.sources[0..self.source_count]) |*source| {
+                    while (true) {
+                        try load(source);
+                        if (source.current == null) {
+                            break;
+                        }
+                        if (!std.mem.eql(u8, source.current.?.key, key)) {
+                            break;
+                        }
+                        source.loaded = false;
+                    }
+                }
+                self.key_last = null;
+            }
+
+            /// Of the entries the sources are standing on, returns the one with
+            /// the smallest key, and among those with that key the newest. No
+            /// source is moved.
+            fn newestOfSmallestKey(self: *Iterator) ReadError!?Version {
+                var best: ?Version = null;
+                for (self.sources[0..self.source_count]) |*source| {
+                    try load(source);
+                    if (source.current == null) {
+                        continue;
+                    }
+                    const candidate = source.current.?;
+                    if (best == null) {
+                        best = candidate;
+                        continue;
+                    }
+                    if (sstable.sortsBefore(candidate.key, candidate.sequence, best.?.key, best.?.sequence)) {
+                        best = candidate;
+                    }
+                }
+                return best;
+            }
+
+            /// Reads the entry a source is standing on, if it has not been read
+            /// yet. Reading it moves the source's own cursor on to the next
+            /// entry, which is why a source that is to move only has `loaded`
+            /// cleared.
+            fn load(source: *Source) ReadError!void {
+                if (source.loaded) {
+                    return;
+                }
+                switch (source.cursor) {
+                    .memtable => |*cursor| {
+                        const entry = cursor.next();
+                        if (entry == null) {
+                            source.current = null;
+                        } else {
+                            source.current = .{
+                                .key = entry.?.key,
+                                .value = entry.?.value,
+                                .sequence = entry.?.sequence,
+                            };
+                        }
+                    },
+                    .table => |*cursor| {
+                        const entry = try cursor.next();
+                        if (entry == null) {
+                            source.current = null;
+                        } else {
+                            source.current = .{
+                                .key = entry.?.key,
+                                .value = entry.?.value,
+                                .sequence = entry.?.sequence,
+                            };
+                        }
+                    },
+                }
+                source.loaded = true;
+            }
+        };
+
+        /// Opens the store in `dir`, creating it if it is not there and
+        /// `options` allow that. A flush that a crash interrupted is run again
+        /// here, and the logs are replayed.
+        ///
+        /// `gpa` is used here, to allocate everything the store will need, and
+        /// again in `close`. `dir` must stay open until the store is closed.
+        ///
+        /// This is for a store on a real disk. The store makes its own event
+        /// loop and storage on `dir`, and frees them in `close`.
+        pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, options: Options) OpenError!Store {
+            return openWithSizes(gpa, io, dir, options, MemTable.buffer_size_max, log_file_size);
         }
 
-        /// Of the entries the sources are standing on, returns the one with
-        /// the smallest key, and among those with that key the newest. No
-        /// source is moved.
-        fn newestOfSmallestKey(self: *Iterator) ReadError!?Version {
-            var best: ?Version = null;
-            for (self.sources[0..self.source_count]) |*source| {
-                try load(source);
-                if (source.current == null) {
-                    continue;
-                }
-                const candidate = source.current.?;
-                if (best == null) {
-                    best = candidate;
-                    continue;
-                }
-                if (sstable.sortsBefore(candidate.key, candidate.sequence, best.?.key, best.?.sequence)) {
-                    best = candidate;
-                }
-            }
-            return best;
+        /// Opens the store whose files `storage` keeps, creating it if it is
+        /// not there and `options` allow that. `storage` must outlive the store
+        /// and must not move.
+        pub fn openOnStorage(gpa: Allocator, storage: *Storage, options: Options) OpenError!Store {
+            return openOnStorageWithSizes(gpa, storage, options, MemTable.buffer_size_max, log_file_size);
         }
 
-        /// Reads the entry a source is standing on, if it has not been read
-        /// yet. Reading it moves the source's own cursor on to the next
-        /// entry, which is why a source that is to move only has `loaded`
-        /// cleared.
-        fn load(source: *Source) ReadError!void {
-            if (source.loaded) {
+        /// `open`, with memtables of `memtable_size` bytes each and new logs of
+        /// `log_size` bytes each. A store always has memtables and logs of the
+        /// sizes in `constants`; tests use small ones so that a flush takes few
+        /// writes and creating a log is quick. A batch must fit in an empty
+        /// memtable and in an empty log.
+        fn openWithSizes(
+            gpa: Allocator,
+            io: Io,
+            dir: Io.Dir,
+            options: Options,
+            memtable_size: usize,
+            log_size: u64,
+        ) OpenError!Store {
+            const event_loop = try gpa.create(AsyncIo);
+            errdefer gpa.destroy(event_loop);
+            event_loop.* = try .init();
+            errdefer event_loop.deinit();
+            const storage = try gpa.create(Storage);
+            errdefer gpa.destroy(storage);
+            storage.* = .init(event_loop, io, dir);
+            errdefer storage.deinit();
+
+            var store = try openOnStorageWithSizes(gpa, storage, options, memtable_size, log_size);
+            store.event_loop_owned = event_loop;
+            return store;
+        }
+
+        /// `openOnStorage`, with memtables of `memtable_size` bytes each and
+        /// new logs of `log_size` bytes each.
+        fn openOnStorageWithSizes(
+            gpa: Allocator,
+            storage: *Storage,
+            options: Options,
+            memtable_size: usize,
+            log_size: u64,
+        ) OpenError!Store {
+            assert(log_size % sector_size == 0);
+            assert(log_size >= sector_log.fileSizeMin(log_payload_size_max));
+
+            // The lock comes first: opening a store can delete and truncate
+            // files, which must not happen under a store that is already open.
+            storage.lock() catch |err| switch (err) {
+                error.AlreadyLocked => return error.StoreAlreadyOpen,
+                else => |other| return other,
+            };
+            errdefer storage.unlock();
+
+            const log_buffer = try gpa.alignedAlloc(u8, .fromByteUnits(sector_size), log_buffer_size);
+            errdefer gpa.free(log_buffer);
+
+            const memtables = try gpa.create([2]MemTable);
+            errdefer gpa.destroy(memtables);
+            memtables[0] = try .init(gpa, memtable_size);
+            errdefer memtables[0].deinit(gpa);
+            memtables[1] = try .init(gpa, memtable_size);
+            errdefer memtables[1].deinit(gpa);
+
+            var tables: manifest.TableSet = try .init(gpa);
+            errdefer tables.deinit(gpa);
+            var scratch: WriteBatch = try .init(gpa);
+            errdefer scratch.deinit(gpa);
+
+            const edit_buffer = try gpa.alloc(u8, manifest.edit_size_max);
+            errdefer gpa.free(edit_buffer);
+            const index_storage = try gpa.alloc(u8, tables_max * sstable.index_size_max);
+            errdefer gpa.free(index_storage);
+            const flush_block_buffer = try gpa.alloc(u8, sstable.block_size_max);
+            errdefer gpa.free(flush_block_buffer);
+            const get_block_buffer = try gpa.alloc(u8, sstable.block_size_max);
+            errdefer gpa.free(get_block_buffer);
+
+            var slots: [tables_max]TableSlot = undefined;
+            for (&slots) |*slot| {
+                slot.in_use = false;
+            }
+
+            var store: Store = .{
+                .storage = storage,
+                .event_loop_owned = null,
+                .memtables = memtables,
+                .active_index = 0,
+                .sequence_last = 0,
+                // The log and the manifest are opened by `recover`.
+                .log = undefined,
+                .log_buffer = log_buffer,
+                .log_file_size = log_size,
+                .log_number = 0,
+                .file_number_next = 0,
+                .tables = tables,
+                .manifest_writer = undefined,
+                .slots = slots,
+                .flushing = null,
+                .scratch = scratch,
+                .edit_buffer = edit_buffer,
+                .index_storage = index_storage,
+                .flush_block_buffer = flush_block_buffer,
+                .get_block_buffer = get_block_buffer,
+                .broken = false,
+                .write_count = 0,
+            };
+            try store.recover(options);
+            return store;
+        }
+
+        /// Closes the store's files and frees its memory. Nothing is flushed:
+        /// what the memtables hold is in the logs, and is replayed when the
+        /// store is next opened.
+        ///
+        /// `gpa` must be the allocator passed to `open`.
+        pub fn close(self: *Store, gpa: Allocator) void {
+            if (self.flushing != null) {
+                const flushing = &self.flushing.?;
+                if (flushing.stage == .writing) {
+                    flushing.writer.close();
+                }
+            }
+            self.closeTables();
+            self.manifest_writer.close();
+            self.log.close();
+
+            self.memtables[0].deinit(gpa);
+            self.memtables[1].deinit(gpa);
+            gpa.destroy(self.memtables);
+            self.tables.deinit(gpa);
+            self.scratch.deinit(gpa);
+            gpa.free(self.edit_buffer);
+            gpa.free(self.index_storage);
+            gpa.free(self.flush_block_buffer);
+            gpa.free(self.get_block_buffer);
+            gpa.free(self.log_buffer);
+
+            self.storage.unlock();
+            if (self.event_loop_owned) |event_loop| {
+                self.storage.deinit();
+                gpa.destroy(self.storage);
+                event_loop.deinit();
+                gpa.destroy(event_loop);
+            }
+            self.* = undefined;
+        }
+
+        /// Applies `batch` as a unit. When this returns without an error, the
+        /// batch is durable.
+        ///
+        /// `EmptyBatch`, `StoreFull` and `StoreBroken` are reported before the
+        /// batch is written anywhere. `EmptyBatch` and `StoreFull` leave the
+        /// store usable.
+        ///
+        /// After any other error the batch may or may not be in the log: it can
+        /// appear when the store is next opened. Every later write returns
+        /// `StoreBroken` until the store is closed and opened again.
+        pub fn write(self: *Store, batch: *const WriteBatch) WriteError!void {
+            // An empty batch is never logged: replay rejects an empty record.
+            if (batch.count() == 0) {
+                return error.EmptyBatch;
+            }
+            try self.commit(batch);
+        }
+
+        /// Writes a batch holding one put. `StoreFull` and `StoreBroken` mean
+        /// what they do for `write`.
+        pub fn put(self: *Store, key: []const u8, value: []const u8) PutError!void {
+            self.scratch.clear();
+            self.scratch.put(key, value) catch |err| switch (err) {
+                error.KeyTooLarge => return error.KeyTooLarge,
+                error.ValueTooLarge => return error.ValueTooLarge,
+                // One operation always fits in an empty batch.
+                error.BatchFull => unreachable,
+            };
+            try self.commit(&self.scratch);
+        }
+
+        /// Writes a batch holding one delete. Deleting a key that is not present
+        /// is not an error. `StoreFull` and `StoreBroken` mean what they do for
+        /// `write`.
+        pub fn delete(self: *Store, key: []const u8) DeleteError!void {
+            self.scratch.clear();
+            self.scratch.delete(key) catch |err| switch (err) {
+                error.KeyTooLarge => return error.KeyTooLarge,
+                // A delete has no value.
+                error.ValueTooLarge => unreachable,
+                // One operation always fits in an empty batch.
+                error.BatchFull => unreachable,
+            };
+            try self.commit(&self.scratch);
+        }
+
+        /// Does this write's share of a flush in progress, makes room for
+        /// `batch` if the active memtable has none, then logs the batch and
+        /// applies it to the active memtable. `batch` must hold at least one
+        /// operation.
+        fn commit(self: *Store, batch: *const WriteBatch) CommitError!void {
+            assert(batch.count() > 0);
+            if (self.broken) {
+                return error.StoreBroken;
+            }
+            self.write_count += 1;
+
+            const batch_bytes = batch.bytes();
+            const batch_memtable_size = memtableSizeMax(batch_bytes);
+
+            // The share comes before the batch is logged, so that an error from
+            // the flush leaves the batch unwritten.
+            if (self.flushing != null) {
+                try self.flushStep(flush_pace * self.flushShare(batch_bytes.len, batch_memtable_size));
+            }
+
+            // The batch goes to the log only if all of it can then be applied,
+            // and only if the log has room for it. Whichever of the memtable
+            // and the log fills first, the memtable is frozen and a new log is
+            // started.
+            const memtable_is_full = batch_memtable_size > self.activeMemtable().bytesFree();
+            const log_is_full = !self.log.hasRoomFor(batch_bytes.len);
+            if (memtable_is_full or log_is_full) {
+                try self.makeRoom();
+                assert(batch_memtable_size <= self.activeMemtable().bytesFree());
+                assert(self.log.hasRoomFor(batch_bytes.len));
+            }
+
+            _ = self.log.append(batch_bytes) catch |err| switch (err) {
+                // A batch is never longer than the log's payload limit, and
+                // room for it was made above.
+                error.PayloadTooLarge => unreachable,
+                error.LogFull => unreachable,
+                else => |other| {
+                    self.broken = true;
+                    return other;
+                },
+            };
+            const memtable = self.activeMemtable();
+            self.sequence_last = applyBatch(memtable, batch_bytes, self.sequence_last + 1);
+        }
+
+        /// How many bytes of a frozen memtable a write should see flushed,
+        /// before `flush_pace` is applied, so that the flush is over before the
+        /// next freeze.
+        ///
+        /// The next freeze comes when the active memtable or its log is full,
+        /// whichever is first. A write uses up some part of each. The larger of
+        /// the two parts is the part of the way to the next freeze that this
+        /// write covers, and the write flushes that part of a whole memtable.
+        fn flushShare(self: *const Store, batch_len: usize, batch_memtable_size: usize) usize {
+            const memtable_size = self.activeMemtable().arena.buffer.len;
+            const log_room: u64 = self.log.file_size - sector_size;
+            const record_size: u64 = sector_log.recordSize(batch_len);
+            // The record's part of the log, as bytes of a memtable.
+            const log_share: usize = @intCast(record_size * memtable_size / log_room);
+            return @max(batch_memtable_size, log_share);
+        }
+
+        /// Freezes the active memtable, which is full or whose log is full, so
+        /// that the other one, which is empty, takes the writes.
+        fn makeRoom(self: *Store) CommitError!void {
+            // The shares that writes do are sized so that a flush is over
+            // before the active memtable fills again. The store does not depend
+            // on that: a flush that is still going is finished here.
+            if (self.flushing != null) {
+                try self.flushComplete();
+            }
+            // The frozen memtable needs a table slot to be flushed into.
+            if (self.tables.count() == tables_max) {
+                return error.StoreFull;
+            }
+            self.freeze() catch |err| {
+                self.broken = true;
+                return err;
+            };
+        }
+
+        /// Writes everything the memtables hold to tables, and returns once the
+        /// tables are durable. The store does this by itself as memtables fill;
+        /// this is for a caller that wants the logs emptied now.
+        ///
+        /// `StoreFull` means every table slot is taken and the active memtable
+        /// was left as it is. After any error but `StoreFull` and `StoreBroken`,
+        /// every later write returns `StoreBroken` until the store is closed and
+        /// opened again.
+        pub fn flush(self: *Store) CommitError!void {
+            if (self.broken) {
+                return error.StoreBroken;
+            }
+            self.write_count += 1;
+
+            if (self.flushing != null) {
+                try self.flushComplete();
+            }
+            // An empty memtable is never written to a table.
+            if (self.activeMemtable().isEmpty()) {
                 return;
             }
-            switch (source.cursor) {
-                .memtable => |*cursor| {
-                    const entry = cursor.next();
-                    if (entry == null) {
-                        source.current = null;
-                    } else {
-                        source.current = .{
-                            .key = entry.?.key,
-                            .value = entry.?.value,
-                            .sequence = entry.?.sequence,
-                        };
-                    }
-                },
-                .table => |*cursor| {
-                    const entry = try cursor.next();
-                    if (entry == null) {
-                        source.current = null;
-                    } else {
-                        source.current = .{
-                            .key = entry.?.key,
-                            .value = entry.?.value,
-                            .sequence = entry.?.sequence,
-                        };
-                    }
-                },
+            if (self.tables.count() == tables_max) {
+                return error.StoreFull;
             }
-            source.loaded = true;
-        }
-    };
-
-    /// Opens the store in `dir`, creating it if it is not there and
-    /// `options` allow that. A flush that a crash interrupted is run again
-    /// here, and the logs are replayed.
-    ///
-    /// `gpa` is used only here, to allocate everything the store will need,
-    /// and is not retained. `dir` must stay open until the store is closed.
-    pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, options: Options) OpenError!Store {
-        return openWithSizes(gpa, io, dir, options, MemTable.buffer_size_max, log_file_size);
-    }
-
-    /// `open`, with memtables of `memtable_size` bytes each and new logs of
-    /// `log_size` bytes each. A store always has memtables and logs of the
-    /// sizes in `constants`; tests use small ones so that a flush takes few
-    /// writes and creating a log is quick. A batch must fit in an empty
-    /// memtable and in an empty log.
-    fn openWithSizes(
-        gpa: Allocator,
-        io: Io,
-        dir: Io.Dir,
-        options: Options,
-        memtable_size: usize,
-        log_size: u64,
-    ) OpenError!Store {
-        assert(log_size % sector_size == 0);
-        assert(log_size >= sector_log.fileSizeMin(log_payload_size_max));
-
-        // The lock comes first: opening a store can delete and truncate
-        // files, which must not happen under a store that is already open.
-        const lock_file = try lockDir(io, dir);
-        errdefer lock_file.close(io);
-
-        const event_loop = try gpa.create(AsyncIo);
-        errdefer gpa.destroy(event_loop);
-        event_loop.* = try .init();
-        errdefer event_loop.deinit();
-        const storage = try gpa.create(Storage);
-        errdefer gpa.destroy(storage);
-        storage.* = .init(event_loop, io, dir);
-        errdefer storage.deinit();
-
-        const log_buffer = try gpa.alignedAlloc(u8, .fromByteUnits(sector_size), log_buffer_size);
-        errdefer gpa.free(log_buffer);
-
-        const memtables = try gpa.create([2]MemTable);
-        errdefer gpa.destroy(memtables);
-        memtables[0] = try .init(gpa, memtable_size);
-        errdefer memtables[0].deinit(gpa);
-        memtables[1] = try .init(gpa, memtable_size);
-        errdefer memtables[1].deinit(gpa);
-
-        var tables: manifest.TableSet = try .init(gpa);
-        errdefer tables.deinit(gpa);
-        var scratch: WriteBatch = try .init(gpa);
-        errdefer scratch.deinit(gpa);
-
-        const edit_buffer = try gpa.alloc(u8, manifest.edit_size_max);
-        errdefer gpa.free(edit_buffer);
-        const index_storage = try gpa.alloc(u8, tables_max * sstable.index_size_max);
-        errdefer gpa.free(index_storage);
-        const flush_block_buffer = try gpa.alloc(u8, sstable.block_size_max);
-        errdefer gpa.free(flush_block_buffer);
-        const get_block_buffer = try gpa.alloc(u8, sstable.block_size_max);
-        errdefer gpa.free(get_block_buffer);
-
-        var slots: [tables_max]TableSlot = undefined;
-        for (&slots) |*slot| {
-            slot.in_use = false;
-        }
-
-        var store: Store = .{
-            .io = io,
-            .dir = dir,
-            .lock_file = lock_file,
-            .event_loop = event_loop,
-            .storage = storage,
-            .memtables = memtables,
-            .active_index = 0,
-            .sequence_last = 0,
-            // The log and the manifest are opened by `recover`.
-            .log = undefined,
-            .log_buffer = log_buffer,
-            .log_file_size = log_size,
-            .log_number = 0,
-            .file_number_next = 0,
-            .tables = tables,
-            .manifest_writer = undefined,
-            .slots = slots,
-            .flushing = null,
-            .scratch = scratch,
-            .edit_buffer = edit_buffer,
-            .index_storage = index_storage,
-            .flush_block_buffer = flush_block_buffer,
-            .get_block_buffer = get_block_buffer,
-            .broken = false,
-            .write_count = 0,
-        };
-        try store.recover(options);
-        return store;
-    }
-
-    /// Closes the store's files and frees its memory. Nothing is flushed:
-    /// what the memtables hold is in the logs, and is replayed when the
-    /// store is next opened.
-    ///
-    /// `gpa` must be the allocator passed to `open`.
-    pub fn close(self: *Store, gpa: Allocator) void {
-        if (self.flushing != null) {
-            const flushing = &self.flushing.?;
-            if (flushing.stage == .writing) {
-                flushing.writer.close();
-            }
-        }
-        self.closeTables();
-        self.manifest_writer.close();
-        self.log.close();
-
-        self.memtables[0].deinit(gpa);
-        self.memtables[1].deinit(gpa);
-        gpa.destroy(self.memtables);
-        self.tables.deinit(gpa);
-        self.scratch.deinit(gpa);
-        gpa.free(self.edit_buffer);
-        gpa.free(self.index_storage);
-        gpa.free(self.flush_block_buffer);
-        gpa.free(self.get_block_buffer);
-        gpa.free(self.log_buffer);
-
-        self.storage.deinit();
-        gpa.destroy(self.storage);
-        self.event_loop.deinit();
-        gpa.destroy(self.event_loop);
-
-        // Closing the file releases the lock.
-        self.lock_file.close(self.io);
-        self.* = undefined;
-    }
-
-    /// Applies `batch` as a unit. When this returns without an error, the
-    /// batch is durable.
-    ///
-    /// `EmptyBatch`, `StoreFull` and `StoreBroken` are reported before the
-    /// batch is written anywhere. `EmptyBatch` and `StoreFull` leave the
-    /// store usable.
-    ///
-    /// After any other error the batch may or may not be in the log: it can
-    /// appear when the store is next opened. Every later write returns
-    /// `StoreBroken` until the store is closed and opened again.
-    pub fn write(self: *Store, batch: *const WriteBatch) WriteError!void {
-        // An empty batch is never logged: replay rejects an empty record.
-        if (batch.count() == 0) {
-            return error.EmptyBatch;
-        }
-        try self.commit(batch);
-    }
-
-    /// Writes a batch holding one put. `StoreFull` and `StoreBroken` mean
-    /// what they do for `write`.
-    pub fn put(self: *Store, key: []const u8, value: []const u8) PutError!void {
-        self.scratch.clear();
-        self.scratch.put(key, value) catch |err| switch (err) {
-            error.KeyTooLarge => return error.KeyTooLarge,
-            error.ValueTooLarge => return error.ValueTooLarge,
-            // One operation always fits in an empty batch.
-            error.BatchFull => unreachable,
-        };
-        try self.commit(&self.scratch);
-    }
-
-    /// Writes a batch holding one delete. Deleting a key that is not present
-    /// is not an error. `StoreFull` and `StoreBroken` mean what they do for
-    /// `write`.
-    pub fn delete(self: *Store, key: []const u8) DeleteError!void {
-        self.scratch.clear();
-        self.scratch.delete(key) catch |err| switch (err) {
-            error.KeyTooLarge => return error.KeyTooLarge,
-            // A delete has no value.
-            error.ValueTooLarge => unreachable,
-            // One operation always fits in an empty batch.
-            error.BatchFull => unreachable,
-        };
-        try self.commit(&self.scratch);
-    }
-
-    /// Does this write's share of a flush in progress, makes room for
-    /// `batch` if the active memtable has none, then logs the batch and
-    /// applies it to the active memtable. `batch` must hold at least one
-    /// operation.
-    fn commit(self: *Store, batch: *const WriteBatch) CommitError!void {
-        assert(batch.count() > 0);
-        if (self.broken) {
-            return error.StoreBroken;
-        }
-        self.write_count += 1;
-
-        const batch_bytes = batch.bytes();
-        const batch_memtable_size = memtableSizeMax(batch_bytes);
-
-        // The share comes before the batch is logged, so that an error from
-        // the flush leaves the batch unwritten.
-        if (self.flushing != null) {
-            try self.flushStep(flush_pace * self.flushShare(batch_bytes.len, batch_memtable_size));
-        }
-
-        // The batch goes to the log only if all of it can then be applied,
-        // and only if the log has room for it. Whichever of the memtable
-        // and the log fills first, the memtable is frozen and a new log is
-        // started.
-        const memtable_is_full = batch_memtable_size > self.activeMemtable().bytesFree();
-        const log_is_full = !self.log.hasRoomFor(batch_bytes.len);
-        if (memtable_is_full or log_is_full) {
-            try self.makeRoom();
-            assert(batch_memtable_size <= self.activeMemtable().bytesFree());
-            assert(self.log.hasRoomFor(batch_bytes.len));
-        }
-
-        _ = self.log.append(batch_bytes) catch |err| switch (err) {
-            // A batch is never longer than the log's payload limit, and
-            // room for it was made above.
-            error.PayloadTooLarge => unreachable,
-            error.LogFull => unreachable,
-            else => |other| {
+            self.freeze() catch |err| {
                 self.broken = true;
-                return other;
-            },
-        };
-        const memtable = self.activeMemtable();
-        self.sequence_last = applyBatch(memtable, batch_bytes, self.sequence_last + 1);
-    }
-
-    /// How many bytes of a frozen memtable a write should see flushed,
-    /// before `flush_pace` is applied, so that the flush is over before the
-    /// next freeze.
-    ///
-    /// The next freeze comes when the active memtable or its log is full,
-    /// whichever is first. A write uses up some part of each. The larger of
-    /// the two parts is the part of the way to the next freeze that this
-    /// write covers, and the write flushes that part of a whole memtable.
-    fn flushShare(self: *const Store, batch_len: usize, batch_memtable_size: usize) usize {
-        const memtable_size = self.activeMemtable().arena.buffer.len;
-        const log_room: u64 = self.log.file_size - sector_size;
-        const record_size: u64 = sector_log.recordSize(batch_len);
-        // The record's part of the log, as bytes of a memtable.
-        const log_share: usize = @intCast(record_size * memtable_size / log_room);
-        return @max(batch_memtable_size, log_share);
-    }
-
-    /// Freezes the active memtable, which is full or whose log is full, so
-    /// that the other one, which is empty, takes the writes.
-    fn makeRoom(self: *Store) CommitError!void {
-        // The shares that writes do are sized so that a flush is over
-        // before the active memtable fills again. The store does not depend
-        // on that: a flush that is still going is finished here.
-        if (self.flushing != null) {
+                return err;
+            };
             try self.flushComplete();
         }
-        // The frozen memtable needs a table slot to be flushed into.
-        if (self.tables.count() == tables_max) {
-            return error.StoreFull;
-        }
-        self.freeze() catch |err| {
-            self.broken = true;
-            return err;
-        };
-    }
 
-    /// Writes everything the memtables hold to tables, and returns once the
-    /// tables are durable. The store does this by itself as memtables fill;
-    /// this is for a caller that wants the logs emptied now.
-    ///
-    /// `StoreFull` means every table slot is taken and the active memtable
-    /// was left as it is. After any error but `StoreFull` and `StoreBroken`,
-    /// every later write returns `StoreBroken` until the store is closed and
-    /// opened again.
-    pub fn flush(self: *Store) CommitError!void {
-        if (self.broken) {
-            return error.StoreBroken;
-        }
-        self.write_count += 1;
-
-        if (self.flushing != null) {
-            try self.flushComplete();
-        }
-        // An empty memtable is never written to a table.
-        if (self.activeMemtable().isEmpty()) {
-            return;
-        }
-        if (self.tables.count() == tables_max) {
-            return error.StoreFull;
-        }
-        self.freeze() catch |err| {
-            self.broken = true;
-            return err;
-        };
-        try self.flushComplete();
-    }
-
-    /// Copies the value for `key` into `buffer` and returns the part of
-    /// `buffer` that holds it, or returns `null` if the key is not present.
-    ///
-    /// The bytes returned are the caller's own. Nothing the store does
-    /// later changes them.
-    ///
-    /// A buffer of `value_size_max` bytes holds any value. With a shorter
-    /// buffer, a value that does not fit is reported as `BufferTooSmall`,
-    /// and nothing is copied.
-    pub fn get(self: *Store, key: []const u8, buffer: []u8) GetError!?[]u8 {
-        // The active memtable holds the newest writes, and the other one,
-        // when it is frozen, the writes before those. Both are newer than
-        // every table.
-        const in_active = self.activeMemtable().get(key);
-        switch (in_active) {
-            .value => |value| return try copyValue(value, buffer),
-            .tombstone => return null,
-            .absent => {},
-        }
-        const in_other = self.otherMemtable().get(key);
-        switch (in_other) {
-            .value => |value| return try copyValue(value, buffer),
-            .tombstone => return null,
-            .absent => {},
-        }
-
-        // The tables, from the newest to the oldest. The first one that has
-        // an entry for the key has the newest one.
-        var sequence_limit: ?u64 = null;
-        while (true) {
-            const found = self.newestTableOlderThan(sequence_limit);
-            if (found == null) {
-                return null;
-            }
-            const slot = found.?;
-            const table = self.tables.find(slot.file_number).?;
-            sequence_limit = table.sequence_max;
-
-            if (std.mem.order(u8, key, table.key_min) == .lt) {
-                continue;
-            }
-            if (std.mem.order(u8, key, table.key_max) == .gt) {
-                continue;
-            }
-            const in_table = try slot.reader.get(key, self.get_block_buffer);
-            switch (in_table) {
+        /// Copies the value for `key` into `buffer` and returns the part of
+        /// `buffer` that holds it, or returns `null` if the key is not present.
+        ///
+        /// The bytes returned are the caller's own. Nothing the store does
+        /// later changes them.
+        ///
+        /// A buffer of `value_size_max` bytes holds any value. With a shorter
+        /// buffer, a value that does not fit is reported as `BufferTooSmall`,
+        /// and nothing is copied.
+        pub fn get(self: *Store, key: []const u8, buffer: []u8) GetError!?[]u8 {
+            // The active memtable holds the newest writes, and the other one,
+            // when it is frozen, the writes before those. Both are newer than
+            // every table.
+            const in_active = self.activeMemtable().get(key);
+            switch (in_active) {
                 .value => |value| return try copyValue(value, buffer),
                 .tombstone => return null,
                 .absent => {},
             }
-        }
-    }
-
-    /// Returns the open table with the largest sequence numbers among those
-    /// whose sequence numbers are all below `sequence_limit`, or among all
-    /// of them if `sequence_limit` is `null`. Tables written by flushes
-    /// hold ranges of sequence numbers that do not overlap, so calling this
-    /// with each table's largest number in turn visits them newest first.
-    fn newestTableOlderThan(self: *const Store, sequence_limit: ?u64) ?*const TableSlot {
-        var newest: ?*const TableSlot = null;
-        var newest_sequence_max: u64 = 0;
-        for (&self.slots) |*slot| {
-            if (!slot.in_use) {
-                continue;
+            const in_other = self.otherMemtable().get(key);
+            switch (in_other) {
+                .value => |value| return try copyValue(value, buffer),
+                .tombstone => return null,
+                .absent => {},
             }
-            const table = self.tables.find(slot.file_number).?;
-            if (sequence_limit != null) {
-                if (table.sequence_max >= sequence_limit.?) {
+
+            // The tables, from the newest to the oldest. The first one that has
+            // an entry for the key has the newest one.
+            var sequence_limit: ?u64 = null;
+            while (true) {
+                const found = self.newestTableOlderThan(sequence_limit);
+                if (found == null) {
+                    return null;
+                }
+                const slot = found.?;
+                const table = self.tables.find(slot.file_number).?;
+                sequence_limit = table.sequence_max;
+
+                if (std.mem.order(u8, key, table.key_min) == .lt) {
                     continue;
                 }
-            }
-            if (newest == null or table.sequence_max > newest_sequence_max) {
-                newest = slot;
-                newest_sequence_max = table.sequence_max;
-            }
-        }
-        return newest;
-    }
-
-    /// Returns a cursor positioned at the first entry. It works in
-    /// `buffers`, which must stay valid, and be used by no other cursor,
-    /// for as long as this one is in use.
-    ///
-    /// The cursor keeps a pointer to this store, so the store must not be
-    /// moved or closed while the cursor is in use.
-    pub fn iterator(self: *const Store, buffers: *const IteratorBuffers) Iterator {
-        var it: Iterator = .{
-            .store = self,
-            .write_count = self.write_count,
-            .sources = undefined,
-            .source_count = 0,
-            .key_buffer = buffers.key,
-            .key_last = null,
-        };
-
-        for (self.memtables) |*memtable| {
-            it.sources[it.source_count] = .{
-                .cursor = .{ .memtable = memtable.iterator() },
-                .loaded = false,
-                .current = null,
-            };
-            it.source_count += 1;
-        }
-        for (&self.slots, 0..) |*slot, slot_index| {
-            if (!slot.in_use) {
-                continue;
-            }
-            it.sources[it.source_count] = .{
-                .cursor = .{ .table = slot.reader.iterator(buffers.block(slot_index)) },
-                .loaded = false,
-                .current = null,
-            };
-            it.source_count += 1;
-        }
-        return it;
-    }
-
-    /// The op number of the last batch written, or 0 if there has been none.
-    /// Each batch is given the next op number.
-    pub fn opLatest(self: *const Store) u64 {
-        return self.log.last.op;
-    }
-
-    /// The sequence number of the last operation written, or 0 if there has
-    /// been none. Each operation of each batch is given the next sequence
-    /// number, so a batch of three operations takes three of them.
-    pub fn sequenceLatest(self: *const Store) u64 {
-        return self.sequence_last;
-    }
-
-    /// The memtable that takes the writes.
-    fn activeMemtable(self: *const Store) *MemTable {
-        return &self.memtables[self.active_index];
-    }
-
-    /// The memtable that does not take the writes. It is empty unless it is
-    /// frozen.
-    fn otherMemtable(self: *const Store) *MemTable {
-        return &self.memtables[1 - self.active_index];
-    }
-
-    /// The part of `index_storage` that belongs to one table slot.
-    fn slotIndexBuffer(self: *const Store, slot_index: usize) []u8 {
-        const start = slot_index * sstable.index_size_max;
-        return self.index_storage[start..][0..sstable.index_size_max];
-    }
-
-    /// The index of a slot that holds no table, or `null` if every slot is
-    /// taken.
-    fn freeSlotIndex(self: *const Store) ?usize {
-        for (self.slots, 0..) |slot, slot_index| {
-            if (!slot.in_use) {
-                return slot_index;
+                if (std.mem.order(u8, key, table.key_max) == .gt) {
+                    continue;
+                }
+                const in_table = try slot.reader.get(key, self.get_block_buffer);
+                switch (in_table) {
+                    .value => |value| return try copyValue(value, buffer),
+                    .tombstone => return null,
+                    .absent => {},
+                }
             }
         }
-        return null;
-    }
 
-    /// Closes every open table file.
-    fn closeTables(self: *Store) void {
-        for (&self.slots) |*slot| {
-            if (slot.in_use) {
-                slot.reader.close();
-                slot.in_use = false;
+        /// Returns the open table with the largest sequence numbers among those
+        /// whose sequence numbers are all below `sequence_limit`, or among all
+        /// of them if `sequence_limit` is `null`. Tables written by flushes
+        /// hold ranges of sequence numbers that do not overlap, so calling this
+        /// with each table's largest number in turn visits them newest first.
+        fn newestTableOlderThan(self: *const Store, sequence_limit: ?u64) ?*const TableSlot {
+            var newest: ?*const TableSlot = null;
+            var newest_sequence_max: u64 = 0;
+            for (&self.slots) |*slot| {
+                if (!slot.in_use) {
+                    continue;
+                }
+                const table = self.tables.find(slot.file_number).?;
+                if (sequence_limit != null) {
+                    if (table.sequence_max >= sequence_limit.?) {
+                        continue;
+                    }
+                }
+                if (newest == null or table.sequence_max > newest_sequence_max) {
+                    newest = slot;
+                    newest_sequence_max = table.sequence_max;
+                }
             }
-        }
-    }
-
-    // ---- Flushing ----
-
-    /// Step 1 of a flush. Starts a new log, begins writing the active
-    /// memtable to a table, and makes the other memtable the active one.
-    ///
-    /// The caller has checked that no flush is in progress, that the active
-    /// memtable holds something, and that a table slot is free. If this
-    /// fails, the store is as it was.
-    fn freeze(self: *Store) FlushError!void {
-        assert(self.flushing == null);
-        assert(self.otherMemtable().isEmpty());
-
-        const log_number_new = self.file_number_next;
-        self.file_number_next += 1;
-        var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-        const log_name = manifest.fileName(&name_buffer, .log, log_number_new);
-
-        // The new log carries on from the last record of the current one.
-        // The current log is not being appended to, so the buffer the two
-        // share is free for the new one to be written out from.
-        var log_new = try Log.Writer.create(
-            self.storage,
-            log_name,
-            self.log_file_size,
-            self.log_buffer,
-            self.log.last,
-        );
-        errdefer {
-            log_new.close();
-            self.dir.deleteFile(self.io, log_name) catch {};
+            return newest;
         }
 
-        try self.flushBegin(
-            self.active_index,
-            self.log_number,
-            self.log.last.op,
-            self.sequence_last,
-        );
-
-        self.log.close();
-        self.log = log_new;
-        self.log_number = log_number_new;
-        self.active_index = 1 - self.active_index;
-    }
-
-    /// Creates the table file that memtable `memtable_index` will be
-    /// written to, and records the flush as in progress. `log_number_old`
-    /// is the log that holds that memtable's writes, and `op_flushed` and
-    /// `sequence_flushed` are the last op and sequence number in it.
-    fn flushBegin(
-        self: *Store,
-        memtable_index: usize,
-        log_number_old: u64,
-        op_flushed: u64,
-        sequence_flushed: u64,
-    ) FlushError!void {
-        assert(self.flushing == null);
-        const memtable = &self.memtables[memtable_index];
-        assert(!memtable.isEmpty());
-        const slot_index = self.freeSlotIndex().?;
-
-        const table_number = self.file_number_next;
-        self.file_number_next += 1;
-        var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-        const table_name = manifest.fileName(&name_buffer, .table, table_number);
-
-        const writer = try TableWriter.create(self.storage, table_name, .{}, .{
-            .block = self.flush_block_buffer,
-            .index = self.slotIndexBuffer(slot_index),
-        });
-
-        var cursor = memtable.iterator();
-        const entry_first = cursor.nextVersion().?;
-        self.flushing = .{
-            .stage = .writing,
-            .memtable_index = memtable_index,
-            .log_number_old = log_number_old,
-            .op_flushed = op_flushed,
-            .sequence_flushed = sequence_flushed,
-            .table_number = table_number,
-            .slot_index = slot_index,
-            .writer = writer,
-            .cursor = cursor,
-            .entry_next = entry_first,
-            .key_min = entry_first.key,
-            .key_max = entry_first.key,
-            .sequence_min = entry_first.sequence,
-            .sequence_max = entry_first.sequence,
-            .summary = undefined,
-        };
-    }
-
-    /// Does one write's share of the flush in progress: writes entries to
-    /// the table until `budget` bytes of the frozen memtable are done, and
-    /// carries the flush through to its end if those were the last. On an
-    /// error the store is marked broken.
-    fn flushStep(self: *Store, budget: usize) FlushError!void {
-        self.flushStepStages(budget) catch |err| {
-            self.flushFailed();
-            return err;
-        };
-    }
-
-    fn flushStepStages(self: *Store, budget: usize) FlushError!void {
-        if (self.flushing.?.stage == .writing) {
-            try self.flushWriteEntries(budget);
-            if (self.flushing.?.entry_next != null) {
-                return;
-            }
-        }
-        try self.flushCompleteStages();
-    }
-
-    /// Carries the flush in progress through to its end. On an error the
-    /// store is marked broken.
-    fn flushComplete(self: *Store) FlushError!void {
-        self.flushCompleteStages() catch |err| {
-            self.flushFailed();
-            return err;
-        };
-    }
-
-    fn flushCompleteStages(self: *Store) FlushError!void {
-        if (self.flushing.?.stage == .writing) {
-            try self.flushWriteEntries(std.math.maxInt(usize));
-            try self.flushFinishTable();
-        }
-        if (self.flushing.?.stage == .table_written) {
-            try self.flushRecordTable();
-        }
-        assert(self.flushing.?.stage == .table_recorded);
-        try self.flushRetireLog();
-    }
-
-    /// Marks the store broken after a step of the flush failed. The frozen
-    /// memtable is kept, so reads still see what it holds.
-    fn flushFailed(self: *Store) void {
-        self.broken = true;
-        const flushing = &self.flushing.?;
-        if (flushing.stage == .writing) {
-            flushing.writer.close();
-        }
-        flushing.stage = .failed;
-    }
-
-    /// Step 2 of a flush. Writes entries of the frozen memtable to the
-    /// table, in order, until `budget` bytes of the memtable are done or
-    /// there are no more entries. Every entry is written: older entries for
-    /// a key and tombstones too.
-    fn flushWriteEntries(self: *Store, budget: usize) FlushError!void {
-        const flushing = &self.flushing.?;
-        assert(flushing.stage == .writing);
-
-        var bytes_done: usize = 0;
-        while (bytes_done < budget) {
-            if (flushing.entry_next == null) {
-                return;
-            }
-            const entry = flushing.entry_next.?;
-
-            flushing.writer.add(entry.key, entry.value, entry.sequence) catch |err| switch (err) {
-                // The writer's buffers are sized for any memtable.
-                error.EntryTooLarge => unreachable,
-                error.TableFull => unreachable,
-                else => |other| return other,
+        /// Returns a cursor positioned at the first entry. It works in
+        /// `buffers`, which must stay valid, and be used by no other cursor,
+        /// for as long as this one is in use.
+        ///
+        /// The cursor keeps a pointer to this store, so the store must not be
+        /// moved or closed while the cursor is in use.
+        pub fn iterator(self: *const Store, buffers: *const IteratorBuffers) Iterator {
+            var it: Iterator = .{
+                .store = self,
+                .write_count = self.write_count,
+                .sources = undefined,
+                .source_count = 0,
+                .key_buffer = buffers.key,
+                .key_last = null,
             };
 
-            // The entries come in key order, so the last one written has
-            // the largest key so far.
-            flushing.key_max = entry.key;
-            flushing.sequence_min = @min(flushing.sequence_min, entry.sequence);
-            flushing.sequence_max = @max(flushing.sequence_max, entry.sequence);
-
-            bytes_done += memtableSizeMin(entry);
-            flushing.entry_next = flushing.cursor.nextVersion();
-        }
-    }
-
-    /// Step 3 of a flush. Completes the table file and makes it, and its
-    /// name, durable.
-    fn flushFinishTable(self: *Store) FlushError!void {
-        const flushing = &self.flushing.?;
-        assert(flushing.stage == .writing);
-        assert(flushing.entry_next == null);
-
-        flushing.summary = try flushing.writer.finish();
-        flushing.writer.close();
-        flushing.stage = .table_written;
-
-        try durable.syncDir(self.io, self.dir);
-    }
-
-    /// Step 4 of a flush. Opens the new table for reading and appends the
-    /// edit that adds it to the manifest. Once the edit is durable, the
-    /// table holds the frozen memtable's writes for good, and the frozen
-    /// memtable's log is no longer needed.
-    fn flushRecordTable(self: *Store) FlushError!void {
-        const flushing = &self.flushing.?;
-        assert(flushing.stage == .table_written);
-
-        var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-        const table_name = manifest.fileName(&name_buffer, .table, flushing.table_number);
-        const index_buffer = self.slotIndexBuffer(flushing.slot_index);
-        var reader = TableReader.open(self.storage, table_name, index_buffer) catch |err| switch (err) {
-            // The file was written a moment ago by this code.
-            error.UnsupportedVersion => return error.Corrupt,
-            error.IndexTooLarge => return error.Corrupt,
-            else => |other| return other,
-        };
-        errdefer reader.close();
-        if (reader.fileSize() != flushing.summary.file_size) {
-            return error.Corrupt;
-        }
-        if (reader.checksum() != flushing.summary.checksum) {
-            return error.Corrupt;
-        }
-
-        const table: manifest.Table = .{
-            .file_number = flushing.table_number,
-            .level = 0,
-            .file_size = flushing.summary.file_size,
-            .checksum = flushing.summary.checksum,
-            .sequence_min = flushing.sequence_min,
-            .sequence_max = flushing.sequence_max,
-            .key_min = flushing.key_min,
-            .key_max = flushing.key_max,
-        };
-        const tables_added = [_]manifest.Table{table};
-        const edit_bytes = manifest.encode(.{
-            .added = &tables_added,
-            .removed = &.{},
-            // The log that was started when the memtable was frozen.
-            .log_number = self.log_number,
-            .file_number_next = self.file_number_next,
-            .op_flushed = flushing.op_flushed,
-            .sequence_flushed = flushing.sequence_flushed,
-        }, self.edit_buffer);
-        const edit: manifest.EncodedEdit = .init(edit_bytes);
-        // The store only builds edits that fit the tables it has.
-        self.tables.check(edit) catch unreachable;
-
-        try self.manifest_writer.append(edit_bytes);
-        self.tables.apply(edit);
-        self.slots[flushing.slot_index] = .{
-            .in_use = true,
-            .file_number = flushing.table_number,
-            .reader = reader,
-        };
-        flushing.stage = .table_recorded;
-    }
-
-    /// Step 5 of a flush. Deletes the frozen memtable's log and empties the
-    /// frozen memtable. The table has everything both of them held.
-    fn flushRetireLog(self: *Store) FlushError!void {
-        const flushing = &self.flushing.?;
-        assert(flushing.stage == .table_recorded);
-
-        var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-        const log_name = manifest.fileName(&name_buffer, .log, flushing.log_number_old);
-        try self.dir.deleteFile(self.io, log_name);
-
-        self.memtables[flushing.memtable_index].reset();
-        self.flushing = null;
-    }
-
-    // ---- Opening ----
-
-    /// Brings a store whose memory is allocated, and which holds no files
-    /// but the lock, to the state its directory describes. If this fails,
-    /// every file it opened is closed again.
-    fn recover(self: *Store, options: Options) OpenError!void {
-        const manifest_end = try self.readManifest();
-        if (manifest_end == null) {
-            if (!options.create_if_missing) {
-                return error.StoreNotFound;
+            for (self.memtables) |*memtable| {
+                it.sources[it.source_count] = .{
+                    .cursor = .{ .memtable = memtable.iterator() },
+                    .loaded = false,
+                    .current = null,
+                };
+                it.source_count += 1;
             }
-            try self.create();
-            return;
+            for (&self.slots, 0..) |*slot, slot_index| {
+                if (!slot.in_use) {
+                    continue;
+                }
+                it.sources[it.source_count] = .{
+                    .cursor = .{ .table = slot.reader.iterator(buffers.block(slot_index)) },
+                    .loaded = false,
+                    .current = null,
+                };
+                it.source_count += 1;
+            }
+            return it;
         }
 
-        // First, everything the manifest says is checked against the
-        // directory, and nothing in the directory is changed. A manifest
-        // that has lost its last edits names files that are gone, and
-        // would have the files that hold the data deleted as strays.
-        const log_number_newer_found = try self.findNewerLog();
-
-        errdefer self.closeTables();
-        try self.openTables();
-
-        // The log the manifest names holds the writes that are in no table.
-        // It was created and synced before the manifest named it, so it is
-        // there, and whole.
-        const log_number_named = self.tables.log_number;
-        const named = self.replayLog(
-            log_number_named,
-            &self.memtables[0],
-            self.tables.sequence_flushed,
-        ) catch |err| switch (err) {
-            error.FileNotFound => return error.Corrupt,
-            error.IncompleteLog => return error.Corrupt,
-            else => |other| return other,
-        };
-        if (named.previous.op != self.tables.op_flushed) {
-            return error.Corrupt;
+        /// The op number of the last batch written, or 0 if there has been none.
+        /// Each batch is given the next op number.
+        pub fn opLatest(self: *const Store) u64 {
+            return self.log.last.op;
         }
 
-        // A log newer than that one was started by a flush that a crash
-        // interrupted. It holds the writes made after the first log's
-        // memtable was frozen.
-        var newer: ?ReplayedLog = null;
-        var log_number_newer: u64 = 0;
-        var newer_is_incomplete = false;
-        if (log_number_newer_found != null) {
-            log_number_newer = log_number_newer_found.?;
-            // A log started after the manifest's last edit took a file
-            // number the manifest had not handed out.
-            if (log_number_newer < self.tables.file_number_next) {
-                return error.Corrupt;
-            }
-            if (log_number_newer > number_recovered_max) {
-                return error.Corrupt;
-            }
-
-            const replayed = self.replayLog(
-                log_number_newer,
-                &self.memtables[1],
-                named.sequence_last,
-            );
-            if (replayed) |replayed_log| {
-                newer = replayed_log;
-            } else |err| switch (err) {
-                // The crash came while the new log was being created. It
-                // holds nothing, and nothing was frozen yet.
-                error.IncompleteLog => newer_is_incomplete = true,
-                else => |other| return other,
-            }
+        /// The sequence number of the last operation written, or 0 if there has
+        /// been none. Each operation of each batch is given the next sequence
+        /// number, so a batch of three operations takes three of them.
+        pub fn sequenceLatest(self: *const Store) u64 {
+            return self.sequence_last;
         }
 
-        if (newer != null) {
-            // The newer log must carry on from the last record of the named
-            // one.
-            if (newer.?.previous.op != named.end.last.op) {
-                return error.Corrupt;
-            }
-            if (newer.?.previous.checksum != named.end.last.checksum) {
-                return error.Corrupt;
-            }
-            // A memtable is only frozen when it holds something and a table
-            // slot is free for it.
-            if (self.memtables[0].isEmpty()) {
-                return error.Corrupt;
-            }
-            if (self.tables.count() == tables_max) {
-                return error.Corrupt;
-            }
+        /// The memtable that takes the writes.
+        fn activeMemtable(self: *const Store) *MemTable {
+            return &self.memtables[self.active_index];
         }
 
-        // The directory is what the manifest describes. From here on files
-        // are changed: strays are deleted, the manifest and the log lose a
-        // record that a crash left half-written, and an interrupted flush
-        // is run again.
-        try self.removeStrayFiles();
-        if (newer_is_incomplete) {
-            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-            const log_name = manifest.fileName(&name_buffer, .log, log_number_newer);
-            try self.dir.deleteFile(self.io, log_name);
+        /// The memtable that does not take the writes. It is empty unless it is
+        /// frozen.
+        fn otherMemtable(self: *const Store) *MemTable {
+            return &self.memtables[1 - self.active_index];
         }
 
-        self.manifest_writer = try ManifestWriter.open(self.storage, manifest_end.?);
-        errdefer self.manifest_writer.close();
-
-        self.active_index = 0;
-        self.sequence_last = named.sequence_last;
-        self.log_number = log_number_named;
-        self.file_number_next = self.tables.file_number_next;
-        var log_end = named.end;
-        var log_file_len = named.file_size;
-
-        if (newer != null) {
-            self.active_index = 1;
-            self.sequence_last = newer.?.sequence_last;
-            self.log_number = log_number_newer;
-            self.file_number_next = log_number_newer + 1;
-            log_end = newer.?.end;
-            log_file_len = newer.?.file_size;
-
-            // Run the interrupted flush again, from the start.
-            try self.flushBegin(
-                0,
-                log_number_named,
-                named.end.last.op,
-                named.sequence_last,
-            );
-            try self.flushComplete();
+        /// The part of `index_storage` that belongs to one table slot.
+        fn slotIndexBuffer(self: *const Store, slot_index: usize) []u8 {
+            const start = slot_index * sstable.index_size_max;
+            return self.index_storage[start..][0..sstable.index_size_max];
         }
 
-        var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-        const log_name = manifest.fileName(&name_buffer, .log, self.log_number);
-        self.log = try Log.Writer.open(self.storage, log_name, log_file_len, self.log_buffer, log_end);
-    }
-
-    /// Reads the manifest and applies its edits to `tables`. Returns where
-    /// the manifest ends, or `null` if the directory holds no store: there
-    /// is no manifest, or a crash while the store was being created left
-    /// one with no edits in it.
-    fn readManifest(self: *Store) OpenError!?wal.End {
-        var reader = ManifestReader.open(self.storage, self.edit_buffer) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            error.IncompleteLog => return null,
-            else => |other| return other,
-        };
-        defer reader.close();
-
-        var edit_count: u64 = 0;
-        while (true) {
-            const edit = try reader.next();
-            if (edit == null) {
-                break;
+        /// The index of a slot that holds no table, or `null` if every slot is
+        /// taken.
+        fn freeSlotIndex(self: *const Store) ?usize {
+            for (self.slots, 0..) |slot, slot_index| {
+                if (!slot.in_use) {
+                    return slot_index;
+                }
             }
-            try self.tables.check(edit.?);
-            self.tables.apply(edit.?);
-            edit_count += 1;
-        }
-        if (edit_count == 0) {
             return null;
         }
 
-        // The store counts on from each of these, so none may be so large
-        // that counting on could overflow.
-        const manifest_end = reader.end();
-        if (manifest_end.last.op > number_recovered_max) {
-            return error.Corrupt;
+        /// Closes every open table file.
+        fn closeTables(self: *Store) void {
+            for (&self.slots) |*slot| {
+                if (slot.in_use) {
+                    slot.reader.close();
+                    slot.in_use = false;
+                }
+            }
         }
-        if (self.tables.op_flushed > number_recovered_max) {
-            return error.Corrupt;
+
+        // ---- Flushing ----
+
+        /// Step 1 of a flush. Starts a new log, begins writing the active
+        /// memtable to a table, and makes the other memtable the active one.
+        ///
+        /// The caller has checked that no flush is in progress, that the active
+        /// memtable holds something, and that a table slot is free. If this
+        /// fails, the store is as it was.
+        fn freeze(self: *Store) FlushError!void {
+            assert(self.flushing == null);
+            assert(self.otherMemtable().isEmpty());
+
+            const log_number_new = self.file_number_next;
+            self.file_number_next += 1;
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const log_name = manifest.fileName(&name_buffer, .log, log_number_new);
+
+            // The new log carries on from the last record of the current one.
+            // The current log is not being appended to, so the buffer the two
+            // share is free for the new one to be written out from.
+            var log_new = try Log.Writer.create(
+                self.storage,
+                log_name,
+                self.log_file_size,
+                self.log_buffer,
+                self.log.last,
+            );
+            errdefer {
+                log_new.close();
+                self.storage.deleteFile(log_name) catch {};
+            }
+
+            try self.flushBegin(
+                self.active_index,
+                self.log_number,
+                self.log.last.op,
+                self.sequence_last,
+            );
+
+            self.log.close();
+            self.log = log_new;
+            self.log_number = log_number_new;
+            self.active_index = 1 - self.active_index;
         }
-        if (self.tables.sequence_flushed > number_recovered_max) {
-            return error.Corrupt;
+
+        /// Creates the table file that memtable `memtable_index` will be
+        /// written to, and records the flush as in progress. `log_number_old`
+        /// is the log that holds that memtable's writes, and `op_flushed` and
+        /// `sequence_flushed` are the last op and sequence number in it.
+        fn flushBegin(
+            self: *Store,
+            memtable_index: usize,
+            log_number_old: u64,
+            op_flushed: u64,
+            sequence_flushed: u64,
+        ) FlushError!void {
+            assert(self.flushing == null);
+            const memtable = &self.memtables[memtable_index];
+            assert(!memtable.isEmpty());
+            const slot_index = self.freeSlotIndex().?;
+
+            const table_number = self.file_number_next;
+            self.file_number_next += 1;
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const table_name = manifest.fileName(&name_buffer, .table, table_number);
+
+            const writer = try TableWriter.create(self.storage, table_name, .{}, .{
+                .block = self.flush_block_buffer,
+                .index = self.slotIndexBuffer(slot_index),
+            });
+
+            var cursor = memtable.iterator();
+            const entry_first = cursor.nextVersion().?;
+            self.flushing = .{
+                .stage = .writing,
+                .memtable_index = memtable_index,
+                .log_number_old = log_number_old,
+                .op_flushed = op_flushed,
+                .sequence_flushed = sequence_flushed,
+                .table_number = table_number,
+                .slot_index = slot_index,
+                .writer = writer,
+                .cursor = cursor,
+                .entry_next = entry_first,
+                .key_min = entry_first.key,
+                .key_max = entry_first.key,
+                .sequence_min = entry_first.sequence,
+                .sequence_max = entry_first.sequence,
+                .summary = undefined,
+            };
         }
-        if (self.tables.file_number_next > number_recovered_max) {
-            return error.Corrupt;
+
+        /// Does one write's share of the flush in progress: writes entries to
+        /// the table until `budget` bytes of the frozen memtable are done, and
+        /// carries the flush through to its end if those were the last. On an
+        /// error the store is marked broken.
+        fn flushStep(self: *Store, budget: usize) FlushError!void {
+            self.flushStepStages(budget) catch |err| {
+                self.flushFailed();
+                return err;
+            };
         }
-        return manifest_end;
-    }
 
-    /// Creates a new store: its first log, then a manifest whose first edit
-    /// names that log.
-    fn create(self: *Store) OpenError!void {
-        try self.removeCreationLeftovers();
+        fn flushStepStages(self: *Store, budget: usize) FlushError!void {
+            if (self.flushing.?.stage == .writing) {
+                try self.flushWriteEntries(budget);
+                if (self.flushing.?.entry_next != null) {
+                    return;
+                }
+            }
+            try self.flushCompleteStages();
+        }
 
-        var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-        const log_name = manifest.fileName(&name_buffer, .log, log_number_first);
-        self.log = try Log.Writer.create(self.storage, log_name, self.log_file_size, self.log_buffer, .none);
-        errdefer self.log.close();
+        /// Carries the flush in progress through to its end. On an error the
+        /// store is marked broken.
+        fn flushComplete(self: *Store) FlushError!void {
+            self.flushCompleteStages() catch |err| {
+                self.flushFailed();
+                return err;
+            };
+        }
 
-        self.manifest_writer = try ManifestWriter.create(self.storage);
-        errdefer self.manifest_writer.close();
+        fn flushCompleteStages(self: *Store) FlushError!void {
+            if (self.flushing.?.stage == .writing) {
+                try self.flushWriteEntries(std.math.maxInt(usize));
+                try self.flushFinishTable();
+            }
+            if (self.flushing.?.stage == .table_written) {
+                try self.flushRecordTable();
+            }
+            assert(self.flushing.?.stage == .table_recorded);
+            try self.flushRetireLog();
+        }
 
-        const edit_bytes = manifest.encode(.{
-            .added = &.{},
-            .removed = &.{},
-            .log_number = log_number_first,
-            .file_number_next = log_number_first + 1,
-            .op_flushed = 0,
-            .sequence_flushed = 0,
-        }, self.edit_buffer);
-        const edit: manifest.EncodedEdit = .init(edit_bytes);
-        self.tables.check(edit) catch unreachable;
-        try self.manifest_writer.append(edit_bytes);
-        self.tables.apply(edit);
+        /// Marks the store broken after a step of the flush failed. The frozen
+        /// memtable is kept, so reads still see what it holds.
+        fn flushFailed(self: *Store) void {
+            self.broken = true;
+            const flushing = &self.flushing.?;
+            if (flushing.stage == .writing) {
+                flushing.writer.close();
+            }
+            flushing.stage = .failed;
+        }
 
-        self.active_index = 0;
-        self.sequence_last = 0;
-        self.log_number = log_number_first;
-        self.file_number_next = log_number_first + 1;
-    }
+        /// Step 2 of a flush. Writes entries of the frozen memtable to the
+        /// table, in order, until `budget` bytes of the memtable are done or
+        /// there are no more entries. Every entry is written: older entries for
+        /// a key and tombstones too.
+        fn flushWriteEntries(self: *Store, budget: usize) FlushError!void {
+            const flushing = &self.flushing.?;
+            assert(flushing.stage == .writing);
 
-    /// Removes what a crash while a store was being created can leave: a
-    /// manifest with no edits, and a first log with no records. A first log
-    /// that holds records is not such a leftover, and is reported.
-    fn removeCreationLeftovers(self: *Store) OpenError!void {
-        // A store that was never fully created has no file but its first
-        // log. Any other numbered file belongs to a store whose manifest
-        // has been lost.
-        {
-            var listing = try self.dir.openDir(self.io, ".", .{ .iterate = true });
-            defer listing.close(self.io);
-            var entries = listing.iterate();
+            var bytes_done: usize = 0;
+            while (bytes_done < budget) {
+                if (flushing.entry_next == null) {
+                    return;
+                }
+                const entry = flushing.entry_next.?;
+
+                flushing.writer.add(entry.key, entry.value, entry.sequence) catch |err| switch (err) {
+                    // The writer's buffers are sized for any memtable.
+                    error.EntryTooLarge => unreachable,
+                    error.TableFull => unreachable,
+                    else => |other| return other,
+                };
+
+                // The entries come in key order, so the last one written has
+                // the largest key so far.
+                flushing.key_max = entry.key;
+                flushing.sequence_min = @min(flushing.sequence_min, entry.sequence);
+                flushing.sequence_max = @max(flushing.sequence_max, entry.sequence);
+
+                bytes_done += memtableSizeMin(entry);
+                flushing.entry_next = flushing.cursor.nextVersion();
+            }
+        }
+
+        /// Step 3 of a flush. Completes the table file and makes it, and its
+        /// name, durable.
+        fn flushFinishTable(self: *Store) FlushError!void {
+            const flushing = &self.flushing.?;
+            assert(flushing.stage == .writing);
+            assert(flushing.entry_next == null);
+
+            flushing.summary = try flushing.writer.finish();
+            flushing.writer.close();
+            flushing.stage = .table_written;
+
+            try self.storage.syncDir();
+        }
+
+        /// Step 4 of a flush. Opens the new table for reading and appends the
+        /// edit that adds it to the manifest. Once the edit is durable, the
+        /// table holds the frozen memtable's writes for good, and the frozen
+        /// memtable's log is no longer needed.
+        fn flushRecordTable(self: *Store) FlushError!void {
+            const flushing = &self.flushing.?;
+            assert(flushing.stage == .table_written);
+
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const table_name = manifest.fileName(&name_buffer, .table, flushing.table_number);
+            const index_buffer = self.slotIndexBuffer(flushing.slot_index);
+            var reader = TableReader.open(self.storage, table_name, index_buffer) catch |err| switch (err) {
+                // The file was written a moment ago by this code.
+                error.UnsupportedVersion => return error.Corrupt,
+                error.IndexTooLarge => return error.Corrupt,
+                else => |other| return other,
+            };
+            errdefer reader.close();
+            if (reader.fileSize() != flushing.summary.file_size) {
+                return error.Corrupt;
+            }
+            if (reader.checksum() != flushing.summary.checksum) {
+                return error.Corrupt;
+            }
+
+            const table: manifest.Table = .{
+                .file_number = flushing.table_number,
+                .level = 0,
+                .file_size = flushing.summary.file_size,
+                .checksum = flushing.summary.checksum,
+                .sequence_min = flushing.sequence_min,
+                .sequence_max = flushing.sequence_max,
+                .key_min = flushing.key_min,
+                .key_max = flushing.key_max,
+            };
+            const tables_added = [_]manifest.Table{table};
+            const edit_bytes = manifest.encode(.{
+                .added = &tables_added,
+                .removed = &.{},
+                // The log that was started when the memtable was frozen.
+                .log_number = self.log_number,
+                .file_number_next = self.file_number_next,
+                .op_flushed = flushing.op_flushed,
+                .sequence_flushed = flushing.sequence_flushed,
+            }, self.edit_buffer);
+            const edit: manifest.EncodedEdit = .init(edit_bytes);
+            // The store only builds edits that fit the tables it has.
+            self.tables.check(edit) catch unreachable;
+
+            try self.manifest_writer.append(edit_bytes);
+            self.tables.apply(edit);
+            self.slots[flushing.slot_index] = .{
+                .in_use = true,
+                .file_number = flushing.table_number,
+                .reader = reader,
+            };
+            flushing.stage = .table_recorded;
+        }
+
+        /// Step 5 of a flush. Deletes the frozen memtable's log and empties the
+        /// frozen memtable. The table has everything both of them held.
+        fn flushRetireLog(self: *Store) FlushError!void {
+            const flushing = &self.flushing.?;
+            assert(flushing.stage == .table_recorded);
+
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const log_name = manifest.fileName(&name_buffer, .log, flushing.log_number_old);
+            try self.storage.deleteFile(log_name);
+
+            self.memtables[flushing.memtable_index].reset();
+            self.flushing = null;
+        }
+
+        // ---- Opening ----
+
+        /// Brings a store whose memory is allocated, and which holds no files
+        /// but the lock, to the state its directory describes. If this fails,
+        /// every file it opened is closed again.
+        fn recover(self: *Store, options: Options) OpenError!void {
+            const manifest_end = try self.readManifest();
+            if (manifest_end == null) {
+                if (!options.create_if_missing) {
+                    return error.StoreNotFound;
+                }
+                try self.create();
+                return;
+            }
+
+            // First, everything the manifest says is checked against the
+            // directory, and nothing in the directory is changed. A manifest
+            // that has lost its last edits names files that are gone, and
+            // would have the files that hold the data deleted as strays.
+            const log_number_newer_found = try self.findNewerLog();
+
+            errdefer self.closeTables();
+            try self.openTables();
+
+            // The log the manifest names holds the writes that are in no table.
+            // It was created and synced before the manifest named it, so it is
+            // there, and whole.
+            const log_number_named = self.tables.log_number;
+            const named = self.replayLog(
+                log_number_named,
+                &self.memtables[0],
+                self.tables.sequence_flushed,
+            ) catch |err| switch (err) {
+                error.FileNotFound => return error.Corrupt,
+                error.IncompleteLog => return error.Corrupt,
+                else => |other| return other,
+            };
+            if (named.previous.op != self.tables.op_flushed) {
+                return error.Corrupt;
+            }
+
+            // A log newer than that one was started by a flush that a crash
+            // interrupted. It holds the writes made after the first log's
+            // memtable was frozen.
+            var newer: ?ReplayedLog = null;
+            var log_number_newer: u64 = 0;
+            var newer_is_incomplete = false;
+            if (log_number_newer_found != null) {
+                log_number_newer = log_number_newer_found.?;
+                // A log started after the manifest's last edit took a file
+                // number the manifest had not handed out.
+                if (log_number_newer < self.tables.file_number_next) {
+                    return error.Corrupt;
+                }
+                if (log_number_newer > number_recovered_max) {
+                    return error.Corrupt;
+                }
+
+                const replayed = self.replayLog(
+                    log_number_newer,
+                    &self.memtables[1],
+                    named.sequence_last,
+                );
+                if (replayed) |replayed_log| {
+                    newer = replayed_log;
+                } else |err| switch (err) {
+                    // The crash came while the new log was being created. It
+                    // holds nothing, and nothing was frozen yet.
+                    error.IncompleteLog => newer_is_incomplete = true,
+                    else => |other| return other,
+                }
+            }
+
+            if (newer != null) {
+                // The newer log must carry on from the last record of the named
+                // one.
+                if (newer.?.previous.op != named.end.last.op) {
+                    return error.Corrupt;
+                }
+                if (newer.?.previous.checksum != named.end.last.checksum) {
+                    return error.Corrupt;
+                }
+                // A memtable is only frozen when it holds something and a table
+                // slot is free for it.
+                if (self.memtables[0].isEmpty()) {
+                    return error.Corrupt;
+                }
+                if (self.tables.count() == tables_max) {
+                    return error.Corrupt;
+                }
+            }
+
+            // The directory is what the manifest describes. From here on files
+            // are changed: strays are deleted, the manifest and the log lose a
+            // record that a crash left half-written, and an interrupted flush
+            // is run again.
+            try self.removeStrayFiles();
+            if (newer_is_incomplete) {
+                var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+                const log_name = manifest.fileName(&name_buffer, .log, log_number_newer);
+                try self.storage.deleteFile(log_name);
+            }
+
+            self.manifest_writer = try ManifestWriter.open(self.storage, manifest_end.?);
+            errdefer self.manifest_writer.close();
+
+            self.active_index = 0;
+            self.sequence_last = named.sequence_last;
+            self.log_number = log_number_named;
+            self.file_number_next = self.tables.file_number_next;
+            var log_end = named.end;
+            var log_file_len = named.file_size;
+
+            if (newer != null) {
+                self.active_index = 1;
+                self.sequence_last = newer.?.sequence_last;
+                self.log_number = log_number_newer;
+                self.file_number_next = log_number_newer + 1;
+                log_end = newer.?.end;
+                log_file_len = newer.?.file_size;
+
+                // Run the interrupted flush again, from the start.
+                try self.flushBegin(
+                    0,
+                    log_number_named,
+                    named.end.last.op,
+                    named.sequence_last,
+                );
+                try self.flushComplete();
+            }
+
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const log_name = manifest.fileName(&name_buffer, .log, self.log_number);
+            self.log = try Log.Writer.open(self.storage, log_name, log_file_len, self.log_buffer, log_end);
+        }
+
+        /// Reads the manifest and applies its edits to `tables`. Returns where
+        /// the manifest ends, or `null` if the directory holds no store: there
+        /// is no manifest, or a crash while the store was being created left
+        /// one with no edits in it.
+        fn readManifest(self: *Store) OpenError!?wal.End {
+            var reader = ManifestReader.open(self.storage, self.edit_buffer) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                error.IncompleteLog => return null,
+                else => |other| return other,
+            };
+            defer reader.close();
+
+            var edit_count: u64 = 0;
             while (true) {
-                const entry = try entries.next(self.io);
-                if (entry == null) {
+                const edit = try reader.next();
+                if (edit == null) {
                     break;
                 }
-                const parsed = manifest.parseFileName(entry.?.name);
+                try self.tables.check(edit.?);
+                self.tables.apply(edit.?);
+                edit_count += 1;
+            }
+            if (edit_count == 0) {
+                return null;
+            }
+
+            // The store counts on from each of these, so none may be so large
+            // that counting on could overflow.
+            const manifest_end = reader.end();
+            if (manifest_end.last.op > number_recovered_max) {
+                return error.Corrupt;
+            }
+            if (self.tables.op_flushed > number_recovered_max) {
+                return error.Corrupt;
+            }
+            if (self.tables.sequence_flushed > number_recovered_max) {
+                return error.Corrupt;
+            }
+            if (self.tables.file_number_next > number_recovered_max) {
+                return error.Corrupt;
+            }
+            return manifest_end;
+        }
+
+        /// Creates a new store: its first log, then a manifest whose first edit
+        /// names that log.
+        fn create(self: *Store) OpenError!void {
+            try self.removeCreationLeftovers();
+
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const log_name = manifest.fileName(&name_buffer, .log, log_number_first);
+            self.log = try Log.Writer.create(self.storage, log_name, self.log_file_size, self.log_buffer, .none);
+            errdefer self.log.close();
+
+            self.manifest_writer = try ManifestWriter.create(self.storage);
+            errdefer self.manifest_writer.close();
+
+            const edit_bytes = manifest.encode(.{
+                .added = &.{},
+                .removed = &.{},
+                .log_number = log_number_first,
+                .file_number_next = log_number_first + 1,
+                .op_flushed = 0,
+                .sequence_flushed = 0,
+            }, self.edit_buffer);
+            const edit: manifest.EncodedEdit = .init(edit_bytes);
+            self.tables.check(edit) catch unreachable;
+            try self.manifest_writer.append(edit_bytes);
+            self.tables.apply(edit);
+
+            self.active_index = 0;
+            self.sequence_last = 0;
+            self.log_number = log_number_first;
+            self.file_number_next = log_number_first + 1;
+        }
+
+        /// Removes what a crash while a store was being created can leave: a
+        /// manifest with no edits, and a first log with no records. A first log
+        /// that holds records is not such a leftover, and is reported.
+        fn removeCreationLeftovers(self: *Store) OpenError!void {
+            // A store that was never fully created has no file but its first
+            // log. Any other numbered file belongs to a store whose manifest
+            // has been lost.
+            {
+                var listing = try self.storage.list();
+
+                defer listing.close();
+                while (true) {
+                    const name = try listing.next();
+                    if (name == null) {
+                        break;
+                    }
+                    const parsed = manifest.parseFileName(name.?);
+                    if (parsed == null) {
+                        continue;
+                    }
+                    if (parsed.?.kind != .log) {
+                        return error.Corrupt;
+                    }
+                    if (parsed.?.file_number != log_number_first) {
+                        return error.Corrupt;
+                    }
+                }
+            }
+
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const log_name = manifest.fileName(&name_buffer, .log, log_number_first);
+
+            var log_is_there = true;
+            var reader_or_error = Log.Reader.open(self.storage, log_name, self.log_buffer);
+            if (reader_or_error) |*reader| {
+                defer reader.close();
+                const record = try reader.next();
+                if (record != null) {
+                    // Writes were made here, and there is no manifest to say
+                    // which tables go with them.
+                    return error.Corrupt;
+                }
+            } else |err| switch (err) {
+                error.FileNotFound => log_is_there = false,
+                error.IncompleteLog => {},
+                // The header is intact and the file is not the length it gives.
+                error.WrongFileSize => return error.Corrupt,
+                else => |other| return other,
+            }
+            if (log_is_there) {
+                try self.storage.deleteFile(log_name);
+            }
+
+            self.storage.deleteFile(manifest.file_name) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => |other| return other,
+            };
+        }
+
+        /// Looks in the directory for a log newer than the one the manifest
+        /// names, and returns its file number. There is at most one: the log a
+        /// flush started before a crash. Nothing is changed.
+        fn findNewerLog(self: *Store) OpenError!?u64 {
+            var log_number_newer: ?u64 = null;
+
+            var listing = try self.storage.list();
+
+            defer listing.close();
+            while (true) {
+                const name = try listing.next();
+                if (name == null) {
+                    return log_number_newer;
+                }
+                const parsed = manifest.parseFileName(name.?);
                 if (parsed == null) {
                     continue;
                 }
                 if (parsed.?.kind != .log) {
+                    continue;
+                }
+                if (parsed.?.file_number <= self.tables.log_number) {
+                    continue;
+                }
+                if (log_number_newer != null) {
                     return error.Corrupt;
                 }
-                if (parsed.?.file_number != log_number_first) {
-                    return error.Corrupt;
+                log_number_newer = parsed.?.file_number;
+            }
+        }
+
+        /// Deletes the numbered files that the manifest does not account for: a
+        /// table it does not hold, which a flush wrote before a crash, and a
+        /// log older than the one it names, which a flush had finished with.
+        ///
+        /// A log newer than the one the manifest names is left alone: it holds
+        /// writes. The caller has checked the manifest against the directory.
+        fn removeStrayFiles(self: *Store) OpenError!void {
+            while (true) {
+                // File numbers are collected while the directory is listed and
+                // the files deleted afterwards, a few at a time, so that
+                // nothing is deleted from a directory while it is being read.
+                var stray: [16]manifest.ParsedFileName = undefined;
+                var stray_count: usize = 0;
+                var stray_left_over = false;
+
+                {
+                    var listing = try self.storage.list();
+
+                    defer listing.close();
+                    while (true) {
+                        const name = try listing.next();
+                        if (name == null) {
+                            break;
+                        }
+                        const parsed = manifest.parseFileName(name.?);
+                        if (parsed == null) {
+                            continue;
+                        }
+                        const file = parsed.?;
+
+                        var is_stray = false;
+                        switch (file.kind) {
+                            .table => {
+                                if (self.tables.find(file.file_number) == null) {
+                                    is_stray = true;
+                                }
+                            },
+                            .log => {
+                                if (file.file_number < self.tables.log_number) {
+                                    is_stray = true;
+                                }
+                            },
+                        }
+                        if (!is_stray) {
+                            continue;
+                        }
+                        if (stray_count == stray.len) {
+                            stray_left_over = true;
+                            continue;
+                        }
+                        stray[stray_count] = file;
+                        stray_count += 1;
+                    }
+                }
+
+                for (stray[0..stray_count]) |file| {
+                    var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+                    const name = manifest.fileName(&name_buffer, file.kind, file.file_number);
+                    try self.storage.deleteFile(name);
+                }
+                if (!stray_left_over) {
+                    return;
                 }
             }
         }
 
-        var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-        const log_name = manifest.fileName(&name_buffer, .log, log_number_first);
-
-        var log_is_there = true;
-        var reader_or_error = Log.Reader.open(self.storage, log_name, self.log_buffer);
-        if (reader_or_error) |*reader| {
-            defer reader.close();
-            const record = try reader.next();
-            if (record != null) {
-                // Writes were made here, and there is no manifest to say
-                // which tables go with them.
-                return error.Corrupt;
-            }
-        } else |err| switch (err) {
-            error.FileNotFound => log_is_there = false,
-            error.IncompleteLog => {},
-            // The header is intact and the file is not the length it gives.
-            error.WrongFileSize => return error.Corrupt,
-            else => |other| return other,
-        }
-        if (log_is_there) {
-            try self.dir.deleteFile(self.io, log_name);
-        }
-
-        self.dir.deleteFile(self.io, manifest.file_name) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => |other| return other,
-        };
-    }
-
-    /// Looks in the directory for a log newer than the one the manifest
-    /// names, and returns its file number. There is at most one: the log a
-    /// flush started before a crash. Nothing is changed.
-    fn findNewerLog(self: *Store) OpenError!?u64 {
-        var log_number_newer: ?u64 = null;
-
-        var listing = try self.dir.openDir(self.io, ".", .{ .iterate = true });
-        defer listing.close(self.io);
-        var entries = listing.iterate();
-        while (true) {
-            const entry = try entries.next(self.io);
-            if (entry == null) {
-                return log_number_newer;
-            }
-            const parsed = manifest.parseFileName(entry.?.name);
-            if (parsed == null) {
-                continue;
-            }
-            if (parsed.?.kind != .log) {
-                continue;
-            }
-            if (parsed.?.file_number <= self.tables.log_number) {
-                continue;
-            }
-            if (log_number_newer != null) {
-                return error.Corrupt;
-            }
-            log_number_newer = parsed.?.file_number;
-        }
-    }
-
-    /// Deletes the numbered files that the manifest does not account for: a
-    /// table it does not hold, which a flush wrote before a crash, and a
-    /// log older than the one it names, which a flush had finished with.
-    ///
-    /// A log newer than the one the manifest names is left alone: it holds
-    /// writes. The caller has checked the manifest against the directory.
-    fn removeStrayFiles(self: *Store) OpenError!void {
-        while (true) {
-            // File numbers are collected while the directory is listed and
-            // the files deleted afterwards, a few at a time, so that
-            // nothing is deleted from a directory while it is being read.
-            var stray: [16]manifest.ParsedFileName = undefined;
-            var stray_count: usize = 0;
-            var stray_left_over = false;
-
-            {
-                var listing = try self.dir.openDir(self.io, ".", .{ .iterate = true });
-                defer listing.close(self.io);
-                var entries = listing.iterate();
-                while (true) {
-                    const entry = try entries.next(self.io);
-                    if (entry == null) {
-                        break;
-                    }
-                    const parsed = manifest.parseFileName(entry.?.name);
-                    if (parsed == null) {
-                        continue;
-                    }
-                    const file = parsed.?;
-
-                    var is_stray = false;
-                    switch (file.kind) {
-                        .table => {
-                            if (self.tables.find(file.file_number) == null) {
-                                is_stray = true;
-                            }
-                        },
-                        .log => {
-                            if (file.file_number < self.tables.log_number) {
-                                is_stray = true;
-                            }
-                        },
-                    }
-                    if (!is_stray) {
-                        continue;
-                    }
-                    if (stray_count == stray.len) {
-                        stray_left_over = true;
-                        continue;
-                    }
-                    stray[stray_count] = file;
-                    stray_count += 1;
+        /// Opens every table the manifest holds, and checks that each file is
+        /// the one that was written.
+        fn openTables(self: *Store) OpenError!void {
+            var tables = self.tables.iterator();
+            while (true) {
+                const found = tables.next();
+                if (found == null) {
+                    return;
                 }
-            }
+                const table = found.?;
+                const slot_index = self.freeSlotIndex().?;
 
-            for (stray[0..stray_count]) |file| {
                 var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-                const name = manifest.fileName(&name_buffer, file.kind, file.file_number);
-                try self.dir.deleteFile(self.io, name);
-            }
-            if (!stray_left_over) {
-                return;
+                const name = manifest.fileName(&name_buffer, .table, table.file_number);
+                const index_buffer = self.slotIndexBuffer(slot_index);
+                var reader = TableReader.open(self.storage, name, index_buffer) catch |err| switch (err) {
+                    // The manifest only names a table once the file is durable.
+                    error.FileNotFound => return error.Corrupt,
+                    else => |other| return other,
+                };
+                errdefer reader.close();
+                if (reader.fileSize() != table.file_size) {
+                    return error.Corrupt;
+                }
+                if (reader.checksum() != table.checksum) {
+                    return error.Corrupt;
+                }
+                // Reads go through buffers of this size.
+                if (reader.blockSizeMax() > sstable.block_size_max) {
+                    return error.BlockTooLarge;
+                }
+
+                self.slots[slot_index] = .{
+                    .in_use = true,
+                    .file_number = table.file_number,
+                    .reader = reader,
+                };
             }
         }
-    }
 
-    /// Opens every table the manifest holds, and checks that each file is
-    /// the one that was written.
-    fn openTables(self: *Store) OpenError!void {
-        var tables = self.tables.iterator();
-        while (true) {
-            const found = tables.next();
-            if (found == null) {
-                return;
-            }
-            const table = found.?;
-            const slot_index = self.freeSlotIndex().?;
+        /// What `replayLog` learned about a log.
+        const ReplayedLog = struct {
+            /// The record the log carries on from, as its file header says.
+            previous: wal.RecordId,
+            /// Where the log's valid records end.
+            end: sector_log.End,
+            /// The length of the log's file.
+            file_size: u64,
+            /// The sequence number of the last operation in the log, or the
+            /// number the log follows if it holds none.
+            sequence_last: u64,
+        };
 
+        /// Reads every record of log number `log_number` and applies it to
+        /// `memtable` as a batch. The operations are numbered from
+        /// `sequence_before + 1` in the order the log holds them, which is how
+        /// they were numbered when they were first written.
+        fn replayLog(
+            self: *Store,
+            log_number: u64,
+            memtable: *MemTable,
+            sequence_before: u64,
+        ) (OpenError || error{IncompleteLog})!ReplayedLog {
             var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-            const name = manifest.fileName(&name_buffer, .table, table.file_number);
-            const index_buffer = self.slotIndexBuffer(slot_index);
-            var reader = TableReader.open(self.storage, name, index_buffer) catch |err| switch (err) {
-                // The manifest only names a table once the file is durable.
-                error.FileNotFound => return error.Corrupt,
+            const log_name = manifest.fileName(&name_buffer, .log, log_number);
+
+            // No log is being appended to yet, so the log buffer is free to
+            // hold the records being replayed.
+            var reader = Log.Reader.open(self.storage, log_name, self.log_buffer) catch |err| switch (err) {
+                // The header is intact and the file is not the length it gives.
+                error.WrongFileSize => return error.Corrupt,
                 else => |other| return other,
             };
-            errdefer reader.close();
-            if (reader.fileSize() != table.file_size) {
+            defer reader.close();
+            const previous = reader.end().last;
+            // A log this store wrote has room for the largest batch. One that
+            // has not could not be appended to.
+            if (reader.file_size < sector_log.fileSizeMin(log_payload_size_max)) {
                 return error.Corrupt;
-            }
-            if (reader.checksum() != table.checksum) {
-                return error.Corrupt;
-            }
-            // Reads go through buffers of this size.
-            if (reader.blockSizeMax() > sstable.block_size_max) {
-                return error.BlockTooLarge;
             }
 
-            self.slots[slot_index] = .{
-                .in_use = true,
-                .file_number = table.file_number,
-                .reader = reader,
+            var sequence_last = sequence_before;
+            while (true) {
+                const record = try reader.next();
+                if (record == null) {
+                    break;
+                }
+                const batch_bytes = record.?.payload;
+
+                try write_batch.validate(batch_bytes);
+                // `commit` makes the same check before it logs a batch. A
+                // memtable fills the same way every time, whether it is new or
+                // has been reset, so this only fails for a log the store did
+                // not write.
+                if (memtableSizeMax(batch_bytes) > memtable.bytesFree()) {
+                    return error.LogTooLargeForMemtable;
+                }
+                sequence_last = applyBatch(memtable, batch_bytes, sequence_last + 1);
+            }
+            return .{
+                .previous = previous,
+                .end = reader.end(),
+                .file_size = reader.file_size,
+                .sequence_last = sequence_last,
             };
         }
-    }
-
-    /// What `replayLog` learned about a log.
-    const ReplayedLog = struct {
-        /// The record the log carries on from, as its file header says.
-        previous: wal.RecordId,
-        /// Where the log's valid records end.
-        end: sector_log.End,
-        /// The length of the log's file.
-        file_size: u64,
-        /// The sequence number of the last operation in the log, or the
-        /// number the log follows if it holds none.
-        sequence_last: u64,
     };
-
-    /// Reads every record of log number `log_number` and applies it to
-    /// `memtable` as a batch. The operations are numbered from
-    /// `sequence_before + 1` in the order the log holds them, which is how
-    /// they were numbered when they were first written.
-    fn replayLog(
-        self: *Store,
-        log_number: u64,
-        memtable: *MemTable,
-        sequence_before: u64,
-    ) (OpenError || error{IncompleteLog})!ReplayedLog {
-        var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-        const log_name = manifest.fileName(&name_buffer, .log, log_number);
-
-        // No log is being appended to yet, so the log buffer is free to
-        // hold the records being replayed.
-        var reader = Log.Reader.open(self.storage, log_name, self.log_buffer) catch |err| switch (err) {
-            // The header is intact and the file is not the length it gives.
-            error.WrongFileSize => return error.Corrupt,
-            else => |other| return other,
-        };
-        defer reader.close();
-        const previous = reader.end().last;
-        // A log this store wrote has room for the largest batch. One that
-        // has not could not be appended to.
-        if (reader.file_size < sector_log.fileSizeMin(log_payload_size_max)) {
-            return error.Corrupt;
-        }
-
-        var sequence_last = sequence_before;
-        while (true) {
-            const record = try reader.next();
-            if (record == null) {
-                break;
-            }
-            const batch_bytes = record.?.payload;
-
-            try write_batch.validate(batch_bytes);
-            // `commit` makes the same check before it logs a batch. A
-            // memtable fills the same way every time, whether it is new or
-            // has been reset, so this only fails for a log the store did
-            // not write.
-            if (memtableSizeMax(batch_bytes) > memtable.bytesFree()) {
-                return error.LogTooLargeForMemtable;
-            }
-            sequence_last = applyBatch(memtable, batch_bytes, sequence_last + 1);
-        }
-        return .{
-            .previous = previous,
-            .end = reader.end(),
-            .file_size = reader.file_size,
-            .sequence_last = sequence_last,
-        };
-    }
-};
-
-/// Takes the lock that marks `dir` as open in a store. The lock is held until
-/// the returned file is closed, or the process ends.
-fn lockDir(io: Io, dir: Io.Dir) Store.OpenError!Io.File {
-    // The file is not truncated: it is always empty, and another store may
-    // hold it locked.
-    const lock_file = dir.createFile(io, lock_file_name, .{
-        .truncate = false,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-    }) catch |err| switch (err) {
-        error.WouldBlock => return error.StoreAlreadyOpen,
-        else => |other| return other,
-    };
-    return lock_file;
 }
 
 /// Copies `value` to the front of `buffer` and returns the copy.
@@ -1884,6 +1887,12 @@ fn applyBatch(memtable: *MemTable, valid_bytes: []const u8, sequence_first: u64)
 }
 
 const testing = std.testing;
+
+// The tests below run a store on a real disk, in a temporary directory.
+const DiskLog = DiskStore.Log;
+const DiskTableWriter = DiskStore.TableWriter;
+const DiskManifestWriter = DiskStore.ManifestWriter;
+const DiskManifestReader = DiskStore.ManifestReader;
 const RealStorage = @import("testing/real_storage.zig").RealStorage;
 
 /// The size of each memtable in the tests that need a memtable to fill
@@ -1909,8 +1918,8 @@ comptime {
     assert(model_memtable_size <= test_memtable_size);
 }
 
-fn openStore(dir: Io.Dir) !Store {
-    return Store.openWithSizes(
+fn openStore(dir: Io.Dir) !DiskStore {
+    return DiskStore.openWithSizes(
         testing.allocator,
         testing.io,
         dir,
@@ -1920,8 +1929,8 @@ fn openStore(dir: Io.Dir) !Store {
     );
 }
 
-fn openSmallStore(dir: Io.Dir) !Store {
-    return Store.openWithSizes(
+fn openSmallStore(dir: Io.Dir) !DiskStore {
+    return DiskStore.openWithSizes(
         testing.allocator,
         testing.io,
         dir,
@@ -1936,7 +1945,7 @@ fn openSmallStore(dir: Io.Dir) !Store {
 /// not be moved.
 const TestLogs = struct {
     event_loop: AsyncIo,
-    storage: Storage,
+    storage: DiskStorage,
     buffer: []align(sector_size) u8,
 
     fn init(self: *TestLogs, dir: Io.Dir) !void {
@@ -1995,7 +2004,7 @@ fn setLogLength(dir: Io.Dir, log_number: u64, len: u64) !void {
 /// Swaps the file the store's log writes to for a read-only handle on the
 /// same file, so that the next append fails with `NotOpenForWriting`. The
 /// store closes the new handle when it is closed.
-fn makeLogReadOnly(store: *Store, dir: Io.Dir) !void {
+fn makeLogReadOnly(store: *DiskStore, dir: Io.Dir) !void {
     var name_buffer: [manifest.file_name_size_max]u8 = undefined;
     const name = logName(&name_buffer, store.log_number);
     const read_only = try dir.openFile(testing.io, name, .{ .mode = .read_only });
@@ -2012,13 +2021,13 @@ fn appendToLog(dir: Io.Dir, log_number: u64, payload: []const u8) !void {
     try logs.init(dir);
     defer logs.deinit();
 
-    var reader: Log.Reader = try .open(&logs.storage, name, logs.buffer);
+    var reader: DiskLog.Reader = try .open(&logs.storage, name, logs.buffer);
     while (try reader.next()) |_| {}
     const end = reader.end();
     const file_size = reader.file_size;
     reader.close();
 
-    var writer: Log.Writer = try .open(&logs.storage, name, file_size, logs.buffer, end);
+    var writer: DiskLog.Writer = try .open(&logs.storage, name, file_size, logs.buffer, end);
     defer writer.close();
     _ = try writer.append(payload);
 }
@@ -2032,7 +2041,7 @@ fn logEnd(dir: Io.Dir, log_number: u64) !sector_log.End {
     try logs.init(dir);
     defer logs.deinit();
 
-    var reader: Log.Reader = try .open(&logs.storage, name, logs.buffer);
+    var reader: DiskLog.Reader = try .open(&logs.storage, name, logs.buffer);
     defer reader.close();
     while (try reader.next()) |_| {}
     return reader.end();
@@ -2097,20 +2106,20 @@ fn expectNumberedFiles(dir: Io.Dir, expected: []const []const u8) !void {
     try testing.expectEqual(expected.len, count);
 }
 
-fn expectValue(store: *Store, key: []const u8, value: []const u8) !void {
+fn expectValue(store: *DiskStore, key: []const u8, value: []const u8) !void {
     var buffer: [value_size_max]u8 = undefined;
     const found = try store.get(key, &buffer);
     try testing.expect(found != null);
     try testing.expectEqualSlices(u8, value, found.?);
 }
 
-fn expectAbsent(store: *Store, key: []const u8) !void {
+fn expectAbsent(store: *DiskStore, key: []const u8) !void {
     var buffer: [value_size_max]u8 = undefined;
     const found = try store.get(key, &buffer);
     try testing.expect(found == null);
 }
 
-fn expectEntry(entry: ?Store.Entry, key: []const u8, value: []const u8) !void {
+fn expectEntry(entry: ?DiskStore.Entry, key: []const u8, value: []const u8) !void {
     try testing.expect(entry != null);
     try testing.expectEqualSlices(u8, key, entry.?.key);
     try testing.expectEqualSlices(u8, value, entry.?.value);
@@ -2129,13 +2138,13 @@ fn numberedValue(buffer: *[test_value_size]u8, number: u64) []const u8 {
     return buffer;
 }
 
-fn putNumbered(store: *Store, number: u64) !void {
+fn putNumbered(store: *DiskStore, number: u64) !void {
     var key_buffer: [8]u8 = undefined;
     var value_buffer: [test_value_size]u8 = undefined;
     try store.put(numberedKey(&key_buffer, number), numberedValue(&value_buffer, number));
 }
 
-fn expectNumbered(store: *Store, number: u64) !void {
+fn expectNumbered(store: *DiskStore, number: u64) !void {
     var key_buffer: [8]u8 = undefined;
     var value_buffer: [test_value_size]u8 = undefined;
     try expectValue(store, numberedKey(&key_buffer, number), numberedValue(&value_buffer, number));
@@ -2143,8 +2152,8 @@ fn expectNumbered(store: *Store, number: u64) !void {
 
 /// Checks that a scan of the store gives exactly the numbered entries from
 /// 0 to `count - 1`, in order.
-fn expectNumberedScan(store: *Store, count: u64) !void {
-    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+fn expectNumberedScan(store: *DiskStore, count: u64) !void {
+    var buffers: DiskStore.IteratorBuffers = try .init(testing.allocator);
     defer buffers.deinit(testing.allocator);
     var key_buffer: [8]u8 = undefined;
     var value_buffer: [test_value_size]u8 = undefined;
@@ -2166,7 +2175,7 @@ test "a new store is empty" {
 
     var store = try openStore(tmp.dir);
     defer store.close(testing.allocator);
-    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+    var buffers: DiskStore.IteratorBuffers = try .init(testing.allocator);
     defer buffers.deinit(testing.allocator);
 
     try testing.expectEqual(@as(u64, 0), store.opLatest());
@@ -2186,7 +2195,7 @@ test "the iterator gives live entries in key order" {
 
     var store = try openStore(tmp.dir);
     defer store.close(testing.allocator);
-    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+    var buffers: DiskStore.IteratorBuffers = try .init(testing.allocator);
     defer buffers.deinit(testing.allocator);
 
     try store.put("c", "3");
@@ -2383,7 +2392,7 @@ test "after a flush the sequence numbers carry on when the store is opened again
 test "a read takes the newest entry among the memtable and the tables" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+    var buffers: DiskStore.IteratorBuffers = try .init(testing.allocator);
     defer buffers.deinit(testing.allocator);
 
     {
@@ -2616,7 +2625,7 @@ fn crashDuringFlush(dir: Io.Dir, point: CrashPoint) !void {
     try putNumbered(&store, crash_entry_count);
 
     // Those writes each did a share of the flush, but not all of it.
-    try testing.expectEqual(Store.FlushStage.writing, store.flushing.?.stage);
+    try testing.expectEqual(DiskStore.FlushStage.writing, store.flushing.?.stage);
     try testing.expect(store.flushing.?.entry_next != null);
     if (point == .writing) {
         return;
@@ -2638,7 +2647,7 @@ fn crashDuringFlush(dir: Io.Dir, point: CrashPoint) !void {
 
 /// Checks that the store holds what `crashDuringFlush` wrote before closing
 /// it at `point`.
-fn expectAfterCrash(store: *Store, point: CrashPoint) !void {
+fn expectAfterCrash(store: *DiskStore, point: CrashPoint) !void {
     var key_buffer: [8]u8 = undefined;
 
     var number: u64 = 2;
@@ -2873,7 +2882,7 @@ fn replaceTable(dir: Io.Dir, key_a: []const u8, value_a: []const u8, key_b: []co
     var real: RealStorage = undefined;
     try real.init(dir);
     defer real.deinit();
-    var writer: TableWriter = try .create(&real.storage, "000003.sst", .{}, .{
+    var writer: DiskTableWriter = try .create(&real.storage, "000003.sst", .{}, .{
         .block = block_buffer,
         .index = index_buffer,
     });
@@ -2977,7 +2986,7 @@ test "a first log left too short by a crash while the store was created is repla
 
     // Without leave to create a store, there is none to open.
     const options: Options = .{ .create_if_missing = false };
-    const result = Store.open(testing.allocator, testing.io, tmp.dir, options);
+    const result = DiskStore.open(testing.allocator, testing.io, tmp.dir, options);
     try testing.expectError(error.StoreNotFound, result);
     // The refused open left the short log as it was.
     try testing.expectEqual(@as(u64, "short".len), try logLength(tmp.dir, log_number_first));
@@ -3013,12 +3022,12 @@ test "a store whose creation a crash cut off before the first edit is created ag
         var real: RealStorage = undefined;
         try real.init(tmp.dir);
         defer real.deinit();
-        var manifest_writer: ManifestWriter = try .create(&real.storage);
+        var manifest_writer: DiskManifestWriter = try .create(&real.storage);
         manifest_writer.close();
     }
 
     const options: Options = .{ .create_if_missing = false };
-    const result = Store.open(testing.allocator, testing.io, tmp.dir, options);
+    const result = DiskStore.open(testing.allocator, testing.io, tmp.dir, options);
     try testing.expectError(error.StoreNotFound, result);
 
     {
@@ -3080,12 +3089,12 @@ test "a manifest edit that does not fit the edits before it is reported" {
         var real: RealStorage = undefined;
         try real.init(tmp.dir);
         defer real.deinit();
-        var reader: ManifestReader = try .open(&real.storage, &read_buffer);
+        var reader: DiskManifestReader = try .open(&real.storage, &read_buffer);
         while (try reader.next()) |_| {}
         const end = reader.end();
         reader.close();
 
-        var writer: ManifestWriter = try .open(&real.storage, end);
+        var writer: DiskManifestWriter = try .open(&real.storage, end);
         defer writer.close();
         try writer.append(edit_bytes);
     }
@@ -3118,7 +3127,7 @@ test "a manifest whose flushed op is too large to count on from is reported" {
         var logs: TestLogs = undefined;
         try logs.init(tmp.dir);
         defer logs.deinit();
-        var log: Log.Writer = try .create(&logs.storage, "000001.log", test_log_file_size, logs.buffer, previous);
+        var log: DiskLog.Writer = try .create(&logs.storage, "000001.log", test_log_file_size, logs.buffer, previous);
         defer log.close();
 
         var batch: WriteBatch = try .init(testing.allocator);
@@ -3139,7 +3148,7 @@ test "a manifest whose flushed op is too large to count on from is reported" {
         var real: RealStorage = undefined;
         try real.init(tmp.dir);
         defer real.deinit();
-        var writer: ManifestWriter = try .create(&real.storage);
+        var writer: DiskManifestWriter = try .create(&real.storage);
         defer writer.close();
         try writer.append(edit_bytes);
     }
@@ -3181,7 +3190,7 @@ test "a log that holds more than a memtable is reported" {
 /// Writes numbered entries to a new small store in `dir` until the next
 /// one, with a value of `test_value_size` bytes, would not fit in the
 /// active memtable. Returns how many were written.
-fn fillFirstMemtable(store: *Store) !u64 {
+fn fillFirstMemtable(store: *DiskStore) !u64 {
     var count: u64 = 0;
     while (MemTable.entrySizeMax(8, test_value_size) <= store.activeMemtable().bytesFree()) {
         try putNumbered(store, count);
@@ -3382,7 +3391,7 @@ test "a flush that fails partway breaks the store, keeps it readable, and is red
         store.flushing.?.writer.file.handle = read_only;
 
         try testing.expectError(error.NotOpenForWriting, store.flush());
-        try testing.expectEqual(Store.FlushStage.failed, store.flushing.?.stage);
+        try testing.expectEqual(DiskStore.FlushStage.failed, store.flushing.?.stage);
 
         // Every later write is refused.
         try testing.expectError(error.StoreBroken, putNumbered(&store, count));
@@ -3463,7 +3472,7 @@ fn fillBatchNearlyAMemtable(batch: *WriteBatch, number_first: u64) !u64 {
 /// active memtable has no room for another numbered put. `count` numbered
 /// entries have been written when this is called, and the new count is
 /// returned.
-fn fillWithFlushStillGoing(store: *Store, count_before: u64) !u64 {
+fn fillWithFlushStillGoing(store: *DiskStore, count_before: u64) !u64 {
     var batch: WriteBatch = try .init(testing.allocator);
     defer batch.deinit(testing.allocator);
 
@@ -3490,7 +3499,7 @@ fn fillWithFlushStillGoing(store: *Store, count_before: u64) !u64 {
         count += 1;
     }
     try testing.expect(store.flushing != null);
-    try testing.expectEqual(Store.FlushStage.writing, store.flushing.?.stage);
+    try testing.expectEqual(DiskStore.FlushStage.writing, store.flushing.?.stage);
     return count;
 }
 
@@ -3551,7 +3560,7 @@ test "a scan crosses blocks that hold one entry each" {
 
     var store = try openStore(tmp.dir);
     defer store.close(testing.allocator);
-    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+    var buffers: DiskStore.IteratorBuffers = try .init(testing.allocator);
     defer buffers.deinit(testing.allocator);
 
     // Two of these do not fit in one block, so every block holds one entry,
@@ -3580,7 +3589,7 @@ test "seekToFirst right after an entry gives that entry again" {
 
     var store = try openStore(tmp.dir);
     defer store.close(testing.allocator);
-    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+    var buffers: DiskStore.IteratorBuffers = try .init(testing.allocator);
     defer buffers.deinit(testing.allocator);
     try store.put("a", "1");
     try store.put("b", "2");
@@ -3624,7 +3633,7 @@ test "a flush does not record a table that is not the one it wrote" {
     try replaceTable(tmp.dir, "a", "1", "b", "X");
 
     try testing.expectError(error.Corrupt, store.flushRecordTable());
-    try testing.expectEqual(Store.FlushStage.table_written, store.flushing.?.stage);
+    try testing.expectEqual(DiskStore.FlushStage.table_written, store.flushing.?.stage);
     try testing.expectEqual(@as(usize, 0), store.tables.count());
     try testing.expect(try fileExists(tmp.dir, "000001.log"));
 }
@@ -3676,7 +3685,7 @@ fn createLogAfter(dir: Io.Dir, name: []const u8, previous: wal.RecordId) !void {
     var logs: TestLogs = undefined;
     try logs.init(dir);
     defer logs.deinit();
-    var log: Log.Writer = try .create(&logs.storage, name, test_log_file_size, logs.buffer, previous);
+    var log: DiskLog.Writer = try .create(&logs.storage, name, test_log_file_size, logs.buffer, previous);
     log.close();
 }
 
@@ -3806,7 +3815,7 @@ fn makeStoreByHand(dir: Io.Dir, edit: manifest.Edit, manifest_previous: wal.Reco
     var real: RealStorage = undefined;
     try real.init(dir);
     defer real.deinit();
-    var log: wal.WriterType(Storage) = try .create(
+    var log: wal.WriterType(DiskStorage) = try .create(
         &real.storage,
         manifest.file_name,
         manifest.edit_size_max,
@@ -3880,12 +3889,12 @@ test "a table with a block longer than the store's buffers is reported" {
 
     var key_buffer: [8]u8 = undefined;
     var value_buffer: [test_value_size]u8 = undefined;
-    var summary: TableWriter.Summary = undefined;
+    var summary: DiskTableWriter.Summary = undefined;
     {
         var real: RealStorage = undefined;
         try real.init(tmp.dir);
         defer real.deinit();
-        var writer: TableWriter = try .create(
+        var writer: DiskTableWriter = try .create(
             &real.storage,
             "000002.sst",
             .{ .block_size = block_size_large },
@@ -3933,8 +3942,8 @@ const model_key_count = 48;
 /// fewer times than there are table slots.
 const model_memtable_size = 32 * 1024;
 
-fn openModelStore(dir: Io.Dir) !Store {
-    return Store.openWithSizes(
+fn openModelStore(dir: Io.Dir) !DiskStore {
+    return DiskStore.openWithSizes(
         testing.allocator,
         testing.io,
         dir,
@@ -3948,8 +3957,8 @@ fn openModelStore(dir: Io.Dir) !Store {
 /// `i` of the model is the value of key number `i`, or `null` if that key is
 /// not present.
 fn expectModel(
-    store: *Store,
-    buffers: *const Store.IteratorBuffers,
+    store: *DiskStore,
+    buffers: *const DiskStore.IteratorBuffers,
     model: *const [model_key_count]?[]const u8,
 ) !void {
     var key_buffer: [3]u8 = undefined;
@@ -4002,7 +4011,7 @@ test "random writes, flushes and reopens match a model" {
 
     var batch: WriteBatch = try .init(testing.allocator);
     defer batch.deinit(testing.allocator);
-    var buffers: Store.IteratorBuffers = try .init(testing.allocator);
+    var buffers: DiskStore.IteratorBuffers = try .init(testing.allocator);
     defer buffers.deinit(testing.allocator);
 
     var store = try openModelStore(tmp.dir);
@@ -4060,13 +4069,13 @@ test "open fails when there is no store and it may not create one" {
     defer tmp.cleanup();
 
     const options: Options = .{ .create_if_missing = false };
-    const result = Store.open(testing.allocator, testing.io, tmp.dir, options);
+    const result = DiskStore.open(testing.allocator, testing.io, tmp.dir, options);
     try testing.expectError(error.StoreNotFound, result);
 
     // Once the store exists, the same options open it.
     var created = try openStore(tmp.dir);
     created.close(testing.allocator);
-    var store: Store = try .open(testing.allocator, testing.io, tmp.dir, options);
+    var store: DiskStore = try .open(testing.allocator, testing.io, tmp.dir, options);
     store.close(testing.allocator);
 }
 
@@ -4473,7 +4482,7 @@ test "a full log freezes the memtable, as a full memtable does" {
 
     var key_buffer: [16]u8 = undefined;
     {
-        var store = try Store.openWithSizes(
+        var store = try DiskStore.openWithSizes(
             testing.allocator,
             testing.io,
             tmp.dir,
@@ -4496,7 +4505,7 @@ test "a full log freezes the memtable, as a full memtable does" {
         try testing.expectEqual(writes, store.opLatest());
     }
 
-    var store = try Store.openWithSizes(
+    var store = try DiskStore.openWithSizes(
         testing.allocator,
         testing.io,
         tmp.dir,
@@ -4663,4 +4672,179 @@ test "after a failed write every later write is refused until the store is opene
     try expectValue(&store, "a", "1");
     try store.put("b", "2");
     try testing.expectEqual(@as(u64, 2), store.opLatest());
+}
+
+// From here on the tests run a store on the simulated storage, which can
+// crash.
+
+const simulated_storage = @import("testing/storage.zig");
+const Simulated = simulated_storage.Storage;
+const SimulatedStore = StoreType(Simulated);
+
+/// The length of each log file in the crash tests: room for the largest
+/// batch and a few dozen sectors more. The simulated storage keeps every
+/// file in memory, twice, so the log is kept as short as a log can be.
+const crash_log_file_size = sector_log.fileSizeMin(log_payload_size_max) + 48 * sector_size;
+
+fn openSimulatedStore(storage: *Simulated) !SimulatedStore {
+    return SimulatedStore.openOnStorageWithSizes(
+        testing.allocator,
+        storage,
+        .{},
+        test_memtable_size,
+        crash_log_file_size,
+    );
+}
+
+fn putNumberedSimulated(store: *SimulatedStore, number: u64) !void {
+    var key_buffer: [8]u8 = undefined;
+    var value_buffer: [test_value_size]u8 = undefined;
+    try store.put(numberedKey(&key_buffer, number), numberedValue(&value_buffer, number));
+}
+
+/// Whether the store holds the numbered entry. Fails if the store holds
+/// the key with any other value.
+fn hasNumberedSimulated(store: *SimulatedStore, number: u64) !bool {
+    var key_buffer: [8]u8 = undefined;
+    var value_buffer: [test_value_size]u8 = undefined;
+    var get_buffer: [test_value_size]u8 = undefined;
+    const found = try store.get(numberedKey(&key_buffer, number), &get_buffer);
+    if (found == null) {
+        return false;
+    }
+    try testing.expectEqualSlices(u8, numberedValue(&value_buffer, number), found.?);
+    return true;
+}
+
+/// How many writes the crash tests make when nothing stops them: enough
+/// for the log to fill and the memtable to be frozen and flushed more than
+/// once.
+const crash_test_writes = 130;
+
+/// Checks a store that was reopened after a crash. Writes `0` to
+/// `acknowledged - 1` had returned before the crash and must all be there.
+/// The write after them was in flight and may be there or not. Nothing
+/// later may be there. Returns how many writes the store holds.
+fn expectAfterSimulatedCrash(store: *SimulatedStore, acknowledged: u64) !u64 {
+    var number: u64 = 0;
+    while (number < acknowledged) : (number += 1) {
+        try testing.expect(try hasNumberedSimulated(store, number));
+    }
+    var present = acknowledged;
+    if (try hasNumberedSimulated(store, acknowledged)) {
+        present += 1;
+    }
+    number = acknowledged + 1;
+    while (number < crash_test_writes) : (number += 1) {
+        try testing.expect(!try hasNumberedSimulated(store, number));
+    }
+    try testing.expectEqual(present, store.opLatest());
+    return present;
+}
+
+test "simulated: a store is created, written, closed and opened" {
+    var storage: Simulated = .init(testing.allocator, .{ .seed = 5 });
+    defer storage.deinit();
+
+    {
+        var store = try openSimulatedStore(&storage);
+        defer store.close(testing.allocator);
+        var number: u64 = 0;
+        while (number < crash_test_writes) : (number += 1) {
+            try putNumberedSimulated(&store, number);
+        }
+        // The workload is long enough to freeze the memtable twice. A
+        // freeze takes two file numbers, one for the new log and one for
+        // the table.
+        try testing.expect(store.log_number >= log_number_first + 3);
+    }
+
+    var store = try openSimulatedStore(&storage);
+    defer store.close(testing.allocator);
+    try testing.expectEqual(@as(u64, crash_test_writes), store.opLatest());
+    var number: u64 = 0;
+    while (number < crash_test_writes) : (number += 1) {
+        try testing.expect(try hasNumberedSimulated(&store, number));
+    }
+}
+
+test "simulated: no acknowledged write is lost, whenever the crash comes" {
+    // How many storage operations the whole workload takes, so that crash
+    // points can be spread over all of it: the creation of the store, the
+    // appends, the freezes and the flushes.
+    var operations_total: u64 = 0;
+    {
+        var storage: Simulated = .init(testing.allocator, .{ .seed = 0 });
+        defer storage.deinit();
+        var store = try openSimulatedStore(&storage);
+        defer store.close(testing.allocator);
+        var number: u64 = 0;
+        while (number < crash_test_writes) : (number += 1) {
+            try putNumberedSimulated(&store, number);
+        }
+        operations_total = storage.operations_started;
+    }
+
+    const kinds = [_]simulated_storage.CrashKind{ .power_loss, .process_kill };
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const random = prng.random();
+
+    var trial: u64 = 0;
+    while (trial < 120) : (trial += 1) {
+        const kind = kinds[trial % kinds.len];
+        const crash_after = 1 + random.uintLessThan(u64, operations_total);
+
+        var storage: Simulated = .init(testing.allocator, .{ .seed = trial });
+        defer storage.deinit();
+        storage.crashAfterOperations(crash_after, kind);
+
+        // Write until the crash stops the store. The crash can come while
+        // the store is still being created, in which case nothing was
+        // written.
+        var acknowledged: u64 = 0;
+        var opened = openSimulatedStore(&storage);
+        if (opened) |*store| {
+            while (acknowledged < crash_test_writes) {
+                putNumberedSimulated(store, acknowledged) catch break;
+                acknowledged += 1;
+            }
+            store.close(testing.allocator);
+        } else |_| {}
+        if (!storage.crashed) {
+            // The crash was planned for later than the workload ran.
+            continue;
+        }
+        storage.restart();
+
+        // The store opens, and holds every write that had returned.
+        var present: u64 = 0;
+        {
+            var store = try openSimulatedStore(&storage);
+            defer store.close(testing.allocator);
+            present = try expectAfterSimulatedCrash(&store, acknowledged);
+        }
+
+        // Opening the store was the moment it took what it found as its
+        // contents. A power loss straight afterwards must change nothing.
+        storage.crash(.power_loss);
+        storage.restart();
+        {
+            var store = try openSimulatedStore(&storage);
+            defer store.close(testing.allocator);
+            try testing.expectEqual(present, try expectAfterSimulatedCrash(&store, acknowledged));
+
+            // And the store carries on.
+            var number = present;
+            while (number < present + 5) : (number += 1) {
+                try putNumberedSimulated(&store, number);
+            }
+            try store.flush();
+        }
+        var store = try openSimulatedStore(&storage);
+        defer store.close(testing.allocator);
+        var number: u64 = 0;
+        while (number < present + 5) : (number += 1) {
+            try testing.expect(try hasNumberedSimulated(&store, number));
+        }
+    }
 }

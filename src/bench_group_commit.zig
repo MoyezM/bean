@@ -55,7 +55,7 @@ const WriteBatch = write_batch.WriteBatch;
 pub const GroupCommitter = struct {
     io: Io,
     /// Only the thread that is leading a group writes to the store.
-    store: *kv.Store,
+    store: *kv.DiskStore,
     /// Held alone by a thread that is reading from the store, and by the
     /// leader while it writes a group to the store. Never held shared.
     readers: Io.RwLock,
@@ -76,7 +76,7 @@ pub const GroupCommitter = struct {
     leader_active: bool,
     /// The error of the first group that failed, if one has. Every group
     /// from `failed_from_group` on fails with it.
-    failure: ?kv.Store.WriteError,
+    failure: ?kv.DiskStore.WriteError,
     failed_from_group: u64,
     /// How many groups have been written without an error.
     groups_written: u64,
@@ -93,13 +93,13 @@ pub const GroupCommitter = struct {
         KeyTooLarge,
         /// The value is longer than `write_batch.value_size_max`.
         ValueTooLarge,
-    } || kv.Store.WriteError;
+    } || kv.DiskStore.WriteError;
 
-    pub const GetError = kv.Store.GetError;
+    pub const GetError = kv.DiskStore.GetError;
 
     /// Allocates the two batches. `gpa` is not retained. The committer must
     /// not be moved once a thread is using it, and `store` must outlive it.
-    pub fn init(gpa: Allocator, io: Io, store: *kv.Store) Allocator.Error!GroupCommitter {
+    pub fn init(gpa: Allocator, io: Io, store: *kv.DiskStore) Allocator.Error!GroupCommitter {
         var filling: WriteBatch = try .init(gpa);
         errdefer filling.deinit(gpa);
         const writing: WriteBatch = try .init(gpa);
@@ -268,7 +268,7 @@ pub const GroupCommitter = struct {
 
     /// Writes the group in `writing` to the store, with readers kept out.
     /// Only the leader calls this, with the mutex released.
-    fn writeToStore(self: *GroupCommitter) kv.Store.WriteError!void {
+    fn writeToStore(self: *GroupCommitter) kv.DiskStore.WriteError!void {
         // As many reads as were waiting when the group before this one was
         // done go first. Each thread that was counted is in `get` and will
         // finish, so this loop ends.
@@ -298,7 +298,7 @@ test "one thread writes through the committer" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: kv.Store = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
     defer committer.deinit(testing.allocator);
@@ -319,7 +319,7 @@ test "a key over the limit is rejected and the committer stays usable" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: kv.Store = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
     defer committer.deinit(testing.allocator);
@@ -356,7 +356,7 @@ test "many threads share syncs and every write is there" {
     const write_count = test_thread_count * test_puts_per_thread;
     var groups_written: u64 = 0;
     {
-        var store: kv.Store = try .open(testing.allocator, testing.io, tmp.dir, .{});
+        var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
         defer store.close(testing.allocator);
         var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
         defer committer.deinit(testing.allocator);
@@ -380,7 +380,7 @@ test "many threads share syncs and every write is there" {
     }
 
     // Every write is durable: it is there after the store is opened again.
-    var store: kv.Store = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     try testing.expectEqual(groups_written, store.opLatest());
 
@@ -429,7 +429,7 @@ test "threads read whole values while other threads write" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: kv.Store = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
     defer committer.deinit(testing.allocator);
@@ -469,7 +469,7 @@ test "get reports a buffer that is too small for the value" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: kv.Store = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
     defer committer.deinit(testing.allocator);
