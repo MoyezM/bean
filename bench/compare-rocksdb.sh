@@ -63,11 +63,16 @@
 #   WRITE_LOAD     keys loaded before the writes are measured  (500000)
 #   READ_LOAD      keys loaded before the reads are measured   (1000000)
 #   ROCKS_CACHE    bytes in RocksDB's block cache              (536870912)
-#   ROCKS_LOG      how RocksDB writes its log  ("--use_fsync=0 --recycle_log_file_num=4")
-#                  The default is its best for a durable write: old log
-#                  files are used again, so that an append overwrites space
-#                  that already holds data, and the sync is a data sync.
-#                  "--use_fsync=1" is a full sync on a log that grows.
+#   ROCKS_LOG      how RocksDB syncs its log                    ("--use_fsync=0")
+#                  The default is a data sync. "--use_fsync=1" is a full
+#                  sync.
+#
+# RocksDB can also be told to use its old log files again, so that an
+# append overwrites space that already holds data, which is the cheapest
+# durable write there is and what bean's log always does. That is not
+# measured here. db_bench has no flag for it, and it would not show anyway:
+# every step is a process of its own, and RocksDB starts each process on a
+# new log. bench/rocksdb-recycled-log.sh measures it separately.
 
 set -euo pipefail
 
@@ -86,7 +91,7 @@ READ_THREADS=${READ_THREADS:-"1 16"}
 WRITE_LOAD=${WRITE_LOAD:-500000}
 READ_LOAD=${READ_LOAD:-1000000}
 ROCKS_CACHE=${ROCKS_CACHE:-536870912}
-ROCKS_LOG=${ROCKS_LOG:-"--use_fsync=0 --recycle_log_file_num=4"}
+ROCKS_LOG=${ROCKS_LOG:-"--use_fsync=0"}
 
 KEY_SIZE=16
 VALUE_SIZE=100
