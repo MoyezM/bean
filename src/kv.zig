@@ -80,6 +80,10 @@ const wal = @import("wal.zig");
 /// The store's write-ahead logs, on the real disk.
 const Log = sector_log.LogType(Storage);
 
+/// The writer and the reader of the store's manifest.
+const ManifestWriter = manifest.WriterType(Storage);
+const ManifestReader = manifest.ReaderType(Storage);
+
 /// The writer and the reader of the store's table files.
 const TableWriter = sstable.WriterType(Storage);
 const TableReader = sstable.ReaderType(Storage);
@@ -210,7 +214,7 @@ pub const Store = struct {
 
     /// The tables the store has, as the manifest records them.
     tables: manifest.TableSet,
-    manifest_writer: manifest.Writer,
+    manifest_writer: ManifestWriter,
     /// One open table file for each table in `tables`.
     slots: [tables_max]TableSlot,
     /// The flush in progress, if there is one.
@@ -1424,7 +1428,7 @@ pub const Store = struct {
             try self.dir.deleteFile(self.io, log_name);
         }
 
-        self.manifest_writer = try manifest.Writer.open(self.io, self.dir, manifest_end.?);
+        self.manifest_writer = try ManifestWriter.open(self.storage, manifest_end.?);
         errdefer self.manifest_writer.close();
 
         self.active_index = 0;
@@ -1462,7 +1466,7 @@ pub const Store = struct {
     /// is no manifest, or a crash while the store was being created left
     /// one with no edits in it.
     fn readManifest(self: *Store) OpenError!?wal.End {
-        var reader = manifest.Reader.open(self.io, self.dir, self.edit_buffer) catch |err| switch (err) {
+        var reader = ManifestReader.open(self.storage, self.edit_buffer) catch |err| switch (err) {
             error.FileNotFound => return null,
             error.IncompleteLog => return null,
             else => |other| return other,
@@ -1511,7 +1515,7 @@ pub const Store = struct {
         self.log = try Log.Writer.create(self.storage, log_name, self.log_file_size, self.log_buffer, .none);
         errdefer self.log.close();
 
-        self.manifest_writer = try manifest.Writer.create(self.io, self.dir);
+        self.manifest_writer = try ManifestWriter.create(self.storage);
         errdefer self.manifest_writer.close();
 
         const edit_bytes = manifest.encode(.{
@@ -3006,7 +3010,10 @@ test "a store whose creation a crash cut off before the first edit is created ag
     // The first log and the manifest exist, but the manifest has no edit.
     {
         try createLogAfter(tmp.dir, "000001.log", .none);
-        var manifest_writer: manifest.Writer = try .create(testing.io, tmp.dir);
+        var real: RealStorage = undefined;
+        try real.init(tmp.dir);
+        defer real.deinit();
+        var manifest_writer: ManifestWriter = try .create(&real.storage);
         manifest_writer.close();
     }
 
@@ -3070,12 +3077,15 @@ test "a manifest edit that does not fit the edits before it is reported" {
         }, &edit_buffer);
 
         var read_buffer: [manifest.edit_size_max]u8 = undefined;
-        var reader: manifest.Reader = try .open(testing.io, tmp.dir, &read_buffer);
+        var real: RealStorage = undefined;
+        try real.init(tmp.dir);
+        defer real.deinit();
+        var reader: ManifestReader = try .open(&real.storage, &read_buffer);
         while (try reader.next()) |_| {}
         const end = reader.end();
         reader.close();
 
-        var writer: manifest.Writer = try .open(testing.io, tmp.dir, end);
+        var writer: ManifestWriter = try .open(&real.storage, end);
         defer writer.close();
         try writer.append(edit_bytes);
     }
@@ -3105,7 +3115,10 @@ test "a manifest whose flushed op is too large to count on from is reported" {
     const op_before_largest = std.math.maxInt(u64) - 1;
     {
         const previous: wal.RecordId = .{ .op = op_before_largest, .checksum = 0 };
-        var log: wal.Writer = try .create(testing.io, tmp.dir, "000001.log", log_payload_size_max, previous);
+        var logs: TestLogs = undefined;
+        try logs.init(tmp.dir);
+        defer logs.deinit();
+        var log: Log.Writer = try .create(&logs.storage, "000001.log", test_log_file_size, logs.buffer, previous);
         defer log.close();
 
         var batch: WriteBatch = try .init(testing.allocator);
@@ -3123,7 +3136,10 @@ test "a manifest whose flushed op is too large to count on from is reported" {
             .op_flushed = op_before_largest,
             .sequence_flushed = 0,
         }, &edit_buffer);
-        var writer: manifest.Writer = try .create(testing.io, tmp.dir);
+        var real: RealStorage = undefined;
+        try real.init(tmp.dir);
+        defer real.deinit();
+        var writer: ManifestWriter = try .create(&real.storage);
         defer writer.close();
         try writer.append(edit_bytes);
     }
@@ -3787,9 +3803,11 @@ fn makeStoreByHand(dir: Io.Dir, edit: manifest.Edit, manifest_previous: wal.Reco
     defer testing.allocator.free(edit_buffer);
     const edit_bytes = manifest.encode(edit, edit_buffer);
 
-    var log: wal.Writer = try .create(
-        testing.io,
-        dir,
+    var real: RealStorage = undefined;
+    try real.init(dir);
+    defer real.deinit();
+    var log: wal.WriterType(Storage) = try .create(
+        &real.storage,
         manifest.file_name,
         manifest.edit_size_max,
         manifest_previous,

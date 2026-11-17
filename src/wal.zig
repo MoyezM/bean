@@ -69,7 +69,7 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Io = std.Io;
 const crc32c = @import("checksum.zig").crc32c;
-const durable = @import("durable.zig");
+const BlockingType = @import("storage_blocking.zig").BlockingType;
 
 // The sizes of the two headers come from the structs that describe them,
 // further down.
@@ -202,361 +202,377 @@ fn isPlainFileName(name: []const u8) bool {
 }
 
 /// Appends records to a log file. A record is durable once `append` returns.
-pub const Writer = struct {
-    io: Io,
-    file: Io.File,
-    payload_size_max: u32,
-    /// Where in the file the next record will be written.
-    offset: u64,
-    /// The last record in the log. The next record chains from it.
-    last: RecordId,
-    /// Set when a write or sync has failed and the file's state is unknown.
-    broken: bool,
+pub fn WriterType(comptime Storage: type) type {
+    return struct {
+        const Writer = @This();
+        const Blocking = BlockingType(Storage);
 
-    pub const CreateError = Io.File.OpenError || Io.File.WritePositionalError ||
-        Io.File.SyncError || Io.Dir.OpenError;
-
-    pub const OpenError = Io.File.OpenError || Io.File.SetLengthError || Io.File.SyncError;
-
-    pub const AppendError = error{
-        /// The payload is longer than the `payload_size_max` given at creation.
-        PayloadTooLarge,
-    } || Io.File.WritePositionalError || Io.File.SyncError;
-
-    /// Creates a new, empty log named `name` in `dir`, and syncs it. Fails if
-    /// the file already exists. `name` is a file name, not a path.
-    ///
-    /// If this fails, the file is removed again. If the process dies partway
-    /// through, a file shorter than a file header, or a file header of all
-    /// zeros with nothing after it, can be left behind. `Reader.open` reports
-    /// both as `IncompleteLog`.
-    ///
-    /// `previous` is the record this log continues from: the last record of
-    /// the log file before it, or `RecordId.none` for a brand-new log.
-    pub fn create(
-        io: Io,
-        dir: Io.Dir,
-        name: []const u8,
+        storage: *Storage,
+        file: Storage.File,
         payload_size_max: u32,
-        previous: RecordId,
-    ) CreateError!Writer {
-        assert(isPlainFileName(name));
-        assert(previous.op < std.math.maxInt(u64));
+        /// Where in the file the next record will be written.
+        offset: u64,
+        /// The last record in the log. The next record chains from it.
+        last: RecordId,
+        /// Set when a write or sync has failed and the file's state is unknown.
+        broken: bool,
 
-        const file = try dir.createFile(io, name, .{ .exclusive = true });
-        // The exclusive create succeeded, so this call made the file and may
-        // remove it. Without this, a failed create would block the next one.
-        errdefer dir.deleteFile(io, name) catch {};
-        errdefer file.close(io);
+        pub const CreateError = Storage.CreateError || Storage.WriteError ||
+            Storage.SyncError || Storage.SyncDirError;
 
-        const header: FileHeader = .init(previous);
-        try file.writePositionalAll(io, header.toBytes(), 0);
-        try durable.sync(io, file);
-        try durable.syncDir(io, dir);
+        pub const OpenError = Storage.OpenError || Storage.TruncateError || Storage.SyncError;
 
-        return .{
-            .io = io,
-            .file = file,
-            .payload_size_max = payload_size_max,
-            .offset = file_header_size,
-            .last = previous,
-            .broken = false,
-        };
-    }
+        pub const AppendError = error{
+            /// The payload is longer than the `payload_size_max` given at creation.
+            PayloadTooLarge,
+        } || Storage.WriteError || Storage.SyncError;
 
-    /// Opens an existing log to append after its valid records, and discards
-    /// anything beyond them. `end` must come from `Reader.end` after that
-    /// reader reached the end of the same file. `name` is a file name, not a
-    /// path.
-    pub fn open(
-        io: Io,
-        dir: Io.Dir,
-        name: []const u8,
-        payload_size_max: u32,
-        end: End,
-    ) OpenError!Writer {
-        assert(isPlainFileName(name));
-        assert(end.valid_len >= file_header_size);
-        assert(end.last.op < std.math.maxInt(u64));
+        /// Creates a new, empty log named `name` in `dir`, and syncs it. Fails if
+        /// the file already exists. `name` is a file name, not a path.
+        ///
+        /// If this fails, the file is removed again. If the process dies partway
+        /// through, a file shorter than a file header, or a file header of all
+        /// zeros with nothing after it, can be left behind. `Reader.open` reports
+        /// both as `IncompleteLog`.
+        ///
+        /// `previous` is the record this log continues from: the last record of
+        /// the log file before it, or `RecordId.none` for a brand-new log.
+        pub fn create(
+            storage: *Storage,
+            name: []const u8,
+            payload_size_max: u32,
+            previous: RecordId,
+        ) CreateError!Writer {
+            assert(isPlainFileName(name));
+            assert(previous.op < std.math.maxInt(u64));
 
-        const file = try dir.openFile(io, name, .{ .mode = .write_only });
-        errdefer file.close(io);
+            const file = try storage.createFile(name, .{ .direct = false });
+            // The exclusive create succeeded, so this call made the file and may
+            // remove it. Without this, a failed create would block the next one.
+            errdefer storage.deleteFile(name) catch {};
+            errdefer storage.closeFile(file);
 
-        // Remove a damaged final record, if there is one, so that it can
-        // never be mistaken for part of the log later.
-        try file.setLength(io, end.valid_len);
-        try durable.sync(io, file);
+            const header: FileHeader = .init(previous);
+            try Blocking.writeAll(storage, file, header.toBytes(), 0, .unsynced);
+            try Blocking.syncFile(storage, file);
+            try storage.syncDir();
 
-        return .{
-            .io = io,
-            .file = file,
-            .payload_size_max = payload_size_max,
-            .offset = end.valid_len,
-            .last = end.last,
-            .broken = false,
-        };
-    }
-
-    pub fn close(self: *Writer) void {
-        self.file.close(self.io);
-        self.* = undefined;
-    }
-
-    /// Appends one record, gives it the next op, and syncs the file. Returns
-    /// the new record's op and checksum. When this returns without an error,
-    /// the record survives a crash.
-    ///
-    /// After any error other than `PayloadTooLarge` the state of the file is
-    /// unknown, and the writer must not be used again.
-    pub fn append(self: *Writer, payload: []const u8) AppendError!RecordId {
-        assert(!self.broken);
-        assert(self.last.op < std.math.maxInt(u64));
-        if (payload.len > self.payload_size_max) {
-            return error.PayloadTooLarge;
+            return .{
+                .storage = storage,
+                .file = file,
+                .payload_size_max = payload_size_max,
+                .offset = file_header_size,
+                .last = previous,
+                .broken = false,
+            };
         }
 
-        var header: RecordHeader = .{
-            .header_checksum = 0,
-            .previous_checksum = self.last.checksum,
-            .op = self.last.op + 1,
-            .payload_len = @intCast(payload.len),
-            .payload_checksum = crc32c(payload),
-        };
-        header.header_checksum = header.expectedHeaderChecksum();
+        /// Opens an existing log to append after its valid records, and discards
+        /// anything beyond them. `end` must come from `Reader.end` after that
+        /// reader reached the end of the same file. `name` is a file name, not a
+        /// path.
+        pub fn open(
+            storage: *Storage,
+            name: []const u8,
+            payload_size_max: u32,
+            end: End,
+        ) OpenError!Writer {
+            assert(isPlainFileName(name));
+            assert(end.valid_len >= file_header_size);
+            assert(end.last.op < std.math.maxInt(u64));
 
-        // From here on, a failure leaves the file in an unknown state.
-        errdefer self.broken = true;
+            const file = try storage.openFile(name, .read_write, .{ .direct = false });
+            errdefer storage.closeFile(file);
 
-        const payload_offset = self.offset + record_header_size;
-        try self.file.writePositionalAll(self.io, header.toBytes(), self.offset);
-        try self.file.writePositionalAll(self.io, payload, payload_offset);
+            // Remove a damaged final record, if there is one, so that it can
+            // never be mistaken for part of the log later.
+            try storage.truncate(file, end.valid_len);
+            try Blocking.syncFile(storage, file);
 
-        try durable.sync(self.io, self.file);
+            return .{
+                .storage = storage,
+                .file = file,
+                .payload_size_max = payload_size_max,
+                .offset = end.valid_len,
+                .last = end.last,
+                .broken = false,
+            };
+        }
 
-        self.offset = payload_offset + payload.len;
-        self.last = .{ .op = header.op, .checksum = header.header_checksum };
-        return self.last;
-    }
-};
+        pub fn close(self: *Writer) void {
+            self.storage.closeFile(self.file);
+            self.* = undefined;
+        }
+
+        /// Appends one record, gives it the next op, and syncs the file. Returns
+        /// the new record's op and checksum. When this returns without an error,
+        /// the record survives a crash.
+        ///
+        /// After any error other than `PayloadTooLarge` the state of the file is
+        /// unknown, and the writer must not be used again.
+        pub fn append(self: *Writer, payload: []const u8) AppendError!RecordId {
+            assert(!self.broken);
+            assert(self.last.op < std.math.maxInt(u64));
+            if (payload.len > self.payload_size_max) {
+                return error.PayloadTooLarge;
+            }
+
+            var header: RecordHeader = .{
+                .header_checksum = 0,
+                .previous_checksum = self.last.checksum,
+                .op = self.last.op + 1,
+                .payload_len = @intCast(payload.len),
+                .payload_checksum = crc32c(payload),
+            };
+            header.header_checksum = header.expectedHeaderChecksum();
+
+            // From here on, a failure leaves the file in an unknown state.
+            errdefer self.broken = true;
+
+            const payload_offset = self.offset + record_header_size;
+            try Blocking.writeAll(self.storage, self.file, header.toBytes(), self.offset, .unsynced);
+            if (payload.len > 0) {
+                try Blocking.writeAll(self.storage, self.file, payload, payload_offset, .unsynced);
+            }
+
+            try Blocking.syncFile(self.storage, self.file);
+
+            self.offset = payload_offset + payload.len;
+            self.last = .{ .op = header.op, .checksum = header.header_checksum };
+            return self.last;
+        }
+    };
+}
 
 /// How many bytes the reader checks for zeros in one read.
 const zero_check_chunk_size = 4096;
 
 /// Reads the records of a log file in the order they were appended.
-pub const Reader = struct {
-    io: Io,
-    file: Io.File,
-    /// Holds the payload of the record most recently returned.
-    buffer: []u8,
-    /// The length of the file when it was opened.
-    file_len: u64,
-    /// Where in the file the next record starts.
-    offset: u64,
-    /// The last record returned, or the file header's previous record.
-    last: RecordId,
-    /// Set once the end of the log has been reached.
-    done: bool,
+pub fn ReaderType(comptime Storage: type) type {
+    return struct {
+        const Reader = @This();
+        const Blocking = BlockingType(Storage);
 
-    pub const Record = struct {
-        op: u64,
-        /// Valid until the next call to `next`.
-        payload: []const u8,
-    };
+        storage: *Storage,
+        file: Storage.File,
+        /// Holds the payload of the record most recently returned.
+        buffer: []u8,
+        /// The length of the file when it was opened.
+        file_len: u64,
+        /// Where in the file the next record starts.
+        offset: u64,
+        /// The last record returned, or the file header's previous record.
+        last: RecordId,
+        /// Set once the end of the log has been reached.
+        done: bool,
 
-    pub const OpenError = error{
-        /// The file is shorter than a file header, or is a file header of
-        /// all zeros and nothing more. A crash while the log was being
-        /// created leaves this. Such a file holds no records, so it is safe
-        /// to delete and create again.
-        IncompleteLog,
-        /// The file does not start with a valid log file header.
-        NotALog,
-    } || Io.File.OpenError || Io.File.LengthError || Io.File.ReadPositionalError;
+        pub const Record = struct {
+            op: u64,
+            /// Valid until the next call to `next`.
+            payload: []const u8,
+        };
 
-    pub const NextError = error{
-        /// The log is damaged in a way a crash during an append cannot
-        /// explain. See the recovery policy at the top of this file. Also
-        /// returned for a record that is longer than `buffer`.
-        Corrupt,
-    } || Io.File.ReadPositionalError;
+        pub const OpenError = error{
+            /// The file is shorter than a file header, or is a file header of
+            /// all zeros and nothing more. A crash while the log was being
+            /// created leaves this. Such a file holds no records, so it is safe
+            /// to delete and create again.
+            IncompleteLog,
+            /// The file does not start with a valid log file header.
+            NotALog,
+        } || Storage.OpenError || Storage.SizeError || Storage.ReadError;
 
-    /// Opens the log named `name` in `dir`. `name` is a file name, not a
-    /// path. `buffer` holds one payload at a time, so it must be at least as
-    /// long as the largest payload in the file.
-    pub fn open(io: Io, dir: Io.Dir, name: []const u8, buffer: []u8) OpenError!Reader {
-        assert(isPlainFileName(name));
+        pub const NextError = error{
+            /// The log is damaged in a way a crash during an append cannot
+            /// explain. See the recovery policy at the top of this file. Also
+            /// returned for a record that is longer than `buffer`.
+            Corrupt,
+        } || Storage.ReadError;
 
-        const file = try dir.openFile(io, name, .{ .mode = .read_only });
-        errdefer file.close(io);
+        /// Opens the log named `name` in `dir`. `name` is a file name, not a
+        /// path. `buffer` holds one payload at a time, so it must be at least as
+        /// long as the largest payload in the file.
+        pub fn open(storage: *Storage, name: []const u8, buffer: []u8) OpenError!Reader {
+            assert(isPlainFileName(name));
 
-        const file_len = try file.length(io);
-        if (file_len < file_header_size) {
-            return error.IncompleteLog;
-        }
+            const file = try storage.openFile(name, .read_only, .{ .direct = false });
+            errdefer storage.closeFile(file);
 
-        var header_bytes: [file_header_size]u8 = undefined;
-        const header_read = try file.readPositionalAll(io, &header_bytes, 0);
-        if (header_read < file_header_size) {
-            return error.IncompleteLog;
-        }
-        const header = FileHeader.fromBytes(&header_bytes);
-        if (header == null) {
-            // Zeros are what unwritten space in a file reads as. A crash in
-            // `Writer.create` can leave the file at its full length before
-            // the header's bytes are on disk.
-            const file_is_only_header = file_len == file_header_size;
-            const header_is_zeros = std.mem.allEqual(u8, &header_bytes, 0);
-            if (file_is_only_header and header_is_zeros) {
+            const file_len = try storage.fileSize(file);
+            if (file_len < file_header_size) {
                 return error.IncompleteLog;
             }
-            return error.NotALog;
+
+            var header_bytes: [file_header_size]u8 = undefined;
+            const header_read = try Blocking.readAll(storage, file, &header_bytes, 0);
+            if (header_read < file_header_size) {
+                return error.IncompleteLog;
+            }
+            const header = FileHeader.fromBytes(&header_bytes);
+            if (header == null) {
+                // Zeros are what unwritten space in a file reads as. A crash in
+                // `Writer.create` can leave the file at its full length before
+                // the header's bytes are on disk.
+                const file_is_only_header = file_len == file_header_size;
+                const header_is_zeros = std.mem.allEqual(u8, &header_bytes, 0);
+                if (file_is_only_header and header_is_zeros) {
+                    return error.IncompleteLog;
+                }
+                return error.NotALog;
+            }
+
+            return .{
+                .storage = storage,
+                .file = file,
+                .buffer = buffer,
+                .file_len = file_len,
+                .offset = file_header_size,
+                .last = header.?.previous(),
+                .done = false,
+            };
         }
 
-        return .{
-            .io = io,
-            .file = file,
-            .buffer = buffer,
-            .file_len = file_len,
-            .offset = file_header_size,
-            .last = header.?.previous(),
-            .done = false,
-        };
-    }
-
-    pub fn close(self: *Reader) void {
-        self.file.close(self.io);
-        self.* = undefined;
-    }
-
-    /// Returns the next record, or `null` at the end of the log.
-    ///
-    /// A damaged final record is what a crash during `Writer.append` leaves
-    /// behind. It was never reported as durable, so it is treated as the end
-    /// of the log. This cannot tell a torn write apart from later corruption
-    /// of a final record that was durable; a replica will be able to repair
-    /// that case from its peers.
-    pub fn next(self: *Reader) NextError!?Record {
-        if (self.done) {
-            return null;
+        pub fn close(self: *Reader) void {
+            self.storage.closeFile(self.file);
+            self.* = undefined;
         }
 
-        // The end of the file, or too few bytes left to hold a header.
-        const bytes_left = self.file_len - self.offset;
-        if (bytes_left < record_header_size) {
-            self.done = true;
-            return null;
-        }
+        /// Returns the next record, or `null` at the end of the log.
+        ///
+        /// A damaged final record is what a crash during `Writer.append` leaves
+        /// behind. It was never reported as durable, so it is treated as the end
+        /// of the log. This cannot tell a torn write apart from later corruption
+        /// of a final record that was durable; a replica will be able to repair
+        /// that case from its peers.
+        pub fn next(self: *Reader) NextError!?Record {
+            if (self.done) {
+                return null;
+            }
 
-        var header_bytes: [record_header_size]u8 = undefined;
-        const header_read = try self.file.readPositionalAll(self.io, &header_bytes, self.offset);
-        if (header_read < record_header_size) {
-            self.done = true;
-            return null;
-        }
+            // The end of the file, or too few bytes left to hold a header.
+            const bytes_left = self.file_len - self.offset;
+            if (bytes_left < record_header_size) {
+                self.done = true;
+                return null;
+            }
 
-        // Zeros are what unwritten space in a file reads as. They end the
-        // log only if nothing but zeros follows. Zeros with data after them
-        // are a record that has been wiped out.
-        if (std.mem.allEqual(u8, &header_bytes, 0)) {
-            const rest_is_zeros = try self.restOfFileIsZeros();
-            if (!rest_is_zeros) {
+            var header_bytes: [record_header_size]u8 = undefined;
+            const header_read = try Blocking.readAll(self.storage, self.file, &header_bytes, self.offset);
+            if (header_read < record_header_size) {
+                self.done = true;
+                return null;
+            }
+
+            // Zeros are what unwritten space in a file reads as. They end the
+            // log only if nothing but zeros follows. Zeros with data after them
+            // are a record that has been wiped out.
+            if (std.mem.allEqual(u8, &header_bytes, 0)) {
+                const rest_is_zeros = try self.restOfFileIsZeros();
+                if (!rest_is_zeros) {
+                    return error.Corrupt;
+                }
+                self.done = true;
+                return null;
+            }
+
+            const header = RecordHeader.fromBytes(&header_bytes);
+            const payload_offset = self.offset + record_header_size;
+
+            // Nothing in the header can be trusted until its checksum is checked.
+            if (header.header_checksum != header.expectedHeaderChecksum()) {
+                const header_is_last_in_file = payload_offset == self.file_len;
+                if (header_is_last_in_file) {
+                    self.done = true;
+                    return null;
+                }
                 return error.Corrupt;
             }
-            self.done = true;
-            return null;
-        }
 
-        const header = RecordHeader.fromBytes(&header_bytes);
-        const payload_offset = self.offset + record_header_size;
+            // The header is intact, so it was written by a writer. A writer only
+            // ever appends the next record in the chain.
+            if (self.last.op == std.math.maxInt(u64)) {
+                // There is no op number left for a record to carry.
+                return error.Corrupt;
+            }
+            const continues_chain = header.previous_checksum == self.last.checksum and
+                header.op == self.last.op + 1;
+            if (!continues_chain) {
+                return error.Corrupt;
+            }
 
-        // Nothing in the header can be trusted until its checksum is checked.
-        if (header.header_checksum != header.expectedHeaderChecksum()) {
-            const header_is_last_in_file = payload_offset == self.file_len;
-            if (header_is_last_in_file) {
+            // The payload was cut short.
+            const record_end = payload_offset + header.payload_len;
+            if (record_end > self.file_len) {
                 self.done = true;
                 return null;
             }
-            return error.Corrupt;
-        }
 
-        // The header is intact, so it was written by a writer. A writer only
-        // ever appends the next record in the chain.
-        if (self.last.op == std.math.maxInt(u64)) {
-            // There is no op number left for a record to carry.
-            return error.Corrupt;
-        }
-        const continues_chain = header.previous_checksum == self.last.checksum and
-            header.op == self.last.op + 1;
-        if (!continues_chain) {
-            return error.Corrupt;
-        }
-
-        // The payload was cut short.
-        const record_end = payload_offset + header.payload_len;
-        if (record_end > self.file_len) {
-            self.done = true;
-            return null;
-        }
-
-        if (header.payload_len > self.buffer.len) {
-            return error.Corrupt;
-        }
-        const payload = self.buffer[0..header.payload_len];
-        const payload_read = try self.file.readPositionalAll(self.io, payload, payload_offset);
-        if (payload_read < payload.len) {
-            self.done = true;
-            return null;
-        }
-
-        if (header.payload_checksum != crc32c(payload)) {
-            const record_is_last_in_file = record_end == self.file_len;
-            if (record_is_last_in_file) {
+            if (header.payload_len > self.buffer.len) {
+                return error.Corrupt;
+            }
+            const payload = self.buffer[0..header.payload_len];
+            const payload_read = try Blocking.readAll(self.storage, self.file, payload, payload_offset);
+            if (payload_read < payload.len) {
                 self.done = true;
                 return null;
             }
-            return error.Corrupt;
+
+            if (header.payload_checksum != crc32c(payload)) {
+                const record_is_last_in_file = record_end == self.file_len;
+                if (record_is_last_in_file) {
+                    self.done = true;
+                    return null;
+                }
+                return error.Corrupt;
+            }
+
+            self.offset = record_end;
+            self.last = .{ .op = header.op, .checksum = header.header_checksum };
+            return .{ .op = header.op, .payload = payload };
         }
 
-        self.offset = record_end;
-        self.last = .{ .op = header.op, .checksum = header.header_checksum };
-        return .{ .op = header.op, .payload = payload };
-    }
-
-    /// Whether every byte from the next record's start to the end of the file
-    /// is zero.
-    fn restOfFileIsZeros(self: *Reader) Io.File.ReadPositionalError!bool {
-        var chunk: [zero_check_chunk_size]u8 = undefined;
-        var offset = self.offset;
-        while (offset < self.file_len) {
-            const bytes_left = self.file_len - offset;
-            const chunk_len: usize = @intCast(@min(bytes_left, chunk.len));
-            const bytes_read = try self.file.readPositionalAll(self.io, chunk[0..chunk_len], offset);
-            if (bytes_read == 0) {
-                // The file is shorter than it was when it was opened.
-                return true;
+        /// Whether every byte from the next record's start to the end of the file
+        /// is zero.
+        fn restOfFileIsZeros(self: *Reader) Storage.ReadError!bool {
+            var chunk: [zero_check_chunk_size]u8 = undefined;
+            var offset = self.offset;
+            while (offset < self.file_len) {
+                const bytes_left = self.file_len - offset;
+                const chunk_len: usize = @intCast(@min(bytes_left, chunk.len));
+                const bytes_read = try Blocking.readAll(self.storage, self.file, chunk[0..chunk_len], offset);
+                if (bytes_read == 0) {
+                    // The file is shorter than it was when it was opened.
+                    return true;
+                }
+                if (!std.mem.allEqual(u8, chunk[0..bytes_read], 0)) {
+                    return false;
+                }
+                offset += bytes_read;
             }
-            if (!std.mem.allEqual(u8, chunk[0..bytes_read], 0)) {
-                return false;
-            }
-            offset += bytes_read;
+            return true;
         }
-        return true;
-    }
 
-    /// Where the records returned so far end. Once `next` has returned
-    /// `null`, this is where a `Writer` should resume.
-    pub fn end(self: *const Reader) End {
-        return .{ .valid_len = self.offset, .last = self.last };
-    }
-};
+        /// Where the records returned so far end. Once `next` has returned
+        /// `null`, this is where a `Writer` should resume.
+        pub fn end(self: *const Reader) End {
+            return .{ .valid_len = self.offset, .last = self.last };
+        }
+    };
+}
 
 const testing = std.testing;
+const RealStorage = @import("testing/real_storage.zig").RealStorage;
+const RealWriter = WriterType(@import("storage.zig").Storage);
+const RealReader = ReaderType(@import("storage.zig").Storage);
 const test_name = "test.wal";
 const test_payload_size_max = 1024;
 
 /// Creates a brand-new log holding `payloads`.
 fn writeLog(dir: Io.Dir, payloads: []const []const u8) !void {
-    var writer: Writer = try .create(testing.io, dir, test_name, test_payload_size_max, .none);
+    var real: RealStorage = undefined;
+    try real.init(dir);
+    defer real.deinit();
+    var writer: RealWriter = try .create(&real.storage, test_name, test_payload_size_max, .none);
     defer writer.close();
     for (payloads) |payload| {
         _ = try writer.append(payload);
@@ -566,8 +582,11 @@ fn writeLog(dir: Io.Dir, payloads: []const []const u8) !void {
 /// Reads the log to its end, checks that it holds exactly `payloads` with
 /// ops counting up from 1, and returns where it ends.
 fn expectLog(dir: Io.Dir, payloads: []const []const u8) !End {
+    var real: RealStorage = undefined;
+    try real.init(dir);
+    defer real.deinit();
     var buffer: [test_payload_size_max]u8 = undefined;
-    var reader: Reader = try .open(testing.io, dir, test_name, &buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, &buffer);
     defer reader.close();
 
     for (payloads, 1..) |payload, op| {
@@ -628,8 +647,11 @@ test "records are read back in order with consecutive ops" {
 test "append returns the op and checksum of the new record" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, test_payload_size_max, .none);
+    var writer: RealWriter = try .create(&real.storage, test_name, test_payload_size_max, .none);
     const first = try writer.append("first");
     const second = try writer.append("second");
     writer.close();
@@ -653,10 +675,13 @@ test "an empty payload is a record" {
 test "create fails if the file exists" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{"kept"});
 
-    const result = Writer.create(testing.io, tmp.dir, test_name, test_payload_size_max, .none);
+    const result = RealWriter.create(&real.storage, test_name, test_payload_size_max, .none);
     try testing.expectError(error.PathAlreadyExists, result);
     _ = try expectLog(tmp.dir, &.{"kept"});
 }
@@ -664,8 +689,11 @@ test "create fails if the file exists" {
 test "a payload over the limit is rejected and the writer stays usable" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, 4, .none);
+    var writer: RealWriter = try .create(&real.storage, test_name, 4, .none);
     _ = try writer.append("1234");
     try testing.expectError(error.PayloadTooLarge, writer.append("12345"));
     _ = try writer.append("ok");
@@ -677,11 +705,14 @@ test "a payload over the limit is rejected and the writer stays usable" {
 test "a writer resumes after the last record" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{ "first", "second" });
     const end = try expectLog(tmp.dir, &.{ "first", "second" });
 
-    var writer: Writer = try .open(testing.io, tmp.dir, test_name, test_payload_size_max, end);
+    var writer: RealWriter = try .open(&real.storage, test_name, test_payload_size_max, end);
     const third = try writer.append("third");
     writer.close();
 
@@ -692,15 +723,18 @@ test "a writer resumes after the last record" {
 test "a log continues the chain of the log before it" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     const previous: RecordId = .{ .op = 41, .checksum = 0xabcd1234 };
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, test_payload_size_max, previous);
+    var writer: RealWriter = try .create(&real.storage, test_name, test_payload_size_max, previous);
     const first = try writer.append("first");
     writer.close();
     try testing.expectEqual(@as(u64, 42), first.op);
 
     var buffer: [test_payload_size_max]u8 = undefined;
-    var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, &buffer);
     defer reader.close();
     try testing.expectEqual(previous, reader.end().last);
     const record = try reader.next();
@@ -712,12 +746,15 @@ test "a log continues the chain of the log before it" {
 test "a final record cut short at any point ends the log" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{ "first", "second" });
     const len_before = try fileLength(tmp.dir);
     {
         const end = try expectLog(tmp.dir, &.{ "first", "second" });
-        var writer: Writer = try .open(testing.io, tmp.dir, test_name, test_payload_size_max, end);
+        var writer: RealWriter = try .open(&real.storage, test_name, test_payload_size_max, end);
         _ = try writer.append("third");
         writer.close();
     }
@@ -736,12 +773,15 @@ test "a final record cut short at any point ends the log" {
 test "a writer overwrites a record that was cut short" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{ "first", "second", "torn" });
     try setFileLength(tmp.dir, try fileLength(tmp.dir) - 2);
     const end = try expectLog(tmp.dir, &.{ "first", "second" });
 
-    var writer: Writer = try .open(testing.io, tmp.dir, test_name, test_payload_size_max, end);
+    var writer: RealWriter = try .open(&real.storage, test_name, test_payload_size_max, end);
     // Opening removed what was left of the torn record.
     try testing.expectEqual(end.valid_len, try fileLength(tmp.dir));
     const third = try writer.append("third");
@@ -754,11 +794,14 @@ test "a writer overwrites a record that was cut short" {
 test "a final record whose payload fails its checksum ends the log" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     // The damaged record is much longer than the one written after it, so
     // the test fails unless the writer really removes the damaged bytes.
     const long_payload: [200]u8 = @splat(1);
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, test_payload_size_max, .none);
+    var writer: RealWriter = try .create(&real.storage, test_name, test_payload_size_max, .none);
     _ = try writer.append("first");
     const second = try writer.append("second");
     const len_before_third = try fileLength(tmp.dir);
@@ -771,7 +814,7 @@ test "a final record whose payload fails its checksum ends the log" {
     try testing.expectEqual(len_before_third, end.valid_len);
     try testing.expectEqual(second, end.last);
 
-    writer = try .open(testing.io, tmp.dir, test_name, test_payload_size_max, end);
+    writer = try .open(&real.storage, test_name, test_payload_size_max, end);
     _ = try writer.append("x");
     writer.close();
 
@@ -781,13 +824,16 @@ test "a final record whose payload fails its checksum ends the log" {
 test "an earlier record whose payload fails its checksum is corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{ "first", "second", "third" });
     // The last byte of the first record's payload.
     try flipByte(tmp.dir, file_header_size + record_header_size + "first".len - 1);
 
     var buffer: [test_payload_size_max]u8 = undefined;
-    var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, &buffer);
     defer reader.close();
     try testing.expectError(error.Corrupt, reader.next());
 }
@@ -795,6 +841,9 @@ test "an earlier record whose payload fails its checksum is corrupt" {
 test "damage to any byte of an earlier record is corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{ "first", "second" });
     const first_record_len = record_header_size + "first".len;
@@ -804,7 +853,7 @@ test "damage to any byte of an earlier record is corrupt" {
         try flipByte(tmp.dir, offset);
 
         var buffer: [test_payload_size_max]u8 = undefined;
-        var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+        var reader: RealReader = try .open(&real.storage, test_name, &buffer);
         try testing.expectError(error.Corrupt, reader.next());
         reader.close();
 
@@ -816,6 +865,9 @@ test "damage to any byte of an earlier record is corrupt" {
 test "a final record with a damaged header and a payload after it is corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{ "first", "second", "third" });
     const third_record_len = record_header_size + "third".len;
@@ -826,7 +878,7 @@ test "a final record with a damaged header and a payload after it is corrupt" {
         try flipByte(tmp.dir, offset);
 
         var buffer: [test_payload_size_max]u8 = undefined;
-        var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+        var reader: RealReader = try .open(&real.storage, test_name, &buffer);
         _ = try reader.next();
         _ = try reader.next();
         try testing.expectError(error.Corrupt, reader.next());
@@ -873,6 +925,9 @@ test "a record that does not continue the chain is corrupt" {
         for (wrong_previous) |previous| {
             var tmp = testing.tmpDir(.{});
             defer tmp.cleanup();
+            var real: RealStorage = undefined;
+            try real.init(tmp.dir);
+            defer real.deinit();
 
             try writeLog(tmp.dir, payloads);
 
@@ -885,7 +940,7 @@ test "a record that does not continue the chain is corrupt" {
             file.close(testing.io);
 
             var buffer: [test_payload_size_max]u8 = undefined;
-            var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+            var reader: RealReader = try .open(&real.storage, test_name, &buffer);
             defer reader.close();
             try testing.expectError(error.Corrupt, reader.next());
         }
@@ -895,6 +950,9 @@ test "a record that does not continue the chain is corrupt" {
 test "no record can follow the largest op" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     const previous: RecordId = .{ .op = std.math.maxInt(u64), .checksum = 0x1234 };
     const file_header: FileHeader = .init(previous);
@@ -913,7 +971,7 @@ test "no record can follow the largest op" {
     file.close(testing.io);
 
     var buffer: [test_payload_size_max]u8 = undefined;
-    var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, &buffer);
     defer reader.close();
     try testing.expectError(error.Corrupt, reader.next());
 }
@@ -929,13 +987,16 @@ fn zeroBytes(dir: Io.Dir, offset: u64, len: usize) !void {
 test "a zeroed record header with data after it is corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{ "first", "second", "third" });
     const second_offset = file_header_size + record_header_size + "first".len;
     try zeroBytes(tmp.dir, second_offset, record_header_size);
 
     var buffer: [test_payload_size_max]u8 = undefined;
-    var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, &buffer);
     defer reader.close();
     const first = try reader.next();
     try testing.expectEqualSlices(u8, "first", first.?.payload);
@@ -945,11 +1006,14 @@ test "a zeroed record header with data after it is corrupt" {
 test "a zeroed record with data after it is corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     // The second record is long, so the zeros run well past one read of the
     // check for what follows them.
     const long_payload: [zero_check_chunk_size + zero_check_chunk_size / 2]u8 = @splat(7);
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, 8192, .none);
+    var writer: RealWriter = try .create(&real.storage, test_name, 8192, .none);
     _ = try writer.append("first");
     _ = try writer.append(&long_payload);
     _ = try writer.append("third");
@@ -959,7 +1023,7 @@ test "a zeroed record with data after it is corrupt" {
     try zeroBytes(tmp.dir, second_offset, record_header_size + long_payload.len);
 
     var buffer: [8192]u8 = undefined;
-    var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, &buffer);
     defer reader.close();
     const first = try reader.next();
     try testing.expectEqualSlices(u8, "first", first.?.payload);
@@ -981,11 +1045,14 @@ test "zeros after the last record end the log" {
 test "a record longer than the buffer is corrupt" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     try writeLog(tmp.dir, &.{ "first", "a longer second record" });
 
     var buffer: [8]u8 = undefined;
-    var reader: Reader = try .open(testing.io, tmp.dir, test_name, &buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, &buffer);
     defer reader.close();
     const first = try reader.next();
     try testing.expectEqualSlices(u8, "first", first.?.payload);
@@ -995,6 +1062,9 @@ test "a record longer than the buffer is corrupt" {
 test "a file shorter than a file header is an incomplete log" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
     var buffer: [test_payload_size_max]u8 = undefined;
 
     // Every length a crash partway through `Writer.create` can leave.
@@ -1005,7 +1075,7 @@ test "a file shorter than a file header is an incomplete log" {
         try file.writePositionalAll(testing.io, complete_bytes[0..len], 0);
         file.close(testing.io);
 
-        const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
+        const result = RealReader.open(&real.storage, test_name, &buffer);
         try testing.expectError(error.IncompleteLog, result);
     }
 }
@@ -1013,6 +1083,9 @@ test "a file shorter than a file header is an incomplete log" {
 test "a file header of zeros with nothing after it is an incomplete log" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
     var buffer: [test_payload_size_max]u8 = undefined;
 
     const zeros: [file_header_size]u8 = @splat(0);
@@ -1020,13 +1093,16 @@ test "a file header of zeros with nothing after it is an incomplete log" {
     try file.writePositionalAll(testing.io, &zeros, 0);
     file.close(testing.io);
 
-    const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
+    const result = RealReader.open(&real.storage, test_name, &buffer);
     try testing.expectError(error.IncompleteLog, result);
 }
 
 test "a file header of zeros with data after it is not a log" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
     var buffer: [test_payload_size_max]u8 = undefined;
 
     // One byte more than a header. A file this long could hold part of a
@@ -1036,13 +1112,16 @@ test "a file header of zeros with data after it is not a log" {
     try file.writePositionalAll(testing.io, &zeros, 0);
     file.close(testing.io);
 
-    const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
+    const result = RealReader.open(&real.storage, test_name, &buffer);
     try testing.expectError(error.NotALog, result);
 }
 
 test "a file that is not a log is rejected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
     var buffer: [test_payload_size_max]u8 = undefined;
 
     // Long enough, but nothing like a file header.
@@ -1051,7 +1130,7 @@ test "a file that is not a log is rejected" {
         const file = try tmp.dir.createFile(testing.io, test_name, .{});
         try file.writePositionalAll(testing.io, &junk, 0);
         file.close(testing.io);
-        const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
+        const result = RealReader.open(&real.storage, test_name, &buffer);
         try testing.expectError(error.NotALog, result);
     }
 
@@ -1065,7 +1144,7 @@ test "a file that is not a log is rejected" {
         const file = try tmp.dir.createFile(testing.io, test_name, .{});
         try file.writePositionalAll(testing.io, wrong_magic.toBytes(), 0);
         file.close(testing.io);
-        const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
+        const result = RealReader.open(&real.storage, test_name, &buffer);
         try testing.expectError(error.NotALog, result);
     }
 }
@@ -1107,12 +1186,15 @@ test "the bytes of a log file match the documented layout" {
 test "a damaged file header is rejected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
     var buffer: [test_payload_size_max]u8 = undefined;
 
     try writeLog(tmp.dir, &.{"first"});
     for (0..file_header_size) |offset| {
         try flipByte(tmp.dir, offset);
-        const result = Reader.open(testing.io, tmp.dir, test_name, &buffer);
+        const result = RealReader.open(&real.storage, test_name, &buffer);
         try testing.expectError(error.NotALog, result);
         try flipByte(tmp.dir, offset);
     }

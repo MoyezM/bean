@@ -18,6 +18,8 @@ const Io = std.Io;
 const MemTable = @import("memtable.zig").MemTable;
 const checksum = @import("checksum.zig");
 const wal = @import("wal.zig");
+const AsyncIo = @import("async_io.zig").AsyncIo;
+const Storage = @import("storage.zig").Storage;
 
 /// The memtable is benchmarked at the size the store gives it.
 const buffer_size = MemTable.buffer_size_max;
@@ -359,7 +361,12 @@ fn timeAppends(io: Io, dir: Io.Dir, payload: []const u8, count: u32) !AppendTime
     std.debug.assert(count <= wal_appends_max);
     var times_ns: [wal_appends_max]u64 = undefined;
 
-    var writer: wal.Writer = try .create(io, dir, wal_file_name, wal_payload_size_max, .none);
+    var event_loop: AsyncIo = try .init();
+    defer event_loop.deinit();
+    var storage: Storage = .init(&event_loop, io, dir);
+    defer storage.deinit();
+
+    var writer: wal.WriterType(Storage) = try .create(&storage, wal_file_name, wal_payload_size_max, .none);
     defer writer.close();
 
     var index: u32 = 0;
@@ -393,13 +400,18 @@ fn timeReplay(io: Io, dir: Io.Dir, buffer: []u8) !ReplayResult {
         .elapsed_ns = std.math.maxInt(u64),
     };
 
+    var event_loop: AsyncIo = try .init();
+    defer event_loop.deinit();
+    var storage: Storage = .init(&event_loop, io, dir);
+    defer storage.deinit();
+
     var round: usize = 0;
     while (round < rounds) {
         var record_count: u64 = 0;
         var payload_bytes: u64 = 0;
 
         const start_ns = nowNs(io);
-        var reader: wal.Reader = try .open(io, dir, wal_file_name, buffer);
+        var reader: wal.ReaderType(Storage) = try .open(&storage, wal_file_name, buffer);
         while (try reader.next()) |record| {
             record_count += 1;
             payload_bytes += record.payload.len;

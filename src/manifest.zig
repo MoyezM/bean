@@ -761,91 +761,101 @@ pub const TableSet = struct {
 
 /// Appends edits to a store's manifest. An edit is durable once `append`
 /// returns.
-pub const Writer = struct {
-    log: wal.Writer,
+pub fn WriterType(comptime Storage: type) type {
+    return struct {
+        const Writer = @This();
+        const LogWriter = wal.WriterType(Storage);
 
-    pub const CreateError = wal.Writer.CreateError;
-    pub const OpenError = wal.Writer.OpenError;
-    pub const AppendError = Io.File.WritePositionalError || Io.File.SyncError;
+        log: LogWriter,
 
-    /// Creates a new, empty manifest in `dir`, and syncs it. Fails if the
-    /// file already exists.
-    pub fn create(io: Io, dir: Io.Dir) CreateError!Writer {
-        const log = try wal.Writer.create(io, dir, file_name, edit_size_max, .none);
-        return .{ .log = log };
-    }
+        pub const CreateError = LogWriter.CreateError;
+        pub const OpenError = LogWriter.OpenError;
+        pub const AppendError = Storage.WriteError || Storage.SyncError;
 
-    /// Opens an existing manifest to append after its valid edits. `end`
-    /// must come from `Reader.end` after that reader reached the end of the
-    /// same file.
-    pub fn open(io: Io, dir: Io.Dir, end: wal.End) OpenError!Writer {
-        const log = try wal.Writer.open(io, dir, file_name, edit_size_max, end);
-        return .{ .log = log };
-    }
+        /// Creates a new, empty manifest, and syncs it. Fails if the file
+        /// already exists.
+        pub fn create(storage: *Storage) CreateError!Writer {
+            const log = try LogWriter.create(storage, file_name, edit_size_max, .none);
+            return .{ .log = log };
+        }
 
-    pub fn close(self: *Writer) void {
-        self.log.close();
-        self.* = undefined;
-    }
+        /// Opens an existing manifest to append after its valid edits. `end`
+        /// must come from `Reader.end` after that reader reached the end of the
+        /// same file.
+        pub fn open(storage: *Storage, end: wal.End) OpenError!Writer {
+            const log = try LogWriter.open(storage, file_name, edit_size_max, end);
+            return .{ .log = log };
+        }
 
-    /// Appends one edit and syncs the file. `edit_bytes` must be a
-    /// well-formed edit, from `encode`, that the store's `TableSet` has
-    /// checked.
-    ///
-    /// After an error the state of the file is unknown, and the writer must
-    /// not be used again.
-    pub fn append(self: *Writer, edit_bytes: []const u8) AppendError!void {
-        assert(edit_bytes.len <= edit_size_max);
-        _ = self.log.append(edit_bytes) catch |err| switch (err) {
-            // An edit is never longer than the limit the log was given.
-            error.PayloadTooLarge => unreachable,
-            else => |other| return other,
-        };
-    }
-};
+        pub fn close(self: *Writer) void {
+            self.log.close();
+            self.* = undefined;
+        }
+
+        /// Appends one edit and syncs the file. `edit_bytes` must be a
+        /// well-formed edit, from `encode`, that the store's `TableSet` has
+        /// checked.
+        ///
+        /// After an error the state of the file is unknown, and the writer must
+        /// not be used again.
+        pub fn append(self: *Writer, edit_bytes: []const u8) AppendError!void {
+            assert(edit_bytes.len <= edit_size_max);
+            _ = self.log.append(edit_bytes) catch |err| switch (err) {
+                // An edit is never longer than the limit the log was given.
+                error.PayloadTooLarge => unreachable,
+                else => |other| return other,
+            };
+        }
+    };
+}
 
 /// Reads the edits of a store's manifest in the order they were appended.
-pub const Reader = struct {
-    log: wal.Reader,
+pub fn ReaderType(comptime Storage: type) type {
+    return struct {
+        const Reader = @This();
+        const LogReader = wal.ReaderType(Storage);
 
-    pub const OpenError = wal.Reader.OpenError;
+        log: LogReader,
 
-    pub const NextError = error{
-        /// A record of the manifest is not a well-formed edit.
-        InvalidEdit,
-    } || wal.Reader.NextError;
+        pub const OpenError = LogReader.OpenError;
 
-    /// Opens the manifest in `dir`. `buffer` holds one edit at a time, and
-    /// must be at least `edit_size_max` long.
-    pub fn open(io: Io, dir: Io.Dir, buffer: []u8) OpenError!Reader {
-        assert(buffer.len >= edit_size_max);
-        const log = try wal.Reader.open(io, dir, file_name, buffer);
-        return .{ .log = log };
-    }
+        pub const NextError = error{
+            /// A record of the manifest is not a well-formed edit.
+            InvalidEdit,
+        } || LogReader.NextError;
 
-    pub fn close(self: *Reader) void {
-        self.log.close();
-        self.* = undefined;
-    }
-
-    /// Returns the next edit, or `null` at the end of the manifest. The
-    /// edit is well-formed, and is valid until the next call to `next`.
-    pub fn next(self: *Reader) NextError!?EncodedEdit {
-        const record = try self.log.next();
-        if (record == null) {
-            return null;
+        /// Opens the manifest. `buffer` holds one edit at a time, and must be
+        /// at least `edit_size_max` long.
+        pub fn open(storage: *Storage, buffer: []u8) OpenError!Reader {
+            assert(buffer.len >= edit_size_max);
+            const log = try LogReader.open(storage, file_name, buffer);
+            return .{ .log = log };
         }
-        const edit_bytes = record.?.payload;
-        try validate(edit_bytes);
-        return EncodedEdit.init(edit_bytes);
-    }
 
-    /// Where the edits returned so far end. Once `next` has returned `null`,
-    /// this is where a `Writer` should resume.
-    pub fn end(self: *const Reader) wal.End {
-        return self.log.end();
-    }
-};
+        pub fn close(self: *Reader) void {
+            self.log.close();
+            self.* = undefined;
+        }
+
+        /// Returns the next edit, or `null` at the end of the manifest. The
+        /// edit is well-formed, and is valid until the next call to `next`.
+        pub fn next(self: *Reader) NextError!?EncodedEdit {
+            const record = try self.log.next();
+            if (record == null) {
+                return null;
+            }
+            const edit_bytes = record.?.payload;
+            try validate(edit_bytes);
+            return EncodedEdit.init(edit_bytes);
+        }
+
+        /// Where the edits returned so far end. Once `next` has returned `null`,
+        /// this is where a `Writer` should resume.
+        pub fn end(self: *const Reader) wal.End {
+            return self.log.end();
+        }
+    };
+}
 
 /// What a numbered file holds.
 pub const FileKind = enum {
@@ -913,6 +923,10 @@ pub fn parseFileName(name: []const u8) ?ParsedFileName {
 }
 
 const testing = std.testing;
+const RealStorage = @import("testing/real_storage.zig").RealStorage;
+const RealWriter = WriterType(@import("storage.zig").Storage);
+const RealReader = ReaderType(@import("storage.zig").Storage);
+const RealLogWriter = wal.WriterType(@import("storage.zig").Storage);
 
 /// The flushed op and flushed sequence number that the tests' edits carry,
 /// unless a test is about those numbers. The sequence number is larger than
@@ -1938,8 +1952,11 @@ test "the flushed numbers move only with the log, and only forwards" {
 
 /// Reads the whole manifest in `dir` into `set`, and returns where it ends.
 fn readManifest(dir: Io.Dir, set: *TableSet) !wal.End {
+    var real: RealStorage = undefined;
+    try real.init(dir);
+    defer real.deinit();
     var buffer: [edit_size_max]u8 = undefined;
-    var reader: Reader = try .open(testing.io, dir, &buffer);
+    var reader: RealReader = try .open(&real.storage, &buffer);
     defer reader.close();
 
     while (try reader.next()) |edit| {
@@ -1952,10 +1969,13 @@ fn readManifest(dir: Io.Dir, set: *TableSet) !wal.End {
 test "edits written to a manifest rebuild the same tables when it is read" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
     var buffer: [edit_size_max]u8 = undefined;
 
     {
-        var writer: Writer = try .create(testing.io, tmp.dir);
+        var writer: RealWriter = try .create(&real.storage);
         defer writer.close();
         try writer.append(encode(.{
             .added = &.{testTable(2, "a", "m")},
@@ -1984,7 +2004,7 @@ test "edits written to a manifest rebuild the same tables when it is read" {
 
     // More edits are appended after the ones already there.
     {
-        var writer: Writer = try .open(testing.io, tmp.dir, end);
+        var writer: RealWriter = try .open(&real.storage, end);
         defer writer.close();
         try writer.append(encode(.{
             .added = &.{testTable(6, "a", "z")},
@@ -2009,11 +2029,14 @@ test "edits written to a manifest rebuild the same tables when it is read" {
 test "an edit that a crash left half-written is ignored" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
     var buffer: [edit_size_max]u8 = undefined;
 
     var len_after_first: u64 = 0;
     {
-        var writer: Writer = try .create(testing.io, tmp.dir);
+        var writer: RealWriter = try .create(&real.storage);
         defer writer.close();
         try writer.append(encode(.{
             .added = &.{testTable(2, "a", "m")},
@@ -2056,15 +2079,18 @@ test "an edit that a crash left half-written is ignored" {
 test "a manifest record that is not an edit is reported" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     {
-        var log: wal.Writer = try .create(testing.io, tmp.dir, file_name, edit_size_max, .none);
+        var log: RealLogWriter = try .create(&real.storage, file_name, edit_size_max, .none);
         defer log.close();
         _ = try log.append("not an edit");
     }
 
     var buffer: [edit_size_max]u8 = undefined;
-    var reader: Reader = try .open(testing.io, tmp.dir, &buffer);
+    var reader: RealReader = try .open(&real.storage, &buffer);
     defer reader.close();
     try testing.expectError(error.InvalidEdit, reader.next());
 }
