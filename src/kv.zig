@@ -13,7 +13,7 @@
 //!
 //!     LOCK          held locked while the store is open
 //!     MANIFEST      which tables the store has, and which log (`manifest.zig`)
-//!     000003.log    a write-ahead log (`wal.zig`)
+//!     000003.log    a write-ahead log (`sector_log.zig`)
 //!     000002.sst    a table (`sstable.zig`)
 //!
 //! Logs and tables are named by number, and each new file takes the next
@@ -330,8 +330,9 @@ pub fn StoreType(comptime Storage: type) type {
 
         /// What writing a batch that holds at least one operation can report.
         pub const CommitError = error{
-            /// The active memtable has no room for the batch, and every table
-            /// slot is taken, so the memtable cannot be flushed to make room.
+            /// The active memtable or its log has no room for the batch, and
+            /// every table slot is taken, so the memtable cannot be flushed
+            /// to make room.
             StoreFull,
             /// An earlier write failed, and the store must be closed and opened
             /// again before it is written to.
@@ -601,6 +602,14 @@ pub fn StoreType(comptime Storage: type) type {
         /// loop and storage on `dir`, and frees them in `close`.
         pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, options: Options) OpenError!Store {
             return openWithSizes(gpa, io, dir, options, MemTable.buffer_size_max, log_file_size);
+        }
+
+        /// `open`, with logs of the short length the tests use. A store always
+        /// has logs of the length in `constants`; writing one of those out
+        /// for every test would take far too long. This is for tests in
+        /// other files, which cannot reach `openWithSizes`.
+        pub fn openForTest(gpa: Allocator, io: Io, dir: Io.Dir, options: Options) OpenError!Store {
+            return openWithSizes(gpa, io, dir, options, MemTable.buffer_size_max, test_log_file_size);
         }
 
         /// Opens the store whose files `storage` keeps, creating it if it is
@@ -1439,15 +1448,26 @@ pub fn StoreType(comptime Storage: type) type {
             // are changed: strays are deleted, the manifest and the log lose a
             // record that a crash left half-written, and an interrupted flush
             // is run again.
+            //
+            // The manifest is opened for writing first. That cuts off an edit
+            // a crash left half-written and syncs the file, so that every
+            // edit read above, which the deletions below rely on, is durable
+            // before a file is deleted on its say-so.
+            self.manifest_writer = try ManifestWriter.open(self.storage, manifest_end.?);
+            errdefer self.manifest_writer.close();
+
             try self.removeStrayFiles();
             if (newer_is_incomplete) {
                 var name_buffer: [manifest.file_name_size_max]u8 = undefined;
                 const log_name = manifest.fileName(&name_buffer, .log, log_number_newer);
                 try self.storage.deleteFile(log_name);
             }
-
-            self.manifest_writer = try ManifestWriter.open(self.storage, manifest_end.?);
-            errdefer self.manifest_writer.close();
+            // The directory as it now is must be durable before anything is
+            // appended to a log. A file whose deletion was lost with the
+            // power would come back beside a log that has since moved on:
+            // a newer log left by a freeze that failed would then follow a
+            // record that is no longer the named log's last.
+            try self.storage.syncDir();
 
             self.active_index = 0;
             self.sequence_last = named.sequence_last;
@@ -1463,7 +1483,19 @@ pub fn StoreType(comptime Storage: type) type {
                 self.file_number_next = log_number_newer + 1;
                 log_end = newer.?.end;
                 log_file_len = newer.?.file_size;
+            }
 
+            // The log is opened for writing before the flush is run again.
+            // Opening it syncs it. The flush will make the manifest name
+            // this log and delete the one before it, so this log's header
+            // and records must be durable by then, and a crash may have
+            // left them written but not synced.
+            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+            const log_name = manifest.fileName(&name_buffer, .log, self.log_number);
+            self.log = try Log.Writer.open(self.storage, log_name, log_file_len, self.log_buffer, log_end);
+            errdefer self.log.close();
+
+            if (newer != null) {
                 // Run the interrupted flush again, from the start.
                 try self.flushBegin(
                     0,
@@ -1473,10 +1505,6 @@ pub fn StoreType(comptime Storage: type) type {
                 );
                 try self.flushComplete();
             }
-
-            var name_buffer: [manifest.file_name_size_max]u8 = undefined;
-            const log_name = manifest.fileName(&name_buffer, .log, self.log_number);
-            self.log = try Log.Writer.open(self.storage, log_name, log_file_len, self.log_buffer, log_end);
         }
 
         /// Reads the manifest and applies its edits to `tables`. Returns where
@@ -1791,6 +1819,11 @@ pub fn StoreType(comptime Storage: type) type {
             if (reader.file_size < sector_log.fileSizeMin(log_payload_size_max)) {
                 return error.Corrupt;
             }
+            // A log is whole sectors. One that is not was not written by a
+            // store, and records could not be appended to it.
+            if (reader.file_size % sector_size != 0) {
+                return error.Corrupt;
+            }
 
             var sequence_last = sequence_before;
             while (true) {
@@ -1905,8 +1938,10 @@ const test_value_size = 1000;
 /// The length of each log file in the tests. Writing a log of the real
 /// size out for every test would take far too long.
 ///
-/// It is large enough that the small memtables of the tests always fill
-/// before their log does, whatever the tests write: a memtable of
+/// It is large enough that the small memtables of `openSmallStore` and the
+/// model tests always fill before their log does, whatever the tests
+/// write. A store from `openStore` has memtables of the full size, and its
+/// log can fill first. A memtable of
 /// `test_memtable_size` bytes holds at most this many entries, and each
 /// entry was logged in a record of at least one sector.
 const test_log_file_size = sector_size * (2 + test_log_records_max) + log_buffer_size;
@@ -3298,6 +3333,33 @@ test "a store with every table slot taken and a full memtable rejects a write, s
     try expectValue(&store, "small", "1");
 }
 
+/// The length of the logs in the test of batches of small operations. It
+/// has room for more full batches than a memtable can take, so that the
+/// memtable is what fills.
+const small_operations_log_size = sector_size +
+    small_operations_batches_max * sector_log.recordSize(write_batch.size_max);
+
+/// Two more full batches than fit in a memtable. An operation takes at
+/// least as many bytes in the memtable as it does in its batch, so a
+/// memtable holds no more full batches than its size divided by a batch's.
+const small_operations_batches_max = MemTable.buffer_size_max / write_batch.size_max + 2;
+
+comptime {
+    assert(small_operations_log_size % sector_size == 0);
+    assert(small_operations_log_size >= sector_log.fileSizeMin(log_payload_size_max));
+}
+
+fn openSmallOperationsStore(dir: Io.Dir) !DiskStore {
+    return DiskStore.openWithSizes(
+        testing.allocator,
+        testing.io,
+        dir,
+        .{},
+        MemTable.buffer_size_max,
+        small_operations_log_size,
+    );
+}
+
 test "batches of small operations fill a memtable, and both logs replay" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3308,7 +3370,7 @@ test "batches of small operations fill a memtable, and both logs replay" {
     var key_number: u64 = 0;
     var batches: u64 = 0;
     {
-        var store = try openStore(tmp.dir);
+        var store = try openSmallOperationsStore(tmp.dir);
         defer store.close(testing.allocator);
 
         // A small operation takes far more room in the memtable than it
@@ -3316,8 +3378,15 @@ test "batches of small operations fill a memtable, and both logs replay" {
         // as large. Stop at the batch that froze it.
         while (store.log_number == log_number_first) {
             key_number = try fillBatchWithSmallOperations(&batch, key_number);
+
+            // It is the memtable that fills, never the log.
+            const memtable_is_full = memtableSizeMax(batch.bytes()) > store.activeMemtable().bytesFree();
+            try testing.expect(store.log.hasRoomFor(batch.bytes().len));
+
             try store.write(&batch);
             batches += 1;
+            const froze = store.log_number != log_number_first;
+            try testing.expectEqual(memtable_is_full, froze);
         }
         try testing.expect(batches > 1);
         try testing.expectEqual(batches, store.opLatest());
@@ -3325,7 +3394,7 @@ test "batches of small operations fill a memtable, and both logs replay" {
 
     // The first log fits in one memtable again and is flushed; the second
     // log's one batch fits in the other.
-    var store = try openStore(tmp.dir);
+    var store = try openSmallOperationsStore(tmp.dir);
     defer store.close(testing.allocator);
     try testing.expectEqual(batches, store.opLatest());
     try testing.expectEqual(key_number, store.sequenceLatest());
@@ -4844,6 +4913,154 @@ test "simulated: no acknowledged write is lost, whenever the crash comes" {
         defer store.close(testing.allocator);
         var number: u64 = 0;
         while (number < present + 5) : (number += 1) {
+            try testing.expect(try hasNumberedSimulated(&store, number));
+        }
+    }
+}
+
+test "a first log that has lost its header, with no manifest, is reported, not deleted" {
+    // With no manifest there is no store to open, and a first log that
+    // holds nothing is a leftover to clear away. One that holds records is
+    // not, even if its header is gone.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createLogAfter(tmp.dir, "000001.log", .none);
+    try appendToLog(tmp.dir, log_number_first, "anything at all");
+    const zeros: [sector_size]u8 = @splat(0);
+    try writeLogBytes(tmp.dir, log_number_first, &zeros, 0);
+
+    try testing.expectError(error.NotALog, openStore(tmp.dir));
+    try testing.expect(try fileExists(tmp.dir, "000001.log"));
+}
+
+test "a log whose file is not the length its header gives is reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openStore(tmp.dir);
+        defer store.close(testing.allocator);
+        try store.put("a", "1");
+    }
+    // One sector more than the header says.
+    try setLogLength(tmp.dir, log_number_first, test_log_file_size + sector_size);
+    try testing.expectError(error.Corrupt, openStore(tmp.dir));
+}
+
+test "a flush keeps pace with a log that fills faster than its memtable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A log with room for the largest batch and four sectors more, under
+    // memtables of the full size.
+    const small_log_size = sector_log.fileSizeMin(log_payload_size_max) + 4 * sector_size;
+    const records_per_log = (small_log_size - sector_size) / sector_size;
+
+    var store = try DiskStore.openWithSizes(
+        testing.allocator,
+        testing.io,
+        tmp.dir,
+        .{},
+        MemTable.buffer_size_max,
+        small_log_size,
+    );
+    defer store.close(testing.allocator);
+
+    // One large batch, so that the memtable to be frozen holds about a
+    // megabyte.
+    {
+        var batch: WriteBatch = try .init(testing.allocator);
+        defer batch.deinit(testing.allocator);
+        var key_buffer: [8]u8 = undefined;
+        var value_buffer: [test_value_size]u8 = undefined;
+        var number: u64 = 0;
+        while (number < 1000) : (number += 1) {
+            try batch.put(numberedKey(&key_buffer, number), numberedValue(&value_buffer, number));
+        }
+        try store.write(&batch);
+    }
+
+    // Tiny writes fill the rest of the log, and the memtable is frozen.
+    var key_buffer: [16]u8 = undefined;
+    var index: u64 = 0;
+    while (store.log_number == log_number_first) : (index += 1) {
+        const key = try std.fmt.bufPrint(&key_buffer, "key{d:0>6}", .{index});
+        try store.put(key, "value");
+    }
+    try testing.expect(store.flushing != null);
+    const log_number_frozen = store.log_number;
+
+    // Each tiny write uses a whole sector of the new log, and almost none
+    // of the memtable. Paced by the memtable alone, the flush would still
+    // be going when the log filled again. Paced by the log, it is over
+    // well before that.
+    var writes_during_flush: u64 = 0;
+    while (store.flushing != null) : (index += 1) {
+        const key = try std.fmt.bufPrint(&key_buffer, "key{d:0>6}", .{index});
+        try store.put(key, "value");
+        writes_during_flush += 1;
+        try testing.expectEqual(log_number_frozen, store.log_number);
+    }
+    try testing.expect(writes_during_flush <= records_per_log / 2 + 2);
+    try testing.expectEqual(@as(usize, 1), store.tables.count());
+}
+
+test "simulated: a newer log whose header was written but not synced does not strand the store" {
+    // A freeze creates the new log and writes its header last. If the
+    // process is killed after the header is written and before it is
+    // synced, the restart finds a newer log with a header. It runs the
+    // flush again, which makes the manifest name that log. The header must
+    // be durable before that, or a power loss leaves the manifest naming a
+    // file of zeros.
+    var seed: u64 = 0;
+    while (seed < 30) : (seed += 1) {
+        var storage: Simulated = .init(testing.allocator, .{ .seed = seed });
+        defer storage.deinit();
+
+        // Fill the first memtable to just short of a freeze.
+        var acknowledged: u64 = 0;
+        {
+            var store = try openSimulatedStore(&storage);
+            defer store.close(testing.allocator);
+            while (store.log_number == log_number_first) {
+                var key_buffer: [8]u8 = undefined;
+                var value_buffer: [test_value_size]u8 = undefined;
+                const key = numberedKey(&key_buffer, acknowledged);
+                const value = numberedValue(&value_buffer, acknowledged);
+                // Stop before the write that would freeze.
+                var batch: WriteBatch = try .init(testing.allocator);
+                defer batch.deinit(testing.allocator);
+                try batch.put(key, value);
+                if (memtableSizeMax(batch.bytes()) > store.activeMemtable().bytesFree()) {
+                    break;
+                }
+                try store.write(&batch);
+                acknowledged += 1;
+            }
+            try testing.expectEqual(log_number_first, store.log_number);
+
+            // The next write freezes. Kill the process at each operation
+            // of the freeze in turn, one seed at a time.
+            storage.crashAfterOperations(1 + seed % 8, .process_kill);
+            putNumberedSimulated(&store, acknowledged) catch {};
+        }
+        if (!storage.crashed) {
+            continue;
+        }
+        storage.restart();
+
+        // Open the store, which may run the flush again, then lose power.
+        {
+            var store = try openSimulatedStore(&storage);
+            store.close(testing.allocator);
+        }
+        storage.crash(.power_loss);
+        storage.restart();
+
+        var store = try openSimulatedStore(&storage);
+        defer store.close(testing.allocator);
+        var number: u64 = 0;
+        while (number < acknowledged) : (number += 1) {
             try testing.expect(try hasNumberedSimulated(&store, number));
         }
     }

@@ -100,4 +100,8 @@ pub const sector_size = 4096;
 /// that is given one small operation at a time fills its log long before
 /// its memtable: at this size a log holds 65,535 such records. A caller
 /// that batches its writes fills the memtable first.
+///
+/// Nothing merges tables yet, so this also bounds how many unbatched writes
+/// a store takes before it is full: one log's worth for each table, and
+/// one more for the memtable.
 pub const log_file_size = 256 * 1024 * 1024;

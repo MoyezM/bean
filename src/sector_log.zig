@@ -264,7 +264,8 @@ pub fn LogType(comptime Storage: type) type {
             pub const CreateError = Storage.CreateError || Storage.WriteError ||
                 Storage.SyncError || Storage.SyncDirError;
 
-            pub const OpenError = Storage.OpenError || Storage.SyncError;
+            pub const OpenError = Storage.OpenError || Storage.SyncError ||
+                Storage.ReadError || Storage.WriteError;
 
             pub const AppendError = error{
                 /// The payload is longer than the writer's buffer can hold.
@@ -344,7 +345,8 @@ pub fn LogType(comptime Storage: type) type {
             /// the end of the same file, and `file_size` from the reader
             /// too.
             ///
-            /// The file is synced before this returns. A record that the
+            /// The remains of a torn append at `end` are wiped, and the file
+            /// is synced, before this returns. A record that the
             /// reader found may have been written just before the process
             /// was killed, and never synced. The reader's caller has
             /// treated it as part of the log, so it must be durable before
@@ -366,6 +368,23 @@ pub fn LogType(comptime Storage: type) type {
                 const file = try storage.openFile(name, .read_write, .{ .direct = true });
                 errdefer storage.closeFile(file);
                 try Blocking.syncFile(storage, file);
+
+                // What a torn append left where the next record goes is
+                // wiped. If its header stayed, a later append of a
+                // different record with the same tail, torn the other way,
+                // would complete it, and a write that was never
+                // acknowledged, and was seen to be absent, would appear.
+                // One sector is enough: a record is only ever found through
+                // the header in its first sector.
+                if (end.offset < file_size) {
+                    const sector = buffer[0..sector_size];
+                    const sector_read = try Blocking.readAll(storage, file, sector, end.offset);
+                    assert(sector_read == sector_size);
+                    if (!std.mem.allEqual(u8, sector, 0)) {
+                        @memset(sector, 0);
+                        try Blocking.writeAll(storage, file, sector, end.offset, .durable);
+                    }
+                }
 
                 return .{
                     .storage = storage,
@@ -1249,4 +1268,52 @@ test "a crash while a log is being created leaves nothing that looks like a log 
             }
         }
     }
+}
+
+test "the remains of a torn append cannot be completed by a later one" {
+    // Two different records with the same tail. The first is torn so that
+    // only its first sector lands. After a restart the second is appended
+    // in the same place, and torn so that only its tail lands. Together the
+    // two halves would make the first record whole.
+    const tail: [2 * sector_size]u8 = @splat('t');
+    var first_payload: [tail.len + 8]u8 = undefined;
+    var second_payload: [tail.len + 8]u8 = undefined;
+    @memcpy(first_payload[0..8], "first---");
+    @memcpy(first_payload[8..], &tail);
+    @memcpy(second_payload[0..8], "second--");
+    @memcpy(second_payload[8..], &tail);
+    comptime assert(recordSize(first_payload.len) == 3 * sector_size);
+    const record_offset = 2 * sector_size;
+    const zeros: [sector_size]u8 = @splat(0);
+
+    var storage: Simulated = .init(testing.allocator, .{});
+    defer storage.deinit();
+
+    // The whole second record, as it would be on disk, taken from a log
+    // where it was appended after the same first record.
+    var second_record: [3 * sector_size]u8 = undefined;
+    {
+        try writeLog(Simulated, &storage, &.{ "short", &second_payload });
+        @memcpy(&second_record, storage.contents(test_name)[record_offset..][0..second_record.len]);
+        try storage.deleteFile(test_name);
+    }
+
+    // The first record, torn: only its first sector landed.
+    try writeLog(Simulated, &storage, &.{ "short", &first_payload });
+    storage.setBytes(test_name, record_offset + sector_size, &zeros);
+    storage.setBytes(test_name, record_offset + 2 * sector_size, &zeros);
+    const end = try expectLog(Simulated, &storage, &.{"short"});
+    try testing.expectEqual(@as(u64, record_offset), end.offset);
+
+    // The restart opens the log for writing.
+    var buffer: TestBuffer align(sector_size) = undefined;
+    var writer: SimulatedLog.Writer = try .open(&storage, test_name, test_file_size, &buffer, end);
+    writer.close();
+
+    // The second record, torn the other way: only its last two sectors
+    // landed.
+    storage.setBytes(test_name, record_offset + sector_size, second_record[sector_size..]);
+
+    // Neither record was ever whole, so neither is in the log.
+    _ = try expectLog(Simulated, &storage, &.{"short"});
 }

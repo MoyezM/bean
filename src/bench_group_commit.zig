@@ -298,7 +298,7 @@ test "one thread writes through the committer" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .openForTest(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
     defer committer.deinit(testing.allocator);
@@ -319,7 +319,7 @@ test "a key over the limit is rejected and the committer stays usable" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .openForTest(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
     defer committer.deinit(testing.allocator);
@@ -356,7 +356,7 @@ test "many threads share syncs and every write is there" {
     const write_count = test_thread_count * test_puts_per_thread;
     var groups_written: u64 = 0;
     {
-        var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
+        var store: kv.DiskStore = try .openForTest(testing.allocator, testing.io, tmp.dir, .{});
         defer store.close(testing.allocator);
         var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
         defer committer.deinit(testing.allocator);
@@ -380,7 +380,7 @@ test "many threads share syncs and every write is there" {
     }
 
     // Every write is durable: it is there after the store is opened again.
-    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .openForTest(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     try testing.expectEqual(groups_written, store.opLatest());
 
@@ -429,7 +429,7 @@ test "threads read whole values while other threads write" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .openForTest(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
     defer committer.deinit(testing.allocator);
@@ -469,7 +469,7 @@ test "get reports a buffer that is too small for the value" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store: kv.DiskStore = try .open(testing.allocator, testing.io, tmp.dir, .{});
+    var store: kv.DiskStore = try .openForTest(testing.allocator, testing.io, tmp.dir, .{});
     defer store.close(testing.allocator);
     var committer: GroupCommitter = try .init(testing.allocator, testing.io, &store);
     defer committer.deinit(testing.allocator);
