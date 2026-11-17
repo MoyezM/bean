@@ -90,6 +90,13 @@ const Benchmark = enum {
     /// more thread writes keys picked at random, one at a time, until they
     /// finish.
     readwhilewriting,
+    /// The lookups of `readrandom` on one thread, which also keeps one
+    /// write in flight the whole time: it starts a write of one key picked
+    /// at random, carries on with lookups while the batch is on its way to
+    /// the disk, and starts the next write when that one has ended. This is
+    /// the store used the way it is meant to be, from one event loop, with
+    /// no lock and no second thread.
+    readwhilewritingloop,
     /// Reads `reads` entries in key order from the start of the store.
     readseq,
     /// Seeks to `reads` keys picked at random, and reads `seek_nexts`
@@ -559,6 +566,7 @@ const Bench = struct {
                 return try self.readRandom(.missing);
             },
             .readwhilewriting => return try self.readFromThreads(.written, .with_writer),
+            .readwhilewritingloop => return try self.readWhileWritingOnOneThread(),
             .readseq => return try self.readSequential(),
             .seekrandom => return try self.seekRandom(),
             .flush => return try self.flushStore(),
@@ -806,6 +814,105 @@ const Bench = struct {
             result.operations += 1;
         }
         result.elapsed_ns = nowNs(self.io) - start_ns;
+        result.latency = summarizeLatencies("read", samples_ns[0..timer.count]);
+        return result;
+    }
+
+    /// The writes of `readwhilewritingloop`: one in flight at a time, each
+    /// started when the one before it has ended.
+    const LoopWriter = struct {
+        bench: *Bench,
+        prng: std.Random.DefaultPrng,
+        batch: WriteBatch,
+        operation: kv.DiskStore.Write = .{},
+        in_flight: bool = false,
+        /// Set when a write has failed, for example because the store is
+        /// full. The lookups carry on without the writes.
+        stopped: bool = false,
+        /// How many writes have ended without an error.
+        operations: u64 = 0,
+
+        /// Starts a write of one key picked at random.
+        fn start(writer: *LoopWriter) void {
+            const config = writer.bench.config;
+            var key_buffer: [key_size_max]u8 = undefined;
+            const key = key_buffer[0..config.key_size];
+            const key_number = writer.prng.random().uintLessThan(u64, config.num);
+            std.mem.writeInt(u64, key[0..key_number_size], key_number, .big);
+            @memset(key[key_number_size..], '0');
+
+            writer.batch.clear();
+            writer.batch.put(key, writer.bench.value) catch {
+                writer.stopped = true;
+                return;
+            };
+            writer.bench.store.writeStart(&writer.operation, onEnded, &writer.batch) catch {
+                writer.stopped = true;
+                return;
+            };
+            writer.in_flight = true;
+        }
+
+        fn onEnded(operation: *kv.DiskStore.Write) void {
+            const writer: *LoopWriter = @fieldParentPtr("operation", operation);
+            writer.in_flight = false;
+            if (operation.result) |_| {
+                writer.operations += 1;
+            } else |_| {
+                writer.stopped = true;
+            }
+        }
+    };
+
+    /// Looks up `reads` keys picked at random while keeping one write in
+    /// flight, all on this thread.
+    fn readWhileWritingOnOneThread(self: *Bench) !Result {
+        var result: Result = .{ .operations = 0, .bytes = 0, .elapsed_ns = 0, .found = 0 };
+        const key_size = self.lookupKeySize(.written);
+
+        const read_count: usize = @intCast(self.config.readCount());
+        const samples_ns = try self.allocSamples(1, read_count);
+        defer self.gpa.free(samples_ns);
+        var timer: OperationTimer = .init(self.io, samples_ns);
+        const deadline: Deadline = .start(self.io, self.config.duration);
+
+        var writer: LoopWriter = .{
+            .bench = self,
+            .prng = .init(self.config.seed + threads_max),
+            .batch = try .init(self.gpa),
+        };
+        defer writer.batch.deinit(self.gpa);
+
+        const start_ns = nowNs(self.io);
+        while (result.operations < self.config.readCount() and !deadline.passed()) {
+            if (!writer.in_flight and !writer.stopped) {
+                writer.start();
+            }
+
+            const key = self.makeKeyOfSize(self.randomKeyNumber(), key_size);
+            timer.begin();
+            const value = try self.store.get(key, self.read_buffer);
+            timer.end();
+            if (value != null) {
+                result.found.? += 1;
+                result.bytes += key.len + value.?.len;
+            }
+            result.operations += 1;
+
+            // One turn of the event loop: if the write has ended, its
+            // callback runs here.
+            self.store.poll();
+        }
+        result.elapsed_ns = nowNs(self.io) - start_ns;
+
+        // The write that is still in flight must end before its batch goes
+        // out of scope.
+        while (self.store.hasWritesInFlight()) {
+            self.store.wait(std.time.ns_per_ms);
+        }
+
+        result.writes_meanwhile = writer.operations;
+        result.store_full = writer.stopped;
         result.latency = summarizeLatencies("read", samples_ns[0..timer.count]);
         return result;
     }
