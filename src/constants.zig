@@ -85,3 +85,8 @@ pub const level_count = 2;
 /// two. More operations than this can be in flight: a full queue is handed
 /// over early to make room.
 pub const async_io_ring_entries = 128;
+
+/// The unit of direct I/O, in bytes. A file that is read and written around
+/// the system's cache is read and written in whole sectors, and the log
+/// pads every record to a whole number of them.
+pub const sector_size = 4096;
