@@ -105,6 +105,11 @@ const log_file_size = constants.log_file_size;
 /// The unit logs are written in.
 const sector_size = sector_log.sector_size;
 
+/// How long one turn of the event loop may block while a blocking write
+/// waits for its batch to be durable. The loop returns as soon as any
+/// operation ends.
+const blocking_wait_ns = 100 * std.time.ns_per_ms;
+
 /// The file number of the log a new store starts with.
 const log_number_first: u64 = 1;
 
@@ -228,6 +233,23 @@ pub fn StoreType(comptime Storage: type) type {
         flush_block_buffer: []u8,
         /// Holds the data block `get` is reading.
         get_block_buffer: []u8,
+
+        /// The writes that have been started and are waiting their turn,
+        /// oldest first.
+        write_queue_head: ?*Write,
+        write_queue_tail: ?*Write,
+        /// The write whose batch is being appended to the log, if any.
+        write_logging: ?*Write,
+        /// The log's part of that append. The storage holds a pointer to
+        /// it while the append is in flight, which is why the store must
+        /// not be moved then.
+        append: Log.Append,
+        /// Set by the log when that append has ended, and cleared when
+        /// `advance` has dealt with it.
+        append_ended: bool,
+        /// Whether `advance` is running. A write's callback must not call
+        /// `poll`, `wait` or a blocking write.
+        advancing: bool,
 
         /// Set when a write to a file has failed. The state of the files is
         /// then unknown, so every later write is refused.
@@ -716,6 +738,12 @@ pub fn StoreType(comptime Storage: type) type {
                 .index_storage = index_storage,
                 .flush_block_buffer = flush_block_buffer,
                 .get_block_buffer = get_block_buffer,
+                .write_queue_head = null,
+                .write_queue_tail = null,
+                .write_logging = null,
+                .append = .{},
+                .append_ended = false,
+                .advancing = false,
                 .broken = false,
                 .write_count = 0,
             };
@@ -729,6 +757,7 @@ pub fn StoreType(comptime Storage: type) type {
         ///
         /// `gpa` must be the allocator passed to `open`.
         pub fn close(self: *Store, gpa: Allocator) void {
+            assert(!self.hasWritesInFlight());
             if (self.flushing != null) {
                 const flushing = &self.flushing.?;
                 if (flushing.stage == .writing) {
@@ -760,8 +789,244 @@ pub fn StoreType(comptime Storage: type) type {
             self.* = undefined;
         }
 
-        /// Applies `batch` as a unit. When this returns without an error, the
-        /// batch is durable.
+        /// One write, from `writeStart` until its callback runs. The caller
+        /// owns it. It and its batch must not be moved, changed or freed
+        /// until the callback has run. Create one with `.{}`.
+        pub const Write = struct {
+            callback: *const fn (write: *Write) void = undefined,
+            batch: *const WriteBatch = undefined,
+            /// Whether the write has been started and not yet called back.
+            in_flight: bool = false,
+            /// The next write waiting its turn.
+            next: ?*Write = null,
+
+            /// Set when the callback runs. Without an error, the batch is
+            /// durable and reads see it.
+            result: CommitError!void = undefined,
+        };
+
+        /// What `writeStart` reports at once, before the write is queued.
+        pub const WriteStartError = error{
+            /// The batch holds no operations.
+            EmptyBatch,
+            /// An earlier write failed, and the store must be closed and
+            /// opened again before it is written to.
+            StoreBroken,
+        };
+
+        /// Starts applying `batch` as a unit, and returns at once. `callback`
+        /// runs later, from `poll` or `wait`, with the outcome in
+        /// `operation.result`. Until then the batch is not visible to reads.
+        ///
+        /// Writes are carried out in the order they were started, one log
+        /// record at a time. While a batch is on its way to the disk the
+        /// caller is free: it can read, start further writes, and do
+        /// anything else. The store must not be moved or closed while a
+        /// write is in flight.
+        ///
+        /// `StoreFull` is reported to the callback and leaves the store
+        /// usable. After any other error there, the batch may or may not be
+        /// in the log: it can appear when the store is next opened. Every
+        /// write queued behind it, and every later one, gets `StoreBroken`
+        /// until the store is closed and opened again.
+        pub fn writeStart(
+            self: *Store,
+            operation: *Write,
+            callback: *const fn (write: *Write) void,
+            batch: *const WriteBatch,
+        ) WriteStartError!void {
+            assert(!operation.in_flight);
+            // An empty batch is never logged: replay rejects an empty record.
+            if (batch.count() == 0) {
+                return error.EmptyBatch;
+            }
+            if (self.broken) {
+                return error.StoreBroken;
+            }
+            operation.* = .{
+                .callback = callback,
+                .batch = batch,
+                .in_flight = true,
+            };
+            if (self.write_queue_tail) |tail| {
+                tail.next = operation;
+            } else {
+                self.write_queue_head = operation;
+            }
+            self.write_queue_tail = operation;
+        }
+
+        /// Whether any write has been started and not yet called back.
+        pub fn hasWritesInFlight(self: *const Store) bool {
+            return self.write_logging != null or self.write_queue_head != null;
+        }
+
+        /// Carries the writes in flight forward as far as they can go
+        /// without waiting, and runs the callbacks of those that have ended.
+        pub fn poll(self: *Store) void {
+            self.storage.poll();
+            self.advance();
+        }
+
+        /// Like `poll`, but when nothing has ended yet, blocks until
+        /// something does or until `timeout_ns` has passed.
+        pub fn wait(self: *Store, timeout_ns: u64) void {
+            // A write that has not been handed to the log yet has nothing
+            // on the disk to wait for, so it is moved on first.
+            self.advance();
+            if (self.write_logging == null) {
+                // Nothing is on its way to the disk. Whatever could end
+                // has ended.
+                return;
+            }
+            self.storage.wait(timeout_ns);
+            self.advance();
+        }
+
+        /// The log's callback when the append in flight has ended. It only
+        /// notes that: the rest is done by `advance`, outside the storage's
+        /// event loop, because it may do blocking I/O of its own.
+        fn onAppendEnded(request: *Log.Append) void {
+            const self: *Store = @fieldParentPtr("append", request);
+            assert(self.write_logging != null);
+            assert(!self.append_ended);
+            self.append_ended = true;
+        }
+
+        /// Moves the writes on: finishes the one whose record has become
+        /// durable, and hands the next one to the log.
+        ///
+        /// The next write's record is started before the finished write is
+        /// applied to the memtable, so that the disk is busy with one batch
+        /// while the processor is busy with the batch before it. The
+        /// exception is when the next write has to freeze the memtable
+        /// first: the finished batch belongs in the memtable being frozen,
+        /// so it goes in before the freeze.
+        fn advance(self: *Store) void {
+            assert(!self.advancing);
+            self.advancing = true;
+            defer self.advancing = false;
+
+            // The write whose record was in flight, if it has ended.
+            var ended: ?*Write = null;
+            if (self.append_ended) {
+                self.append_ended = false;
+                const logged = self.write_logging.?;
+                self.write_logging = null;
+                if (self.append.result) |_| {
+                    ended = logged;
+                } else |err| {
+                    self.broken = true;
+                    self.finishWrite(logged, err);
+                }
+            }
+            var ended_is_applied = false;
+
+            while (self.write_logging == null and self.write_queue_head != null) {
+                if (self.broken) {
+                    self.finishWrite(self.dequeueWrite(), error.StoreBroken);
+                    continue;
+                }
+                const next = self.write_queue_head.?;
+                const batch_bytes = next.batch.bytes();
+
+                // The finished batch is not in the memtable yet, but its
+                // room there is spoken for.
+                var memtable_reserved: usize = 0;
+                if (ended != null and !ended_is_applied) {
+                    memtable_reserved = memtableSizeMax(ended.?.batch.bytes());
+                }
+                const memtable_needed = memtableSizeMax(batch_bytes) + memtable_reserved;
+                const memtable_is_full = memtable_needed > self.activeMemtable().bytesFree();
+                const log_is_full = !self.log.hasRoomFor(batch_bytes.len);
+                const must_make_room = memtable_is_full or log_is_full;
+                if (must_make_room and ended != null and !ended_is_applied) {
+                    self.applyWrite(ended.?);
+                    ended_is_applied = true;
+                    continue;
+                }
+
+                _ = self.dequeueWrite();
+                self.logWrite(next, must_make_room) catch |err| {
+                    self.finishWrite(next, err);
+                };
+            }
+
+            if (ended) |write_ended| {
+                if (!ended_is_applied) {
+                    self.applyWrite(write_ended);
+                }
+                self.finishWrite(write_ended, {});
+            }
+        }
+
+        /// Takes the oldest waiting write off the queue.
+        fn dequeueWrite(self: *Store) *Write {
+            const operation = self.write_queue_head.?;
+            self.write_queue_head = operation.next;
+            if (self.write_queue_head == null) {
+                self.write_queue_tail = null;
+            }
+            operation.next = null;
+            return operation;
+        }
+
+        /// Does this write's share of a flush in progress, makes room for
+        /// its batch if there is none, and starts appending the batch to
+        /// the log. On an error nothing has been logged.
+        fn logWrite(self: *Store, operation: *Write, must_make_room: bool) CommitError!void {
+            self.write_count += 1;
+            const batch_bytes = operation.batch.bytes();
+            const batch_memtable_size = memtableSizeMax(batch_bytes);
+
+            // The share comes before the batch is logged, so that an error
+            // from the flush leaves the batch unwritten.
+            if (self.flushing != null) {
+                try self.flushStep(flush_pace * self.flushShare(batch_bytes.len, batch_memtable_size));
+            }
+
+            // The batch goes to the log only if all of it can then be
+            // applied, and only if the log has room for it. Whichever of
+            // the memtable and the log fills first, the memtable is frozen
+            // and a new log is started.
+            if (must_make_room) {
+                try self.makeRoom();
+                assert(batch_memtable_size <= self.activeMemtable().bytesFree());
+                assert(self.log.hasRoomFor(batch_bytes.len));
+            }
+
+            self.write_logging = operation;
+            self.log.appendStart(&self.append, onAppendEnded, batch_bytes);
+        }
+
+        /// Puts a batch whose record is durable into the active memtable,
+        /// where reads see it.
+        fn applyWrite(self: *Store, operation: *Write) void {
+            const memtable = self.activeMemtable();
+            self.sequence_last = applyBatch(memtable, operation.batch.bytes(), self.sequence_last + 1);
+        }
+
+        fn finishWrite(self: *Store, operation: *Write, result: CommitError!void) void {
+            _ = self;
+            assert(operation.in_flight);
+            operation.in_flight = false;
+            operation.result = result;
+            operation.callback(operation);
+        }
+
+        /// A write that blocks: started, then waited for.
+        const BlockingWrite = struct {
+            operation: Write = .{},
+            done: bool = false,
+
+            fn onDone(operation: *Write) void {
+                const state: *BlockingWrite = @fieldParentPtr("operation", operation);
+                state.done = true;
+            }
+        };
+
+        /// Applies `batch` as a unit, and blocks until that is done. When
+        /// this returns without an error, the batch is durable.
         ///
         /// `EmptyBatch`, `StoreFull` and `StoreBroken` are reported before the
         /// batch is written anywhere. `EmptyBatch` and `StoreFull` leave the
@@ -771,10 +1036,6 @@ pub fn StoreType(comptime Storage: type) type {
         /// appear when the store is next opened. Every later write returns
         /// `StoreBroken` until the store is closed and opened again.
         pub fn write(self: *Store, batch: *const WriteBatch) WriteError!void {
-            // An empty batch is never logged: replay rejects an empty record.
-            if (batch.count() == 0) {
-                return error.EmptyBatch;
-            }
             try self.commit(batch);
         }
 
@@ -788,7 +1049,11 @@ pub fn StoreType(comptime Storage: type) type {
                 // One operation always fits in an empty batch.
                 error.BatchFull => unreachable,
             };
-            try self.commit(&self.scratch);
+            self.commit(&self.scratch) catch |err| switch (err) {
+                // The batch holds one operation.
+                error.EmptyBatch => unreachable,
+                else => |other| return other,
+            };
         }
 
         /// Writes a batch holding one delete. Deleting a key that is not present
@@ -803,53 +1068,21 @@ pub fn StoreType(comptime Storage: type) type {
                 // One operation always fits in an empty batch.
                 error.BatchFull => unreachable,
             };
-            try self.commit(&self.scratch);
+            self.commit(&self.scratch) catch |err| switch (err) {
+                // The batch holds one operation.
+                error.EmptyBatch => unreachable,
+                else => |other| return other,
+            };
         }
 
-        /// Does this write's share of a flush in progress, makes room for
-        /// `batch` if the active memtable has none, then logs the batch and
-        /// applies it to the active memtable. `batch` must hold at least one
-        /// operation.
-        fn commit(self: *Store, batch: *const WriteBatch) CommitError!void {
-            assert(batch.count() > 0);
-            if (self.broken) {
-                return error.StoreBroken;
+        /// Starts a write and runs the event loop until it has ended.
+        fn commit(self: *Store, batch: *const WriteBatch) WriteError!void {
+            var state: BlockingWrite = .{};
+            try self.writeStart(&state.operation, BlockingWrite.onDone, batch);
+            while (!state.done) {
+                self.wait(blocking_wait_ns);
             }
-            self.write_count += 1;
-
-            const batch_bytes = batch.bytes();
-            const batch_memtable_size = memtableSizeMax(batch_bytes);
-
-            // The share comes before the batch is logged, so that an error from
-            // the flush leaves the batch unwritten.
-            if (self.flushing != null) {
-                try self.flushStep(flush_pace * self.flushShare(batch_bytes.len, batch_memtable_size));
-            }
-
-            // The batch goes to the log only if all of it can then be applied,
-            // and only if the log has room for it. Whichever of the memtable
-            // and the log fills first, the memtable is frozen and a new log is
-            // started.
-            const memtable_is_full = batch_memtable_size > self.activeMemtable().bytesFree();
-            const log_is_full = !self.log.hasRoomFor(batch_bytes.len);
-            if (memtable_is_full or log_is_full) {
-                try self.makeRoom();
-                assert(batch_memtable_size <= self.activeMemtable().bytesFree());
-                assert(self.log.hasRoomFor(batch_bytes.len));
-            }
-
-            _ = self.log.append(batch_bytes) catch |err| switch (err) {
-                // A batch is never longer than the log's payload limit, and
-                // room for it was made above.
-                error.PayloadTooLarge => unreachable,
-                error.LogFull => unreachable,
-                else => |other| {
-                    self.broken = true;
-                    return other;
-                },
-            };
-            const memtable = self.activeMemtable();
-            self.sequence_last = applyBatch(memtable, batch_bytes, self.sequence_last + 1);
+            return state.operation.result;
         }
 
         /// How many bytes of a frozen memtable a write should see flushed,
@@ -897,6 +1130,7 @@ pub fn StoreType(comptime Storage: type) type {
         /// every later write returns `StoreBroken` until the store is closed and
         /// opened again.
         pub fn flush(self: *Store) CommitError!void {
+            assert(!self.hasWritesInFlight());
             if (self.broken) {
                 return error.StoreBroken;
             }
@@ -5063,5 +5297,206 @@ test "simulated: a newer log whose header was written but not synced does not st
         while (number < acknowledged) : (number += 1) {
             try testing.expect(try hasNumberedSimulated(&store, number));
         }
+    }
+}
+
+/// A numbered write that has been started and not waited for, with the
+/// batch it holds.
+const StartedWrite = struct {
+    operation: SimulatedStore.Write = .{},
+    batch: WriteBatch = undefined,
+    ended: bool = false,
+    /// The order in which the callbacks ran, counted across the test.
+    ended_at: u64 = 0,
+
+    var ended_count: u64 = 0;
+
+    fn init(self: *StartedWrite, number: u64) !void {
+        self.* = .{};
+        self.batch = try .init(testing.allocator);
+        var key_buffer: [8]u8 = undefined;
+        var value_buffer: [test_value_size]u8 = undefined;
+        try self.batch.put(numberedKey(&key_buffer, number), numberedValue(&value_buffer, number));
+    }
+
+    fn deinit(self: *StartedWrite) void {
+        self.batch.deinit(testing.allocator);
+    }
+
+    fn onEnded(operation: *SimulatedStore.Write) void {
+        const self: *StartedWrite = @fieldParentPtr("operation", operation);
+        ended_count += 1;
+        self.ended_at = ended_count;
+        self.ended = true;
+    }
+};
+
+test "simulated: a write that has been started is not seen by reads until it has ended" {
+    var storage: Simulated = .init(testing.allocator, .{ .seed = 2 });
+    defer storage.deinit();
+    var store = try openSimulatedStore(&storage);
+    defer store.close(testing.allocator);
+
+    var started: StartedWrite = undefined;
+    try started.init(0);
+    defer started.deinit();
+    StartedWrite.ended_count = 0;
+
+    try store.writeStart(&started.operation, StartedWrite.onEnded, &started.batch);
+    // Starting a write never runs its callback.
+    try testing.expect(!started.ended);
+    try testing.expect(store.hasWritesInFlight());
+
+    // The store can be read while the batch is on its way to the disk, and
+    // the batch is not there yet.
+    var reads_meanwhile: u64 = 0;
+    while (!started.ended) {
+        try testing.expect(!try hasNumberedSimulated(&store, 0));
+        reads_meanwhile += 1;
+        store.poll();
+    }
+    try testing.expect(reads_meanwhile >= 1);
+    try started.operation.result;
+    try testing.expect(!store.hasWritesInFlight());
+    try testing.expect(try hasNumberedSimulated(&store, 0));
+    try testing.expectEqual(@as(u64, 1), store.opLatest());
+}
+
+test "simulated: writes started together end in the order they were started" {
+    var storage: Simulated = .init(testing.allocator, .{ .seed = 4, .latency_ticks_max = 8 });
+    defer storage.deinit();
+    var store = try openSimulatedStore(&storage);
+    defer store.close(testing.allocator);
+
+    // Enough writes to freeze the memtable on the way.
+    const count = 90;
+    const writes = try testing.allocator.alloc(StartedWrite, count);
+    defer testing.allocator.free(writes);
+    for (writes, 0..) |*started, number| {
+        try started.init(number);
+    }
+    defer for (writes) |*started| {
+        started.deinit();
+    };
+    StartedWrite.ended_count = 0;
+
+    for (writes) |*started| {
+        try store.writeStart(&started.operation, StartedWrite.onEnded, &started.batch);
+    }
+    for (writes) |*started| {
+        try testing.expect(!started.ended);
+    }
+
+    while (store.hasWritesInFlight()) {
+        // Between turns of the event loop the store holds exactly the
+        // writes whose callbacks have run: a batch goes into the memtable
+        // and its callback runs in the same turn.
+        var number: u64 = 0;
+        while (number < count) : (number += 1) {
+            const is_there = try hasNumberedSimulated(&store, number);
+            try testing.expectEqual(writes[number].ended, is_there);
+        }
+        store.wait(0);
+    }
+
+    for (writes, 1..) |*started, order| {
+        try started.operation.result;
+        try testing.expectEqual(@as(u64, order), started.ended_at);
+    }
+    try testing.expectEqual(@as(u64, count), store.opLatest());
+    try testing.expect(store.log_number > log_number_first);
+}
+
+test "simulated: a write that cannot be started is refused at once, with no callback" {
+    var storage: Simulated = .init(testing.allocator, .{ .seed = 6 });
+    defer storage.deinit();
+    var store = try openSimulatedStore(&storage);
+    defer store.close(testing.allocator);
+
+    var started: StartedWrite = undefined;
+    try started.init(0);
+    defer started.deinit();
+
+    var empty: WriteBatch = try .init(testing.allocator);
+    defer empty.deinit(testing.allocator);
+    try testing.expectError(
+        error.EmptyBatch,
+        store.writeStart(&started.operation, StartedWrite.onEnded, &empty),
+    );
+    try testing.expect(!store.hasWritesInFlight());
+
+    // Break the store: its storage fails under a write.
+    storage.crashAfterOperations(1, .process_kill);
+    try testing.expectError(error.InputOutput, putNumberedSimulated(&store, 1));
+    try testing.expectError(
+        error.StoreBroken,
+        store.writeStart(&started.operation, StartedWrite.onEnded, &started.batch),
+    );
+    try testing.expect(!started.ended);
+    try testing.expect(!store.hasWritesInFlight());
+}
+
+test "simulated: with several writes in flight, a crash keeps a prefix that holds every acknowledged one" {
+    const depth = 4;
+    const kinds = [_]simulated_storage.CrashKind{ .power_loss, .process_kill };
+    var prng: std.Random.DefaultPrng = .init(0xdeed);
+    const random = prng.random();
+
+    var trial: u64 = 0;
+    while (trial < 80) : (trial += 1) {
+        var storage: Simulated = .init(testing.allocator, .{ .seed = trial, .latency_ticks_max = 6 });
+        defer storage.deinit();
+
+        const writes = try testing.allocator.alloc(StartedWrite, crash_test_writes);
+        defer testing.allocator.free(writes);
+        for (writes, 0..) |*started, number| {
+            try started.init(number);
+        }
+        defer for (writes) |*started| {
+            started.deinit();
+        };
+
+        // Keep `depth` writes in flight until the crash, which comes at a
+        // random storage operation after the store is open.
+        var acknowledged: u64 = 0;
+        {
+            var store = try openSimulatedStore(&storage);
+            defer store.close(testing.allocator);
+            storage.crashAfterOperations(1 + random.uintLessThan(u64, 400), kinds[trial % kinds.len]);
+
+            var started_count: u64 = 0;
+            while (true) {
+                while (started_count < crash_test_writes and started_count < acknowledged + depth) {
+                    const started = &writes[started_count];
+                    store.writeStart(&started.operation, StartedWrite.onEnded, &started.batch) catch break;
+                    started_count += 1;
+                }
+                if (!store.hasWritesInFlight()) {
+                    break;
+                }
+                store.wait(0);
+                // Count the writes that ended without an error. They end in
+                // order, so they are a prefix.
+                while (acknowledged < started_count and writes[acknowledged].ended) {
+                    writes[acknowledged].operation.result catch break;
+                    acknowledged += 1;
+                }
+            }
+            // Let every write that was started be called back.
+            while (store.hasWritesInFlight()) {
+                store.wait(0);
+            }
+        }
+        if (!storage.crashed) {
+            continue;
+        }
+        storage.restart();
+
+        var store = try openSimulatedStore(&storage);
+        defer store.close(testing.allocator);
+        // Everything acknowledged is there, then possibly the one write
+        // that was in the log when the crash came, then nothing.
+        const present = try expectAfterSimulatedCrash(&store, acknowledged);
+        try testing.expect(present <= acknowledged + 1);
     }
 }

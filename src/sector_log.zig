@@ -81,6 +81,11 @@ const BlockingType = @import("storage_blocking.zig").BlockingType;
 /// The unit the log is written in.
 pub const sector_size = constants.sector_size;
 
+/// How long one turn of the event loop may block while a blocking append
+/// waits for its record to be durable. The loop returns as soon as any
+/// operation ends.
+const blocking_wait_ns = 100 * std.time.ns_per_ms;
+
 pub const file_header_size = @sizeOf(FileHeader);
 pub const record_header_size = @sizeOf(RecordHeader);
 
@@ -260,6 +265,8 @@ pub fn LogType(comptime Storage: type) type {
             last: RecordId,
             /// Set when a write has failed and the file's state is unknown.
             broken: bool,
+            /// Whether an append is in flight.
+            appending: bool,
 
             pub const CreateError = Storage.CreateError || Storage.WriteError ||
                 Storage.SyncError || Storage.SyncDirError;
@@ -337,6 +344,7 @@ pub fn LogType(comptime Storage: type) type {
                     .offset = sector_size,
                     .last = previous,
                     .broken = false,
+                    .appending = false,
                 };
             }
 
@@ -394,10 +402,13 @@ pub fn LogType(comptime Storage: type) type {
                     .offset = end.offset,
                     .last = end.last,
                     .broken = false,
+                    .appending = false,
                 };
             }
 
+            /// No append may be in flight.
             pub fn close(self: *Writer) void {
+                assert(!self.appending);
                 self.storage.closeFile(self.file);
                 self.* = undefined;
             }
@@ -419,22 +430,32 @@ pub fn LogType(comptime Storage: type) type {
                 return self.file_size - self.offset;
             }
 
-            /// Appends one record, gives it the next op, and makes it
-            /// durable. Returns the new record's op and checksum. When this
-            /// returns without an error, the record survives a crash.
+            /// Starts appending one record. The record is given the next op.
+            /// `callback` runs later, from the storage's event loop, when
+            /// the record is durable or the append has failed; the outcome
+            /// is in `request.result`.
             ///
-            /// After any error other than `PayloadTooLarge` and `LogFull`
-            /// the state of the file is unknown, and the writer must not be
-            /// used again.
-            pub fn append(self: *Writer, payload: []const u8) AppendError!RecordId {
+            /// The payload is copied before this returns. `request` is the
+            /// caller's and must not move until the callback has run. Only
+            /// one append may be in flight at a time, and the writer must
+            /// not move while one is.
+            ///
+            /// The caller has checked that the payload fits: it is no
+            /// longer than `payloadSizeLimit`, and `hasRoomFor` it is true.
+            ///
+            /// After an error the state of the file is unknown, and the
+            /// writer must not be used again.
+            pub fn appendStart(
+                self: *Writer,
+                request: *Append,
+                callback: *const fn (request: *Append) void,
+                payload: []const u8,
+            ) void {
                 assert(!self.broken);
+                assert(!self.appending);
                 assert(self.last.op < std.math.maxInt(u64));
-                if (payload.len > self.payloadSizeLimit()) {
-                    return error.PayloadTooLarge;
-                }
-                if (!self.hasRoomFor(payload.len)) {
-                    return error.LogFull;
-                }
+                assert(payload.len <= self.payloadSizeLimit());
+                assert(self.hasRoomFor(payload.len));
 
                 var header: RecordHeader = .{
                     .header_checksum = 0,
@@ -454,15 +475,83 @@ pub fn LogType(comptime Storage: type) type {
                 @memcpy(record[record_header_size..payload_end], payload);
                 @memset(record[payload_end..], 0);
 
-                // From here on, a failure leaves the file in an unknown
-                // state.
-                errdefer self.broken = true;
-                try Blocking.writeAll(self.storage, self.file, record, self.offset, .durable);
-
-                self.offset += record_size;
-                self.last = .{ .op = header.op, .checksum = header.header_checksum };
-                return self.last;
+                request.* = .{
+                    .writer = self,
+                    .callback = callback,
+                    .record_size = record_size,
+                    .id = .{ .op = header.op, .checksum = header.header_checksum },
+                };
+                self.appending = true;
+                self.storage.write(&request.operation, onAppendWritten, self.file, record, self.offset, .durable);
             }
+
+            fn onAppendWritten(operation: *Storage.Write) void {
+                const request: *Append = @fieldParentPtr("operation", operation);
+                const self = request.writer;
+                assert(self.appending);
+                self.appending = false;
+
+                if (operation.result) |_| {
+                    self.offset += request.record_size;
+                    self.last = request.id;
+                    request.result = request.id;
+                } else |err| {
+                    // The file's state is unknown from here on.
+                    self.broken = true;
+                    request.result = err;
+                }
+                request.callback(request);
+            }
+
+            /// Appends one record, gives it the next op, and makes it
+            /// durable, blocking until that is done. Returns the new
+            /// record's op and checksum. When this returns without an
+            /// error, the record survives a crash.
+            ///
+            /// After any error other than `PayloadTooLarge` and `LogFull`
+            /// the state of the file is unknown, and the writer must not be
+            /// used again.
+            pub fn append(self: *Writer, payload: []const u8) AppendError!RecordId {
+                assert(!self.broken);
+                if (payload.len > self.payloadSizeLimit()) {
+                    return error.PayloadTooLarge;
+                }
+                if (!self.hasRoomFor(payload.len)) {
+                    return error.LogFull;
+                }
+
+                var state: BlockingAppend = .{};
+                self.appendStart(&state.request, BlockingAppend.onDone, payload);
+                while (!state.done) {
+                    self.storage.wait(blocking_wait_ns);
+                }
+                return state.request.result;
+            }
+
+            const BlockingAppend = struct {
+                request: Append = .{},
+                done: bool = false,
+
+                fn onDone(request: *Append) void {
+                    const state: *BlockingAppend = @fieldParentPtr("request", request);
+                    state.done = true;
+                }
+            };
+        };
+
+        /// One append, from `Writer.appendStart` until its callback runs.
+        /// Create one with `.{}`.
+        pub const Append = struct {
+            operation: Storage.Write = .{},
+            writer: *Writer = undefined,
+            callback: *const fn (request: *Append) void = undefined,
+            /// How many bytes of the file the record takes.
+            record_size: usize = undefined,
+            /// The op and checksum the record will have.
+            id: RecordId = undefined,
+
+            /// Set when the callback runs: the record's op and checksum.
+            result: Storage.WriteError!RecordId = undefined,
         };
 
         /// Reads the records of a log file in the order they were appended.
