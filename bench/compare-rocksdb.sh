@@ -39,6 +39,9 @@
 #   - bean is single-threaded. Its rows with more than one thread run the
 #     threads one at a time behind the benchmark's own lock, so they measure
 #     that lock as much as the store. The one-thread rows are the store.
+#   - readwhilewritingloop is bean only. It is the lookups of
+#     readwhilewriting on one thread that also keeps one write in flight,
+#     through the store's event loop, with no lock and no second thread.
 #
 # What this cannot show until bean compacts: a store larger than memory, and
 # a store that has been overwritten long enough to reach a steady state. bean
@@ -60,6 +63,11 @@
 #   WRITE_LOAD     keys loaded before the writes are measured  (500000)
 #   READ_LOAD      keys loaded before the reads are measured   (1000000)
 #   ROCKS_CACHE    bytes in RocksDB's block cache              (536870912)
+#   ROCKS_LOG      how RocksDB writes its log  ("--use_fsync=0 --recycle_log_file_num=4")
+#                  The default is its best for a durable write: old log
+#                  files are used again, so that an append overwrites space
+#                  that already holds data, and the sync is a data sync.
+#                  "--use_fsync=1" is a full sync on a log that grows.
 
 set -euo pipefail
 
@@ -78,6 +86,7 @@ READ_THREADS=${READ_THREADS:-"1 16"}
 WRITE_LOAD=${WRITE_LOAD:-500000}
 READ_LOAD=${READ_LOAD:-1000000}
 ROCKS_CACHE=${ROCKS_CACHE:-536870912}
+ROCKS_LOG=${ROCKS_LOG:-"--use_fsync=0 --recycle_log_file_num=4"}
 
 KEY_SIZE=16
 VALUE_SIZE=100
@@ -97,7 +106,7 @@ BEAN_WRITES_CAP=$((400000 * DURATION))
 BEAN_READS_CAP=$((1000000 * DURATION))
 
 export BEAN_BENCH DB_BENCH WORK_DIR OUT_DIR RUNS DURATION MEMORY_MAX
-export WRITE_THREADS READ_THREADS WRITE_LOAD READ_LOAD ROCKS_CACHE
+export WRITE_THREADS READ_THREADS WRITE_LOAD READ_LOAD ROCKS_CACHE ROCKS_LOG
 
 # ---------------------------------------------------------------------------
 # Running one store's program
@@ -107,7 +116,7 @@ export WRITE_THREADS READ_THREADS WRITE_LOAD READ_LOAD ROCKS_CACHE
 run_rocksdb() {
     "$DB_BENCH" --db="$db" --num="$num" \
         --key_size=$KEY_SIZE --value_size=$VALUE_SIZE --seed="$seed" \
-        --sync=1 --use_fsync=1 --compression_type=none \
+        --sync=1 $ROCKS_LOG --compression_type=none \
         --bloom_bits=10 --cache_size="$ROCKS_CACHE" --max_background_jobs=8 \
         "$@"
 }
@@ -250,13 +259,13 @@ measure() {
 # Prints result lines from standard input as a table row each.
 print_rows() {
     awk -F '\t' '{
-        printf "    %-17s %3s  %-8s %10s %9s %9s %10s %10s %8s %8s %s\n",
+        printf "    %-20s %3s  %-8s %10s %9s %9s %10s %10s %8s %8s %s\n",
             $2, $3, $4, $6, $7, $8, $9, $10, $11, $12, $13
     }'
 }
 
 print_heading() {
-    printf "    %-17s %3s  %-8s %10s %9s %9s %10s %10s %8s %8s\n" \
+    printf "    %-20s %3s  %-8s %10s %9s %9s %10s %10s %8s %8s\n" \
         workload thr store ops/sec "p50 us" "p99 us" "p99.9 us" "max us" ops/sync "cpu us/op"
 }
 
@@ -319,6 +328,12 @@ scenario_reads() {
         reads=$((BEAN_READS_CAP / threads))
         measure readwhilewriting "$threads" --reads=$reads
     done
+    # The same lookups with one write in flight the whole time, from one
+    # thread running the store's event loop. db_bench has nothing like it.
+    if [ "$engine" = bean ]; then
+        load_for_reads
+        measure readwhilewritingloop 1 --reads=$BEAN_READS_CAP
+    fi
 }
 
 # Runs one scenario for one store. This is what runs under the memory limit.
@@ -426,7 +441,7 @@ main() {
         echo "  each step    $DURATION seconds"
         echo "  entries      $KEY_SIZE-byte keys, $VALUE_SIZE-byte values"
         echo "  rocksdb      $("$DB_BENCH" --version 2>/dev/null | head -n 1)"
-        echo "               sync=1 use_fsync=1 no compression, bloom_bits=10,"
+        echo "               sync=1 $ROCKS_LOG no compression, bloom_bits=10,"
         echo "               cache_size=$ROCKS_CACHE, max_background_jobs=8"
         echo "  bean         $(cd "$HERE/.." && git describe --always --dirty 2>/dev/null || echo '?') (the source tree; $BEAN_BENCH is not checked against it)"
 
@@ -454,6 +469,8 @@ main() {
         echo "  - cpu us/op is the whole process, all threads, less a process that only opens the store."
         echo "  - bean's rows with more than one thread run behind the benchmark's lock, one"
         echo "    thread at a time; the one-thread rows are the store."
+        echo "  - readwhilewritingloop is bean only: lookups on one thread that also keeps"
+        echo "    one write in flight, through the store's event loop."
         echo
         echo "raw output: $OUT_DIR/raw"
     } 2>&1 | tee "$OUT_DIR/results.txt"
