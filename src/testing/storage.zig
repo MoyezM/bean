@@ -434,6 +434,18 @@ pub const Storage = struct {
         }
     }
 
+    /// Overwrites part of a file, in both copies, as if it had always
+    /// held these bytes. The file must already be that long.
+    pub fn setBytes(self: *Storage, name: []const u8, offset: u64, bytes: []const u8) void {
+        const index = self.findListed(name).?;
+        const file = &self.files[index];
+        const start: usize = @intCast(offset);
+        @memcpy(file.visible[start..][0..bytes.len], bytes);
+        @memcpy(file.durable[start..][0..bytes.len], bytes);
+        file.visible_version += 1;
+        file.durable_version = file.visible_version;
+    }
+
     /// What a read of the whole file would return.
     pub fn contents(self: *Storage, name: []const u8) []const u8 {
         const index = self.findListed(name).?;

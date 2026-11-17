@@ -3,6 +3,7 @@ pub const constants = @import("constants.zig");
 pub const MemTable = @import("memtable.zig").MemTable;
 pub const kv = @import("kv.zig");
 pub const manifest = @import("manifest.zig");
+pub const sector_log = @import("sector_log.zig");
 pub const sstable = @import("sstable.zig");
 pub const storage = @import("storage.zig");
 pub const wal = @import("wal.zig");
@@ -16,6 +17,7 @@ test {
     _ = @import("kv.zig");
     _ = @import("manifest.zig");
     _ = @import("memtable.zig");
+    _ = @import("sector_log.zig");
     _ = @import("sstable.zig");
     _ = @import("storage.zig");
     _ = @import("wal.zig");
