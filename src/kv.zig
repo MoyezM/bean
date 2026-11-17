@@ -79,6 +79,10 @@ const wal = @import("wal.zig");
 
 /// The store's write-ahead logs, on the real disk.
 const Log = sector_log.LogType(Storage);
+
+/// The writer and the reader of the store's table files.
+const TableWriter = sstable.WriterType(Storage);
+const TableReader = sstable.ReaderType(Storage);
 const write_batch = @import("write_batch.zig");
 const WriteBatch = write_batch.WriteBatch;
 
@@ -237,7 +241,7 @@ pub const Store = struct {
         in_use: bool,
         /// Only meaningful while the slot is in use.
         file_number: u64,
-        reader: sstable.Reader,
+        reader: TableReader,
     };
 
     /// How far a flush has got.
@@ -274,7 +278,7 @@ pub const Store = struct {
         /// table's index in that slot's part of `index_storage`.
         slot_index: usize,
         /// Open while the stage is `writing`.
-        writer: sstable.Writer,
+        writer: TableWriter,
         cursor: MemTable.Iterator,
         /// The entry to write next, or `null` once every entry is written.
         entry_next: ?MemTable.Entry,
@@ -286,7 +290,7 @@ pub const Store = struct {
         sequence_min: u64,
         sequence_max: u64,
         /// Set once the stage is past `writing`.
-        summary: sstable.Writer.Summary,
+        summary: TableWriter.Summary,
     };
 
     /// What a flush can report.
@@ -358,7 +362,7 @@ pub const Store = struct {
 
     /// What a read can report: a table's data block is damaged, or cannot
     /// be read.
-    pub const ReadError = sstable.Reader.ReadError;
+    pub const ReadError = TableReader.ReadError;
 
     /// What `get` can report.
     pub const GetError = error{
@@ -435,7 +439,7 @@ pub const Store = struct {
 
         const SourceCursor = union(enum) {
             memtable: MemTable.Iterator,
-            table: sstable.Reader.Iterator,
+            table: TableReader.Iterator,
         };
 
         /// One entry of one source. A `null` value is a tombstone.
@@ -1118,7 +1122,7 @@ pub const Store = struct {
         var name_buffer: [manifest.file_name_size_max]u8 = undefined;
         const table_name = manifest.fileName(&name_buffer, .table, table_number);
 
-        const writer = try sstable.Writer.create(self.io, self.dir, table_name, .{}, .{
+        const writer = try TableWriter.create(self.storage, table_name, .{}, .{
             .block = self.flush_block_buffer,
             .index = self.slotIndexBuffer(slot_index),
         });
@@ -1255,7 +1259,7 @@ pub const Store = struct {
         var name_buffer: [manifest.file_name_size_max]u8 = undefined;
         const table_name = manifest.fileName(&name_buffer, .table, flushing.table_number);
         const index_buffer = self.slotIndexBuffer(flushing.slot_index);
-        var reader = sstable.Reader.open(self.io, self.dir, table_name, index_buffer) catch |err| switch (err) {
+        var reader = TableReader.open(self.storage, table_name, index_buffer) catch |err| switch (err) {
             // The file was written a moment ago by this code.
             error.UnsupportedVersion => return error.Corrupt,
             error.IndexTooLarge => return error.Corrupt,
@@ -1700,7 +1704,7 @@ pub const Store = struct {
             var name_buffer: [manifest.file_name_size_max]u8 = undefined;
             const name = manifest.fileName(&name_buffer, .table, table.file_number);
             const index_buffer = self.slotIndexBuffer(slot_index);
-            var reader = sstable.Reader.open(self.io, self.dir, name, index_buffer) catch |err| switch (err) {
+            var reader = TableReader.open(self.storage, name, index_buffer) catch |err| switch (err) {
                 // The manifest only names a table once the file is durable.
                 error.FileNotFound => return error.Corrupt,
                 else => |other| return other,
@@ -1876,6 +1880,7 @@ fn applyBatch(memtable: *MemTable, valid_bytes: []const u8, sequence_first: u64)
 }
 
 const testing = std.testing;
+const RealStorage = @import("testing/real_storage.zig").RealStorage;
 
 /// The size of each memtable in the tests that need a memtable to fill
 /// after a few dozen writes.
@@ -2861,7 +2866,10 @@ fn replaceTable(dir: Io.Dir, key_a: []const u8, value_a: []const u8, key_b: []co
     const index_buffer = try testing.allocator.alloc(u8, sstable.indexSizeMax(2, key_size_max));
     defer testing.allocator.free(index_buffer);
 
-    var writer: sstable.Writer = try .create(testing.io, dir, "000003.sst", .{}, .{
+    var real: RealStorage = undefined;
+    try real.init(dir);
+    defer real.deinit();
+    var writer: TableWriter = try .create(&real.storage, "000003.sst", .{}, .{
         .block = block_buffer,
         .index = index_buffer,
     });
@@ -3354,8 +3362,8 @@ test "a flush that fails partway breaks the store, keeps it readable, and is red
         // Swap the table's file for a read-only handle, so that writing the
         // first data block fails.
         const read_only = try tmp.dir.openFile(testing.io, "000003.sst", .{ .mode = .read_only });
-        store.flushing.?.writer.file.close(testing.io);
-        store.flushing.?.writer.file = read_only;
+        store.flushing.?.writer.file.handle.close(testing.io);
+        store.flushing.?.writer.file.handle = read_only;
 
         try testing.expectError(error.NotOpenForWriting, store.flush());
         try testing.expectEqual(Store.FlushStage.failed, store.flushing.?.stage);
@@ -3854,11 +3862,13 @@ test "a table with a block longer than the store's buffers is reported" {
 
     var key_buffer: [8]u8 = undefined;
     var value_buffer: [test_value_size]u8 = undefined;
-    var summary: sstable.Writer.Summary = undefined;
+    var summary: TableWriter.Summary = undefined;
     {
-        var writer: sstable.Writer = try .create(
-            testing.io,
-            tmp.dir,
+        var real: RealStorage = undefined;
+        try real.init(tmp.dir);
+        defer real.deinit();
+        var writer: TableWriter = try .create(
+            &real.storage,
             "000002.sst",
             .{ .block_size = block_size_large },
             .{ .block = block_buffer, .index = index_buffer },

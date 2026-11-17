@@ -6,6 +6,7 @@
 //! have their callbacks run too.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 /// How long one turn of the event loop may block while a call waits for
 /// its operation. The loop returns as soon as any operation ends, so this
@@ -32,6 +33,10 @@ pub fn BlockingType(comptime Storage: type) type {
             buffer: []u8,
             offset: u64,
         ) Storage.ReadError!usize {
+            if (buffer.len == 0) {
+                // Nothing to read. An operation must transfer something.
+                return 0;
+            }
             var state: ReadState = .{};
             storage.read(&state.operation, ReadState.onDone, file, buffer, offset);
             while (!state.done) {
@@ -58,6 +63,9 @@ pub fn BlockingType(comptime Storage: type) type {
             offset: u64,
             durability: Storage.Durability,
         ) Storage.WriteError!void {
+            // An operation must transfer something. Nothing in the store
+            // writes an empty buffer.
+            assert(buffer.len > 0);
             var state: WriteState = .{};
             storage.write(&state.operation, WriteState.onDone, file, buffer, offset, durability);
             while (!state.done) {

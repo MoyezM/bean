@@ -89,7 +89,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 const constants = @import("constants.zig");
 const crc32c = @import("checksum.zig").crc32c;
-const durable = @import("durable.zig");
+const BlockingType = @import("storage_blocking.zig").BlockingType;
 
 /// The longest key a table stores. A longer key is a bug in the caller.
 pub const key_size_max = constants.key_size_max;
@@ -692,528 +692,537 @@ const BlockBuilder = struct {
 
 /// Writes a table file. Entries are added in key order, then `finish` writes
 /// the index block and the footer.
-pub const Writer = struct {
-    io: Io,
-    file: Io.File,
-    block_size: u32,
-    /// The data block being filled.
-    data: BlockBuilder,
-    /// The index block: one entry for every data block written so far.
-    index: BlockBuilder,
-    /// The key of the entry added last. It points into the buffer of `data`.
-    /// Only meaningful once an entry has been added.
-    last_key: []const u8,
-    /// The sequence number of the entry added last. Only meaningful once an
-    /// entry has been added.
-    last_sequence: u64,
-    /// Where in the file the next block will be written.
-    offset: u64,
-    /// How many entries have been added.
-    entry_count: u64,
-    /// The length of the longest data block written.
-    block_len_max: u32,
-    /// Set once `finish` has completed the table.
-    finished: bool,
-    /// Set when a write or sync has failed and the file's state is unknown.
-    broken: bool,
+pub fn WriterType(comptime Storage: type) type {
+    return struct {
+        const Writer = @This();
+        const Blocking = BlockingType(Storage);
 
-    /// Memory the writer works in. The caller owns both buffers, and they
-    /// must stay valid until the writer is closed.
-    pub const Buffers = struct {
-        /// Holds the data block being filled. It must be at least
-        /// `Options.block_size` long, and it bounds the largest entry that
-        /// can be added; see `blockSizeMax`.
-        block: []u8,
-        /// Holds the index, which gets one entry for each data block
-        /// written. It bounds how large the table can grow; see
-        /// `indexSizeMax`.
-        index: []u8,
-    };
-
-    /// What `finish` reports about the table it completed. The layer above
-    /// records `file_size` and `checksum`, and compares them with
-    /// `Reader.fileSize` and `Reader.checksum` when it opens the file, to
-    /// tell that it is the file that was written.
-    pub const Summary = struct {
-        /// For the caller's information. It is not stored in the file.
+        storage: *Storage,
+        file: Storage.File,
+        block_size: u32,
+        /// The data block being filled.
+        data: BlockBuilder,
+        /// The index block: one entry for every data block written so far.
+        index: BlockBuilder,
+        /// The key of the entry added last. It points into the buffer of `data`.
+        /// Only meaningful once an entry has been added.
+        last_key: []const u8,
+        /// The sequence number of the entry added last. Only meaningful once an
+        /// entry has been added.
+        last_sequence: u64,
+        /// Where in the file the next block will be written.
+        offset: u64,
+        /// How many entries have been added.
         entry_count: u64,
-        /// The length of the file in bytes.
-        file_size: u64,
-        /// The footer checksum, which covers the whole table through the
-        /// chain of checksums.
-        checksum: u32,
-    };
+        /// The length of the longest data block written.
+        block_len_max: u32,
+        /// Set once `finish` has completed the table.
+        finished: bool,
+        /// Set when a write or sync has failed and the file's state is unknown.
+        broken: bool,
 
-    pub const CreateError = Io.File.OpenError;
-
-    pub const AddError = error{
-        /// The entry does not fit in `Buffers.block`.
-        EntryTooLarge,
-        /// `Buffers.index` has no room for another data block.
-        TableFull,
-    } || Io.File.WritePositionalError;
-
-    pub const FinishError = Io.File.WritePositionalError || Io.File.SyncError;
-
-    /// Creates the file `name` in `dir`. Fails if the file already exists.
-    pub fn create(
-        io: Io,
-        dir: Io.Dir,
-        name: []const u8,
-        options: Options,
-        buffers: Buffers,
-    ) CreateError!Writer {
-        assert(buffers.block.len >= options.block_size);
-
-        const data: BlockBuilder = .init(buffers.block);
-        const index: BlockBuilder = .init(buffers.index);
-
-        const file = try dir.createFile(io, name, .{ .exclusive = true });
-
-        return .{
-            .io = io,
-            .file = file,
-            .block_size = options.block_size,
-            .data = data,
-            .index = index,
-            .last_key = "",
-            .last_sequence = 0,
-            .offset = 0,
-            .entry_count = 0,
-            .block_len_max = 0,
-            .finished = false,
-            .broken = false,
+        /// Memory the writer works in. The caller owns both buffers, and they
+        /// must stay valid until the writer is closed.
+        pub const Buffers = struct {
+            /// Holds the data block being filled. It must be at least
+            /// `Options.block_size` long, and it bounds the largest entry that
+            /// can be added; see `blockSizeMax`.
+            block: []u8,
+            /// Holds the index, which gets one entry for each data block
+            /// written. It bounds how large the table can grow; see
+            /// `indexSizeMax`.
+            index: []u8,
         };
-    }
 
-    /// Closes the file. If `finish` has not returned without an error, the
-    /// file is not a valid table and the caller should delete it.
-    pub fn close(self: *Writer) void {
-        self.file.close(self.io);
-        self.* = undefined;
-    }
+        /// What `finish` reports about the table it completed. The layer above
+        /// records `file_size` and `checksum`, and compares them with
+        /// `Reader.fileSize` and `Reader.checksum` when it opens the file, to
+        /// tell that it is the file that was written.
+        pub const Summary = struct {
+            /// For the caller's information. It is not stored in the file.
+            entry_count: u64,
+            /// The length of the file in bytes.
+            file_size: u64,
+            /// The footer checksum, which covers the whole table through the
+            /// chain of checksums.
+            checksum: u32,
+        };
 
-    /// Adds one entry. A `null` value adds a tombstone.
-    ///
-    /// Entries are added in the table's order: `key` must be greater than
-    /// the key added before it, or the same key with a smaller `sequence`.
-    /// Adding entries out of order, or the same key and sequence number
-    /// twice, is a bug in the caller.
-    ///
-    /// `EntryTooLarge` and `TableFull` are reported before anything
-    /// is changed, so the caller can still finish the table as it stands.
-    /// After any other error the file's state is unknown, and the writer
-    /// must only be closed.
-    pub fn add(self: *Writer, key: []const u8, value: ?[]const u8, sequence: u64) AddError!void {
-        assert(!self.finished);
-        assert(!self.broken);
+        pub const CreateError = Storage.CreateError;
 
-        var flags: EntryFlags = .tombstone;
-        var value_bytes: []const u8 = "";
-        if (value) |present| {
-            flags = .value;
-            value_bytes = present;
+        pub const AddError = error{
+            /// The entry does not fit in `Buffers.block`.
+            EntryTooLarge,
+            /// `Buffers.index` has no room for another data block.
+            TableFull,
+        } || Storage.WriteError;
+
+        pub const FinishError = Storage.WriteError || Storage.SyncError;
+
+        /// Creates the file `name`. Fails if the file already exists.
+        pub fn create(
+            storage: *Storage,
+            name: []const u8,
+            options: Options,
+            buffers: Buffers,
+        ) CreateError!Writer {
+            assert(buffers.block.len >= options.block_size);
+
+            const data: BlockBuilder = .init(buffers.block);
+            const index: BlockBuilder = .init(buffers.index);
+
+            const file = try storage.createFile(name, .{ .direct = false });
+
+            return .{
+                .storage = storage,
+                .file = file,
+                .block_size = options.block_size,
+                .data = data,
+                .index = index,
+                .last_key = "",
+                .last_sequence = 0,
+                .offset = 0,
+                .entry_count = 0,
+                .block_len_max = 0,
+                .finished = false,
+                .broken = false,
+            };
         }
 
-        assert(key.len <= key_size_max);
-        assert(value_bytes.len <= value_size_max);
-
-        // The entry must fit in a block that holds nothing else.
-        const entry_size = entrySize(key.len, value_bytes.len);
-        const single_entry_block_len = block_header_size + entry_size + slot_size;
-        if (single_entry_block_len > self.data.buffer.len) {
-            return error.EntryTooLarge;
+        /// Closes the file. If `finish` has not returned without an error, the
+        /// file is not a valid table and the caller should delete it.
+        pub fn close(self: *Writer) void {
+            self.storage.closeFile(self.file);
+            self.* = undefined;
         }
 
-        if (self.entry_count > 0) {
-            assert(sortsBefore(self.last_key, self.last_sequence, key, sequence));
+        /// Adds one entry. A `null` value adds a tombstone.
+        ///
+        /// Entries are added in the table's order: `key` must be greater than
+        /// the key added before it, or the same key with a smaller `sequence`.
+        /// Adding entries out of order, or the same key and sequence number
+        /// twice, is a bug in the caller.
+        ///
+        /// `EntryTooLarge` and `TableFull` are reported before anything
+        /// is changed, so the caller can still finish the table as it stands.
+        /// After any other error the file's state is unknown, and the writer
+        /// must only be closed.
+        pub fn add(self: *Writer, key: []const u8, value: ?[]const u8, sequence: u64) AddError!void {
+            assert(!self.finished);
+            assert(!self.broken);
+
+            var flags: EntryFlags = .tombstone;
+            var value_bytes: []const u8 = "";
+            if (value) |present| {
+                flags = .value;
+                value_bytes = present;
+            }
+
+            assert(key.len <= key_size_max);
+            assert(value_bytes.len <= value_size_max);
+
+            // The entry must fit in a block that holds nothing else.
+            const entry_size = entrySize(key.len, value_bytes.len);
+            const single_entry_block_len = block_header_size + entry_size + slot_size;
+            if (single_entry_block_len > self.data.buffer.len) {
+                return error.EntryTooLarge;
+            }
+
+            if (self.entry_count > 0) {
+                assert(sortsBefore(self.last_key, self.last_sequence, key, sequence));
+            }
+
+            // The current block is closed first if this entry and its slot would
+            // take it past the block size. An empty block takes the entry however
+            // large it is.
+            const block_has_entries = self.data.entry_count > 0;
+            const block_len_with_entry = self.data.blockLen() + entry_size + slot_size;
+            const closes_block = block_has_entries and block_len_with_entry > self.block_size;
+
+            // The block this entry goes into will end with `key` until another
+            // entry is added, so the index must have room for an entry with that
+            // key. If the current block is closed first, the index also takes an
+            // entry for it.
+            var index_bytes_needed = indexEntrySize(key.len);
+            if (closes_block) {
+                index_bytes_needed += indexEntrySize(self.last_key.len);
+            }
+            if (index_bytes_needed > self.index.bytesFree()) {
+                return error.TableFull;
+            }
+
+            if (closes_block) {
+                // A failure here leaves the file in an unknown state.
+                errdefer self.broken = true;
+                try self.writeDataBlock();
+            }
+            self.last_key = self.data.add(flags, key, value_bytes, sequence);
+            self.last_sequence = sequence;
+            self.entry_count += 1;
         }
 
-        // The current block is closed first if this entry and its slot would
-        // take it past the block size. An empty block takes the entry however
-        // large it is.
-        const block_has_entries = self.data.entry_count > 0;
-        const block_len_with_entry = self.data.blockLen() + entry_size + slot_size;
-        const closes_block = block_has_entries and block_len_with_entry > self.block_size;
-
-        // The block this entry goes into will end with `key` until another
-        // entry is added, so the index must have room for an entry with that
-        // key. If the current block is closed first, the index also takes an
-        // entry for it.
-        var index_bytes_needed = indexEntrySize(key.len);
-        if (closes_block) {
-            index_bytes_needed += indexEntrySize(self.last_key.len);
-        }
-        if (index_bytes_needed > self.index.bytesFree()) {
-            return error.TableFull;
-        }
-
-        if (closes_block) {
-            // A failure here leaves the file in an unknown state.
+        /// Writes everything that is still buffered and syncs the file. When
+        /// this returns without an error, the table is complete and durable.
+        /// Nothing may be added afterwards.
+        ///
+        /// The file's name is not durable until the caller syncs `dir`.
+        ///
+        /// After an error the file's state is unknown, and the writer must only
+        /// be closed.
+        pub fn finish(self: *Writer) FinishError!Summary {
+            assert(!self.finished);
+            assert(!self.broken);
             errdefer self.broken = true;
-            try self.writeDataBlock();
+
+            if (self.data.entry_count > 0) {
+                try self.writeDataBlock();
+            }
+
+            const index = self.index.finish(.index);
+            try Blocking.writeAll(self.storage, self.file, index.bytes, self.offset, .unsynced);
+
+            const index_location: BlockLocation = .{
+                .offset = self.offset,
+                .len = @intCast(index.bytes.len),
+                .header_checksum = index.header_checksum,
+            };
+            const footer: Footer = .init(index_location, self.block_len_max);
+            const footer_offset = self.offset + index.bytes.len;
+            try Blocking.writeAll(self.storage, self.file, footer.toBytes(), footer_offset, .unsynced);
+
+            try Blocking.syncFile(self.storage, self.file);
+
+            self.finished = true;
+            return .{
+                .entry_count = self.entry_count,
+                .file_size = footer_offset + footer_size,
+                .checksum = footer.checksum,
+            };
         }
-        self.last_key = self.data.add(flags, key, value_bytes, sequence);
-        self.last_sequence = sequence;
-        self.entry_count += 1;
-    }
 
-    /// Writes everything that is still buffered and syncs the file. When
-    /// this returns without an error, the table is complete and durable.
-    /// Nothing may be added afterwards.
-    ///
-    /// The file's name is not durable until the caller syncs `dir`.
-    ///
-    /// After an error the file's state is unknown, and the writer must only
-    /// be closed.
-    pub fn finish(self: *Writer) FinishError!Summary {
-        assert(!self.finished);
-        assert(!self.broken);
-        errdefer self.broken = true;
+        /// Writes the data block being filled to the file, adds an entry for it
+        /// to the index, and starts a new, empty block.
+        fn writeDataBlock(self: *Writer) Storage.WriteError!void {
+            assert(self.data.entry_count > 0);
 
-        if (self.data.entry_count > 0) {
-            try self.writeDataBlock();
+            const block = self.data.finish(.data);
+            try Blocking.writeAll(self.storage, self.file, block.bytes, self.offset, .unsynced);
+
+            const location: BlockLocation = .{
+                .offset = self.offset,
+                .len = @intCast(block.bytes.len),
+                .header_checksum = block.header_checksum,
+            };
+
+            // The entry added last is the last entry of this block. `add` has
+            // already made sure the index has room for it.
+            _ = self.index.add(.value, self.last_key, location.toBytes(), self.last_sequence);
+
+            self.offset += block.bytes.len;
+            self.block_len_max = @max(self.block_len_max, location.len);
+            self.data.reset();
         }
-
-        const index = self.index.finish(.index);
-        try self.file.writePositionalAll(self.io, index.bytes, self.offset);
-
-        const index_location: BlockLocation = .{
-            .offset = self.offset,
-            .len = @intCast(index.bytes.len),
-            .header_checksum = index.header_checksum,
-        };
-        const footer: Footer = .init(index_location, self.block_len_max);
-        const footer_offset = self.offset + index.bytes.len;
-        try self.file.writePositionalAll(self.io, footer.toBytes(), footer_offset);
-
-        try durable.sync(self.io, self.file);
-
-        self.finished = true;
-        return .{
-            .entry_count = self.entry_count,
-            .file_size = footer_offset + footer_size,
-            .checksum = footer.checksum,
-        };
-    }
-
-    /// Writes the data block being filled to the file, adds an entry for it
-    /// to the index, and starts a new, empty block.
-    fn writeDataBlock(self: *Writer) Io.File.WritePositionalError!void {
-        assert(self.data.entry_count > 0);
-
-        const block = self.data.finish(.data);
-        try self.file.writePositionalAll(self.io, block.bytes, self.offset);
-
-        const location: BlockLocation = .{
-            .offset = self.offset,
-            .len = @intCast(block.bytes.len),
-            .header_checksum = block.header_checksum,
-        };
-
-        // The entry added last is the last entry of this block. `add` has
-        // already made sure the index has room for it.
-        _ = self.index.add(.value, self.last_key, location.toBytes(), self.last_sequence);
-
-        self.offset += block.bytes.len;
-        self.block_len_max = @max(self.block_len_max, location.len);
-        self.data.reset();
-    }
-};
+    };
+}
 
 /// Reads a table file. The index block is held in memory for as long as the
 /// reader is open; data blocks are read from the file when they are needed.
-pub const Reader = struct {
-    io: Io,
-    file: Io.File,
-    /// The index block, checked. Points into the buffer given to `open`.
-    index: Block,
-    /// The length of the longest data block, or zero if there are none.
-    block_len_max: u32,
-    /// The length of the file in bytes.
-    file_size: u64,
-    /// The footer checksum, which covers the whole table through the chain
-    /// of checksums.
-    footer_checksum: u32,
+pub fn ReaderType(comptime Storage: type) type {
+    return struct {
+        const Reader = @This();
+        const Blocking = BlockingType(Storage);
 
-    pub const OpenError = error{
-        /// The file is not a table, or it is damaged.
-        Corrupt,
-        /// The file is an intact table of a format version this code does
-        /// not read.
-        UnsupportedVersion,
-        /// The table's index does not fit in the buffer given to `open`.
-        IndexTooLarge,
-    } || Io.File.OpenError || Io.File.LengthError || Io.File.ReadPositionalError;
+        storage: *Storage,
+        file: Storage.File,
+        /// The index block, checked. Points into the buffer given to `open`.
+        index: Block,
+        /// The length of the longest data block, or zero if there are none.
+        block_len_max: u32,
+        /// The length of the file in bytes.
+        file_size: u64,
+        /// The footer checksum, which covers the whole table through the chain
+        /// of checksums.
+        footer_checksum: u32,
 
-    pub const ReadError = error{
-        /// A data block is damaged.
-        Corrupt,
-    } || Io.File.ReadPositionalError;
+        pub const OpenError = error{
+            /// The file is not a table, or it is damaged.
+            Corrupt,
+            /// The file is an intact table of a format version this code does
+            /// not read.
+            UnsupportedVersion,
+            /// The table's index does not fit in the buffer given to `open`.
+            IndexTooLarge,
+        } || Storage.OpenError || Storage.SizeError || Storage.ReadError;
 
-    /// A forward-only cursor over every entry of a table, in the table's
-    /// order: by key, and for one key from the newest entry to the oldest.
-    /// Tombstones are included.
-    pub const Iterator = struct {
-        reader: *const Reader,
-        /// Holds the current data block.
-        buffer: []u8,
-        /// The data block to read once the current one is used up.
-        block_next: usize,
-        /// The current data block. Empty until a block is read.
-        block: Block,
-        /// The entry of the current block that `next` returns next.
-        entry_next: usize,
+        pub const ReadError = error{
+            /// A data block is damaged.
+            Corrupt,
+        } || Storage.ReadError;
 
-        /// Positions the cursor at the first entry. Nothing is read from the
-        /// file until `next` is called.
-        pub fn seekToFirst(self: *Iterator) void {
-            self.block_next = 0;
-            self.block = .empty;
-            self.entry_next = 0;
-        }
+        /// A forward-only cursor over every entry of a table, in the table's
+        /// order: by key, and for one key from the newest entry to the oldest.
+        /// Tombstones are included.
+        pub const Iterator = struct {
+            reader: *const Reader,
+            /// Holds the current data block.
+            buffer: []u8,
+            /// The data block to read once the current one is used up.
+            block_next: usize,
+            /// The current data block. Empty until a block is read.
+            block: Block,
+            /// The entry of the current block that `next` returns next.
+            entry_next: usize,
 
-        /// Positions the cursor at the first entry whose key is >= `key`.
-        /// If this fails, the cursor is left at the end of the table.
-        pub fn seek(self: *Iterator, key: []const u8) ReadError!void {
-            // The cursor goes to the end first. It stays there if every key
-            // is smaller than `key`, or if anything below fails.
-            self.block_next = self.reader.blockCount();
-            self.block = .empty;
-            self.entry_next = 0;
-
-            const found = try self.reader.findBlock(key);
-            if (found == null) {
-                return;
+            /// Positions the cursor at the first entry. Nothing is read from the
+            /// file until `next` is called.
+            pub fn seekToFirst(self: *Iterator) void {
+                self.block_next = 0;
+                self.block = .empty;
+                self.entry_next = 0;
             }
-            const block_index = found.?;
-            const block = try self.reader.readBlock(block_index, self.buffer);
-            const entry_index = try lowerBoundInFoundBlock(block, key);
 
-            self.block = block;
-            self.block_next = block_index + 1;
-            self.entry_next = entry_index;
-        }
+            /// Positions the cursor at the first entry whose key is >= `key`.
+            /// If this fails, the cursor is left at the end of the table.
+            pub fn seek(self: *Iterator, key: []const u8) ReadError!void {
+                // The cursor goes to the end first. It stays there if every key
+                // is smaller than `key`, or if anything below fails.
+                self.block_next = self.reader.blockCount();
+                self.block = .empty;
+                self.entry_next = 0;
 
-        /// Returns the entry at the cursor and advances past it, or returns
-        /// `null` at the end of the table. The entry is valid until the next
-        /// call on this iterator. If this fails, the cursor does not move.
-        pub fn next(self: *Iterator) ReadError!?Entry {
-            if (self.entry_next == self.block.entry_count) {
-                if (self.block_next == self.reader.blockCount()) {
-                    return null;
+                const found = try self.reader.findBlock(key);
+                if (found == null) {
+                    return;
                 }
-                try self.readBlock(self.block_next);
+                const block_index = found.?;
+                const block = try self.reader.readBlock(block_index, self.buffer);
+                const entry_index = try lowerBoundInFoundBlock(block, key);
+
+                self.block = block;
+                self.block_next = block_index + 1;
+                self.entry_next = entry_index;
             }
 
-            const entry = try blockEntry(self.block, self.entry_next);
-            self.entry_next += 1;
+            /// Returns the entry at the cursor and advances past it, or returns
+            /// `null` at the end of the table. The entry is valid until the next
+            /// call on this iterator. If this fails, the cursor does not move.
+            pub fn next(self: *Iterator) ReadError!?Entry {
+                if (self.entry_next == self.block.entry_count) {
+                    if (self.block_next == self.reader.blockCount()) {
+                        return null;
+                    }
+                    try self.readBlock(self.block_next);
+                }
 
-            if (entry.flags == .tombstone) {
-                return .{ .key = entry.key, .value = null, .sequence = entry.sequence };
+                const entry = try blockEntry(self.block, self.entry_next);
+                self.entry_next += 1;
+
+                if (entry.flags == .tombstone) {
+                    return .{ .key = entry.key, .value = null, .sequence = entry.sequence };
+                }
+                return .{ .key = entry.key, .value = entry.value, .sequence = entry.sequence };
             }
-            return .{ .key = entry.key, .value = entry.value, .sequence = entry.sequence };
-        }
 
-        /// Reads one data block and puts the cursor at its first entry.
-        fn readBlock(self: *Iterator, block_index: usize) ReadError!void {
-            // If the read fails, the cursor is left with no current block.
-            self.block = .empty;
-            self.entry_next = 0;
+            /// Reads one data block and puts the cursor at its first entry.
+            fn readBlock(self: *Iterator, block_index: usize) ReadError!void {
+                // If the read fails, the cursor is left with no current block.
+                self.block = .empty;
+                self.entry_next = 0;
 
-            self.block = try self.reader.readBlock(block_index, self.buffer);
-            self.block_next = block_index + 1;
-        }
-    };
-
-    /// Opens the table `name` in `dir`, checks its footer and index block,
-    /// and loads the index into `index_buffer`. Data blocks are not read
-    /// here. Each one is checked when `get` or an iterator reads it, so a
-    /// successful open does not show that every data block is intact.
-    ///
-    /// The caller owns `index_buffer`, and it must stay valid until the
-    /// reader is closed. See `indexSizeMax` for how long it has to be.
-    pub fn open(io: Io, dir: Io.Dir, name: []const u8, index_buffer: []u8) OpenError!Reader {
-        const file = try dir.openFile(io, name, .{ .mode = .read_only });
-        errdefer file.close(io);
-
-        const file_len = try file.length(io);
-        if (file_len < footer_size) {
-            return error.Corrupt;
-        }
-        const footer_offset = file_len - footer_size;
-
-        var footer_bytes: [footer_size]u8 = undefined;
-        const footer_read = try file.readPositionalAll(io, &footer_bytes, footer_offset);
-        if (footer_read < footer_size) {
-            return error.Corrupt;
-        }
-        const footer = try Footer.fromBytes(&footer_bytes);
-
-        // The index block must end exactly where the footer starts.
-        if (footer.index.len > footer_offset) {
-            return error.Corrupt;
-        }
-        if (footer.index.offset != footer_offset - footer.index.len) {
-            return error.Corrupt;
-        }
-
-        if (footer.index.len > index_buffer.len) {
-            return error.IndexTooLarge;
-        }
-        const index_bytes = index_buffer[0..footer.index.len];
-        const index_read = try file.readPositionalAll(io, index_bytes, footer.index.offset);
-        if (index_read < index_bytes.len) {
-            return error.Corrupt;
-        }
-        const index = try checkBlock(index_bytes, .index);
-        if (index.header_checksum != footer.index.header_checksum) {
-            return error.Corrupt;
-        }
-        try checkIndexEntries(index, footer);
-
-        return .{
-            .io = io,
-            .file = file,
-            .index = index,
-            .block_len_max = footer.block_len_max,
-            .file_size = file_len,
-            .footer_checksum = footer.checksum,
+                self.block = try self.reader.readBlock(block_index, self.buffer);
+                self.block_next = block_index + 1;
+            }
         };
-    }
 
-    /// Closes the file. No cursor made from this reader may be used
-    /// afterwards.
-    pub fn close(self: *Reader) void {
-        self.file.close(self.io);
-        self.* = undefined;
-    }
+        /// Opens the table `name` in `dir`, checks its footer and index block,
+        /// and loads the index into `index_buffer`. Data blocks are not read
+        /// here. Each one is checked when `get` or an iterator reads it, so a
+        /// successful open does not show that every data block is intact.
+        ///
+        /// The caller owns `index_buffer`, and it must stay valid until the
+        /// reader is closed. See `indexSizeMax` for how long it has to be.
+        pub fn open(storage: *Storage, name: []const u8, index_buffer: []u8) OpenError!Reader {
+            const file = try storage.openFile(name, .read_only, .{ .direct = false });
+            errdefer storage.closeFile(file);
 
-    /// The length of the longest data block in this table, or zero if it has
-    /// none. A buffer passed to `get` or `iterator` must be at least this
-    /// long. The index block is not counted; it is in the buffer given to
-    /// `open`.
-    pub fn blockSizeMax(self: *const Reader) usize {
-        return self.block_len_max;
-    }
-
-    /// The length of the file in bytes. Equal to `Writer.Summary.file_size`
-    /// for the table that was written.
-    pub fn fileSize(self: *const Reader) u64 {
-        return self.file_size;
-    }
-
-    /// The footer checksum. Equal to `Writer.Summary.checksum` for the table
-    /// that was written.
-    pub fn checksum(self: *const Reader) u32 {
-        return self.footer_checksum;
-    }
-
-    /// Looks up the newest entry for `key`, the one with the largest
-    /// sequence number, reading at most one data block from the file into
-    /// `block_buffer`. A returned value points into `block_buffer`.
-    pub fn get(self: *const Reader, key: []const u8, block_buffer: []u8) ReadError!Lookup {
-        assert(block_buffer.len >= self.block_len_max);
-
-        const found = try self.findBlock(key);
-        if (found == null) {
-            return .absent;
-        }
-        const block = try self.readBlock(found.?, block_buffer);
-
-        const entry_index = try lowerBoundInFoundBlock(block, key);
-        const entry = try blockEntry(block, entry_index);
-        if (!std.mem.eql(u8, entry.key, key)) {
-            return .absent;
-        }
-        if (entry.flags == .tombstone) {
-            return .tombstone;
-        }
-        return .{ .value = entry.value };
-    }
-
-    /// Returns a cursor positioned at the first entry. The cursor reads one
-    /// data block at a time into `block_buffer`, which must stay valid for as
-    /// long as the cursor is used. Each cursor needs its own buffer.
-    ///
-    /// The cursor keeps a pointer to this reader, so the reader must not be
-    /// moved or closed while the cursor is in use.
-    pub fn iterator(self: *const Reader, block_buffer: []u8) Iterator {
-        assert(block_buffer.len >= self.block_len_max);
-        return .{
-            .reader = self,
-            .buffer = block_buffer,
-            .block_next = 0,
-            .block = .empty,
-            .entry_next = 0,
-        };
-    }
-
-    /// How many data blocks the table has.
-    fn blockCount(self: *const Reader) usize {
-        return self.index.entry_count;
-    }
-
-    /// Returns the first data block whose last key is >= `key`. That is the
-    /// only block that can hold the newest entry for `key`. Returns `null`
-    /// if `key` is greater than every key in the table.
-    fn findBlock(self: *const Reader, key: []const u8) error{Corrupt}!?usize {
-        const block_index = try blockLowerBound(self.index, key, sequence_newest);
-        if (block_index == self.blockCount()) {
-            return null;
-        }
-        return block_index;
-    }
-
-    /// Reads one data block from the file into `buffer`, in a single read,
-    /// and checks it.
-    fn readBlock(self: *const Reader, block_index: usize, buffer: []u8) ReadError!Block {
-        // `open` has checked that every index entry holds a block location
-        // and that no block is longer than `block_len_max`.
-        assert(buffer.len >= self.block_len_max);
-        const index_entry = try blockEntry(self.index, block_index);
-        const location = BlockLocation.fromBytes(index_entry.value[0..block_location_size]);
-
-        const bytes = buffer[0..location.len];
-        const bytes_read = try self.file.readPositionalAll(self.io, bytes, location.offset);
-        if (bytes_read < bytes.len) {
-            return error.Corrupt;
-        }
-
-        const block = try checkBlock(bytes, .data);
-        if (block.header_checksum != location.header_checksum) {
-            return error.Corrupt;
-        }
-        if (block.entry_count == 0) {
-            return error.Corrupt;
-        }
-
-        // The block's entries must lie in the range the index gives it:
-        // after the last entry of the block before it, and up to the entry
-        // its own index entry names.
-        const first_entry = try blockEntry(block, 0);
-        const last_entry = try blockEntry(block, block.entry_count - 1);
-        if (!std.mem.eql(u8, last_entry.key, index_entry.key)) {
-            return error.Corrupt;
-        }
-        if (last_entry.sequence != index_entry.sequence) {
-            return error.Corrupt;
-        }
-        if (block_index > 0) {
-            const previous_index_entry = try blockEntry(self.index, block_index - 1);
-            const previous_comes_first = sortsBefore(
-                previous_index_entry.key,
-                previous_index_entry.sequence,
-                first_entry.key,
-                first_entry.sequence,
-            );
-            if (!previous_comes_first) {
+            const file_len = try storage.fileSize(file);
+            if (file_len < footer_size) {
                 return error.Corrupt;
             }
+            const footer_offset = file_len - footer_size;
+
+            var footer_bytes: [footer_size]u8 = undefined;
+            const footer_read = try Blocking.readAll(storage, file, &footer_bytes, footer_offset);
+            if (footer_read < footer_size) {
+                return error.Corrupt;
+            }
+            const footer = try Footer.fromBytes(&footer_bytes);
+
+            // The index block must end exactly where the footer starts.
+            if (footer.index.len > footer_offset) {
+                return error.Corrupt;
+            }
+            if (footer.index.offset != footer_offset - footer.index.len) {
+                return error.Corrupt;
+            }
+
+            if (footer.index.len > index_buffer.len) {
+                return error.IndexTooLarge;
+            }
+            const index_bytes = index_buffer[0..footer.index.len];
+            const index_read = try Blocking.readAll(storage, file, index_bytes, footer.index.offset);
+            if (index_read < index_bytes.len) {
+                return error.Corrupt;
+            }
+            const index = try checkBlock(index_bytes, .index);
+            if (index.header_checksum != footer.index.header_checksum) {
+                return error.Corrupt;
+            }
+            try checkIndexEntries(index, footer);
+
+            return .{
+                .storage = storage,
+                .file = file,
+                .index = index,
+                .block_len_max = footer.block_len_max,
+                .file_size = file_len,
+                .footer_checksum = footer.checksum,
+            };
         }
-        return block;
-    }
-};
+
+        /// Closes the file. No cursor made from this reader may be used
+        /// afterwards.
+        pub fn close(self: *Reader) void {
+            self.storage.closeFile(self.file);
+            self.* = undefined;
+        }
+
+        /// The length of the longest data block in this table, or zero if it has
+        /// none. A buffer passed to `get` or `iterator` must be at least this
+        /// long. The index block is not counted; it is in the buffer given to
+        /// `open`.
+        pub fn blockSizeMax(self: *const Reader) usize {
+            return self.block_len_max;
+        }
+
+        /// The length of the file in bytes. Equal to `Writer.Summary.file_size`
+        /// for the table that was written.
+        pub fn fileSize(self: *const Reader) u64 {
+            return self.file_size;
+        }
+
+        /// The footer checksum. Equal to `Writer.Summary.checksum` for the table
+        /// that was written.
+        pub fn checksum(self: *const Reader) u32 {
+            return self.footer_checksum;
+        }
+
+        /// Looks up the newest entry for `key`, the one with the largest
+        /// sequence number, reading at most one data block from the file into
+        /// `block_buffer`. A returned value points into `block_buffer`.
+        pub fn get(self: *const Reader, key: []const u8, block_buffer: []u8) ReadError!Lookup {
+            assert(block_buffer.len >= self.block_len_max);
+
+            const found = try self.findBlock(key);
+            if (found == null) {
+                return .absent;
+            }
+            const block = try self.readBlock(found.?, block_buffer);
+
+            const entry_index = try lowerBoundInFoundBlock(block, key);
+            const entry = try blockEntry(block, entry_index);
+            if (!std.mem.eql(u8, entry.key, key)) {
+                return .absent;
+            }
+            if (entry.flags == .tombstone) {
+                return .tombstone;
+            }
+            return .{ .value = entry.value };
+        }
+
+        /// Returns a cursor positioned at the first entry. The cursor reads one
+        /// data block at a time into `block_buffer`, which must stay valid for as
+        /// long as the cursor is used. Each cursor needs its own buffer.
+        ///
+        /// The cursor keeps a pointer to this reader, so the reader must not be
+        /// moved or closed while the cursor is in use.
+        pub fn iterator(self: *const Reader, block_buffer: []u8) Iterator {
+            assert(block_buffer.len >= self.block_len_max);
+            return .{
+                .reader = self,
+                .buffer = block_buffer,
+                .block_next = 0,
+                .block = .empty,
+                .entry_next = 0,
+            };
+        }
+
+        /// How many data blocks the table has.
+        fn blockCount(self: *const Reader) usize {
+            return self.index.entry_count;
+        }
+
+        /// Returns the first data block whose last key is >= `key`. That is the
+        /// only block that can hold the newest entry for `key`. Returns `null`
+        /// if `key` is greater than every key in the table.
+        fn findBlock(self: *const Reader, key: []const u8) error{Corrupt}!?usize {
+            const block_index = try blockLowerBound(self.index, key, sequence_newest);
+            if (block_index == self.blockCount()) {
+                return null;
+            }
+            return block_index;
+        }
+
+        /// Reads one data block from the file into `buffer`, in a single read,
+        /// and checks it.
+        fn readBlock(self: *const Reader, block_index: usize, buffer: []u8) ReadError!Block {
+            // `open` has checked that every index entry holds a block location
+            // and that no block is longer than `block_len_max`.
+            assert(buffer.len >= self.block_len_max);
+            const index_entry = try blockEntry(self.index, block_index);
+            const location = BlockLocation.fromBytes(index_entry.value[0..block_location_size]);
+
+            const bytes = buffer[0..location.len];
+            const bytes_read = try Blocking.readAll(self.storage, self.file, bytes, location.offset);
+            if (bytes_read < bytes.len) {
+                return error.Corrupt;
+            }
+
+            const block = try checkBlock(bytes, .data);
+            if (block.header_checksum != location.header_checksum) {
+                return error.Corrupt;
+            }
+            if (block.entry_count == 0) {
+                return error.Corrupt;
+            }
+
+            // The block's entries must lie in the range the index gives it:
+            // after the last entry of the block before it, and up to the entry
+            // its own index entry names.
+            const first_entry = try blockEntry(block, 0);
+            const last_entry = try blockEntry(block, block.entry_count - 1);
+            if (!std.mem.eql(u8, last_entry.key, index_entry.key)) {
+                return error.Corrupt;
+            }
+            if (last_entry.sequence != index_entry.sequence) {
+                return error.Corrupt;
+            }
+            if (block_index > 0) {
+                const previous_index_entry = try blockEntry(self.index, block_index - 1);
+                const previous_comes_first = sortsBefore(
+                    previous_index_entry.key,
+                    previous_index_entry.sequence,
+                    first_entry.key,
+                    first_entry.sequence,
+                );
+                if (!previous_comes_first) {
+                    return error.Corrupt;
+                }
+            }
+            return block;
+        }
+    };
+}
 
 /// Checks every entry of the index block. Each must hold a block location,
 /// the data blocks they describe must lie back to back from the start of the
@@ -1261,6 +1270,9 @@ fn checkIndexEntries(index: Block, footer: Footer) error{Corrupt}!void {
 }
 
 const testing = std.testing;
+const RealStorage = @import("testing/real_storage.zig").RealStorage;
+const RealWriter = WriterType(@import("storage.zig").Storage);
+const RealReader = ReaderType(@import("storage.zig").Storage);
 const test_name = "test.sst";
 
 /// An index buffer of this size has room for a table holding `entries`,
@@ -1290,7 +1302,7 @@ fn testBlockSize(options: Options, entries: []const Entry) usize {
 /// Writes a table holding `entries`, replacing the test file if it exists.
 /// The entries must be in the table's order: by key, and for one key from
 /// the largest sequence number to the smallest.
-fn writeTable(dir: Io.Dir, options: Options, entries: []const Entry) !Writer.Summary {
+fn writeTable(dir: Io.Dir, options: Options, entries: []const Entry) !RealWriter.Summary {
     const gpa = testing.allocator;
     const block_buffer = try gpa.alloc(u8, testBlockSize(options, entries));
     defer gpa.free(block_buffer);
@@ -1298,8 +1310,11 @@ fn writeTable(dir: Io.Dir, options: Options, entries: []const Entry) !Writer.Sum
     defer gpa.free(index_buffer);
 
     dir.deleteFile(testing.io, test_name) catch {};
-    const buffers: Writer.Buffers = .{ .block = block_buffer, .index = index_buffer };
-    var writer: Writer = try .create(testing.io, dir, test_name, options, buffers);
+    var real: RealStorage = undefined;
+    try real.init(dir);
+    defer real.deinit();
+    const buffers: RealWriter.Buffers = .{ .block = block_buffer, .index = index_buffer };
+    var writer: RealWriter = try .create(&real.storage, test_name, options, buffers);
     defer writer.close();
 
     for (entries) |entry| {
@@ -1310,7 +1325,10 @@ fn writeTable(dir: Io.Dir, options: Options, entries: []const Entry) !Writer.Sum
 
 /// A reader of the test file, together with the buffers it needs.
 const TestReader = struct {
-    reader: Reader,
+    /// The storage the reader reads through. It is allocated apart so that
+    /// this struct can be returned by value.
+    real: *RealStorage,
+    reader: RealReader,
     index_buffer: []u8,
     get_buffer: []u8,
     iterator_buffer: []u8,
@@ -1323,7 +1341,12 @@ const TestReader = struct {
         const index_buffer = try gpa.alloc(u8, file_len);
         errdefer gpa.free(index_buffer);
 
-        var reader: Reader = try .open(testing.io, dir, test_name, index_buffer);
+        const real = try gpa.create(RealStorage);
+        errdefer gpa.destroy(real);
+        try real.init(dir);
+        errdefer real.deinit();
+
+        var reader: RealReader = try .open(&real.storage, test_name, index_buffer);
         errdefer reader.close();
 
         const get_buffer = try gpa.alloc(u8, reader.blockSizeMax());
@@ -1332,6 +1355,7 @@ const TestReader = struct {
         errdefer gpa.free(iterator_buffer);
 
         return .{
+            .real = real,
             .reader = reader,
             .index_buffer = index_buffer,
             .get_buffer = get_buffer,
@@ -1342,6 +1366,8 @@ const TestReader = struct {
     fn close(self: *TestReader) void {
         const gpa = testing.allocator;
         self.reader.close();
+        self.real.deinit();
+        gpa.destroy(self.real);
         gpa.free(self.index_buffer);
         gpa.free(self.get_buffer);
         gpa.free(self.iterator_buffer);
@@ -1351,7 +1377,7 @@ const TestReader = struct {
         return self.reader.get(key, self.get_buffer);
     }
 
-    fn iterator(self: *const TestReader) Reader.Iterator {
+    fn iterator(self: *const TestReader) RealReader.Iterator {
         return self.reader.iterator(self.iterator_buffer);
     }
 };
@@ -1680,7 +1706,10 @@ fn expectOpenCorrupt(dir: Io.Dir) !void {
     // and an index is never longer than its file, so the index always fits
     // in this buffer.
     var index_buffer: [eight_table_len]u8 = undefined;
-    const result = Reader.open(testing.io, dir, test_name, &index_buffer);
+    var real: RealStorage = undefined;
+    try real.init(dir);
+    defer real.deinit();
+    const result = RealReader.open(&real.storage, test_name, &index_buffer);
     try testing.expectError(error.Corrupt, result);
 }
 
@@ -2371,14 +2400,17 @@ test "after a failed seek the cursor is at the end of the table" {
 test "create fails if the file exists" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     _ = try writeTable(tmp.dir, .{}, &.{});
 
     var block_buffer: [1024]u8 = undefined;
     var index_buffer: [1024]u8 = undefined;
-    const buffers: Writer.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
+    const buffers: RealWriter.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
     const options: Options = .{ .block_size = 1024 };
-    const result = Writer.create(testing.io, tmp.dir, test_name, options, buffers);
+    const result = RealWriter.create(&real.storage, test_name, options, buffers);
     try testing.expectError(error.PathAlreadyExists, result);
 }
 
@@ -2401,12 +2433,15 @@ test "a key and a value of exactly the longest size are accepted" {
 test "an entry that does not fit in the block buffer is rejected and the writer stays usable" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     var block_buffer: [64]u8 = undefined;
     var index_buffer: [1024]u8 = undefined;
-    const buffers: Writer.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
+    const buffers: RealWriter.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
     const options: Options = .{ .block_size = 64 };
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, options, buffers);
+    var writer: RealWriter = try .create(&real.storage, test_name, options, buffers);
     defer writer.close();
 
     // With a 64-byte buffer and a one-byte key, the largest value that fits
@@ -2430,6 +2465,9 @@ test "an entry that does not fit in the block buffer is rejected and the writer 
 test "a full index rejects an entry that would start a new block" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     // A block size of 48 gives every entry a block of its own: a block with
     // one of these entries is 41 bytes, and a second would make it 62. The
@@ -2437,9 +2475,9 @@ test "a full index rejects an entry that would start a new block" {
     // one byte long.
     var block_buffer: [48]u8 = undefined;
     var index_buffer: [indexSizeMax(2, 1)]u8 = undefined;
-    const buffers: Writer.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
+    const buffers: RealWriter.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
     const options: Options = .{ .block_size = 48 };
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, options, buffers);
+    var writer: RealWriter = try .create(&real.storage, test_name, options, buffers);
     defer writer.close();
 
     try writer.add("a", "1", 1);
@@ -2458,14 +2496,17 @@ test "a full index rejects an entry that would start a new block" {
 test "a full index rejects an entry whose key would not fit in it" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     // The index buffer has room for one data block whose last key is one
     // byte long.
     var block_buffer: [1024]u8 = undefined;
     var index_buffer: [indexSizeMax(1, 1)]u8 = undefined;
-    const buffers: Writer.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
+    const buffers: RealWriter.Buffers = .{ .block = &block_buffer, .index = &index_buffer };
     const options: Options = .{ .block_size = 1024 };
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, options, buffers);
+    var writer: RealWriter = try .create(&real.storage, test_name, options, buffers);
     defer writer.close();
 
     try writer.add("a", "1", 1);
@@ -2485,6 +2526,9 @@ test "a full index rejects an entry whose key would not fit in it" {
 test "open fails if the index does not fit in the buffer" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     const entries = [_]Entry{
         .{ .key = "a", .value = "1", .sequence = 1 },
@@ -2495,11 +2539,11 @@ test "open fails if the index does not fit in the buffer" {
     const index_block_len = comptime indexSizeMax(1, 1);
 
     var small_buffer: [index_block_len - 1]u8 = undefined;
-    const result = Reader.open(testing.io, tmp.dir, test_name, &small_buffer);
+    const result = RealReader.open(&real.storage, test_name, &small_buffer);
     try testing.expectError(error.IndexTooLarge, result);
 
     var exact_buffer: [index_block_len]u8 = undefined;
-    var reader: Reader = try .open(testing.io, tmp.dir, test_name, &exact_buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, &exact_buffer);
     reader.close();
 }
 
@@ -2560,6 +2604,9 @@ test "indexSizeMax is a block header and one largest index entry for each data b
 test "an index buffer of indexSizeMax is exactly enough when every entry gets its own block" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     // Every key has the longest length, 3 bytes, so the index buffer has no
     // byte to spare. An entry takes 15 + 3 + 1 bytes and a 4-byte slot, so a
@@ -2575,9 +2622,9 @@ test "an index buffer of indexSizeMax is exactly enough when every entry gets it
     defer testing.allocator.free(index_buffer);
 
     var block_buffer: [48]u8 = undefined;
-    const buffers: Writer.Buffers = .{ .block = &block_buffer, .index = index_buffer };
+    const buffers: RealWriter.Buffers = .{ .block = &block_buffer, .index = index_buffer };
     const options: Options = .{ .block_size = 48 };
-    var writer: Writer = try .create(testing.io, tmp.dir, test_name, options, buffers);
+    var writer: RealWriter = try .create(&real.storage, test_name, options, buffers);
     defer writer.close();
 
     for (entries) |entry| {
@@ -2592,7 +2639,7 @@ test "an index buffer of indexSizeMax is exactly enough when every entry gets it
     // A reader can open the table with an index buffer of the same size.
     const reader_index_buffer = try testing.allocator.alloc(u8, index_size);
     defer testing.allocator.free(reader_index_buffer);
-    var reader: Reader = try .open(testing.io, tmp.dir, test_name, reader_index_buffer);
+    var reader: RealReader = try .open(&real.storage, test_name, reader_index_buffer);
     defer reader.close();
     try testing.expectEqual(@as(usize, 3), reader.blockCount());
 }
@@ -2985,6 +3032,9 @@ test "a footer with the wrong magic is detected even if its checksum is right" {
 test "an intact footer of another version is reported as an unsupported version" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
 
     const bytes = try smallTableBytes(tmp.dir);
     defer testing.allocator.free(bytes);
@@ -2997,7 +3047,7 @@ test "an intact footer of another version is reported as an unsupported version"
     try writeWholeFile(tmp.dir, bytes);
 
     var index_buffer: [small_table_len]u8 = undefined;
-    const result = Reader.open(testing.io, tmp.dir, test_name, &index_buffer);
+    const result = RealReader.open(&real.storage, test_name, &index_buffer);
     try testing.expectError(error.UnsupportedVersion, result);
 }
 
