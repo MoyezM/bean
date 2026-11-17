@@ -66,12 +66,19 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+const async_io = @import("async_io.zig");
+const AsyncIo = async_io.AsyncIo;
 const constants = @import("constants.zig");
 const durable = @import("durable.zig");
 const manifest = @import("manifest.zig");
 const MemTable = @import("memtable.zig").MemTable;
+const sector_log = @import("sector_log.zig");
 const sstable = @import("sstable.zig");
+const Storage = @import("storage.zig").Storage;
 const wal = @import("wal.zig");
+
+/// The store's write-ahead logs, on the real disk.
+const Log = sector_log.LogType(Storage);
 const write_batch = @import("write_batch.zig");
 const WriteBatch = write_batch.WriteBatch;
 
@@ -98,6 +105,16 @@ const lock_file_name = "LOCK";
 /// The longest payload the store's logs accept: one batch.
 const log_payload_size_max: u32 = write_batch.size_max;
 
+/// The length of the buffer that holds one log record on its way to or
+/// from a log file.
+const log_buffer_size = sector_log.bufferSize(log_payload_size_max);
+
+/// The length of each log file a store creates.
+const log_file_size = constants.log_file_size;
+
+/// The unit logs are written in.
+const sector_size = sector_log.sector_size;
+
 /// The file number of the log a new store starts with.
 const log_number_first: u64 = 1;
 
@@ -118,7 +135,13 @@ comptime {
     assert(sstable.entry_overhead <= MemTable.entry_overhead_min);
 
     // A batch is the payload of one log record.
-    assert(write_batch.size_max <= wal.payload_size_format_max);
+    assert(write_batch.size_max <= sector_log.payload_size_format_max);
+
+    // A log file is whole sectors, and an empty one has room for the
+    // largest batch, so a batch can always be logged once a new log has
+    // been started.
+    assert(log_file_size % sector_size == 0);
+    assert(log_file_size >= sector_log.fileSizeMin(log_payload_size_max));
 
     // Every key and value a batch accepts is one the memtable can hold, so
     // applying a valid batch never passes the memtable an oversized entry.
@@ -152,6 +175,12 @@ pub const Store = struct {
     /// Held locked from `open` to `close`.
     lock_file: Io.File,
 
+    /// The event loop the store's log I/O runs on, and the storage layer
+    /// over it. They are allocated apart from the store because operations
+    /// in flight hold pointers to them.
+    event_loop: *AsyncIo,
+    storage: *Storage,
+
     /// The two memtables. They are allocated apart from the store so that a
     /// flush's cursor into one stays valid if the `Store` value is moved.
     memtables: *[2]MemTable,
@@ -163,7 +192,12 @@ pub const Store = struct {
     sequence_last: u64,
 
     /// The log the active memtable's writes go to.
-    log: wal.Writer,
+    log: Log.Writer,
+    /// Holds one log record: the one being appended, or the one being
+    /// replayed in `open`. Creating a log also writes the file out from it.
+    log_buffer: []align(sector_size) u8,
+    /// The length of each log file this store creates.
+    log_file_size: u64,
     /// The file number of that log.
     log_number: u64,
     /// The next file number to hand out. It runs ahead of the manifest's,
@@ -261,9 +295,10 @@ pub const Store = struct {
         Corrupt,
     } || Io.File.OpenError || Io.File.WritePositionalError || Io.File.SyncError ||
         Io.File.LengthError || Io.File.ReadPositionalError ||
-        Io.Dir.OpenError || Io.Dir.DeleteFileError;
+        Io.Dir.OpenError || Io.Dir.DeleteFileError ||
+        Log.Writer.CreateError || Storage.WriteError;
 
-    /// What `open` can report. `wal.Reader.open` can also report
+    /// What `open` can report. Opening a log can also report
     /// `IncompleteLog`, which is not here: `open` handles it itself.
     pub const OpenError = error{
         /// `dir` holds no store and `create_if_missing` is false.
@@ -288,7 +323,8 @@ pub const Store = struct {
         IndexTooLarge,
         /// A table has a data block longer than any this code writes.
         BlockTooLarge,
-    } || Allocator.Error || FlushError || Io.File.SetLengthError || Io.Dir.Iterator.Error;
+    } || Allocator.Error || FlushError || Io.File.SetLengthError || Io.Dir.Iterator.Error ||
+        async_io.InitError || Storage.OpenError || Storage.ReadError || Storage.SizeError;
 
     /// What writing a batch that holds at least one operation can report.
     pub const CommitError = error{
@@ -559,23 +595,41 @@ pub const Store = struct {
     /// `gpa` is used only here, to allocate everything the store will need,
     /// and is not retained. `dir` must stay open until the store is closed.
     pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, options: Options) OpenError!Store {
-        return openWithMemtableSize(gpa, io, dir, options, MemTable.buffer_size_max);
+        return openWithSizes(gpa, io, dir, options, MemTable.buffer_size_max, log_file_size);
     }
 
-    /// `open`, with memtables of `memtable_size` bytes each. A store always
-    /// has memtables of the largest size; tests use small ones so that a
-    /// flush takes few writes. A batch must fit in an empty memtable.
-    fn openWithMemtableSize(
+    /// `open`, with memtables of `memtable_size` bytes each and new logs of
+    /// `log_size` bytes each. A store always has memtables and logs of the
+    /// sizes in `constants`; tests use small ones so that a flush takes few
+    /// writes and creating a log is quick. A batch must fit in an empty
+    /// memtable and in an empty log.
+    fn openWithSizes(
         gpa: Allocator,
         io: Io,
         dir: Io.Dir,
         options: Options,
         memtable_size: usize,
+        log_size: u64,
     ) OpenError!Store {
+        assert(log_size % sector_size == 0);
+        assert(log_size >= sector_log.fileSizeMin(log_payload_size_max));
+
         // The lock comes first: opening a store can delete and truncate
         // files, which must not happen under a store that is already open.
         const lock_file = try lockDir(io, dir);
         errdefer lock_file.close(io);
+
+        const event_loop = try gpa.create(AsyncIo);
+        errdefer gpa.destroy(event_loop);
+        event_loop.* = try .init();
+        errdefer event_loop.deinit();
+        const storage = try gpa.create(Storage);
+        errdefer gpa.destroy(storage);
+        storage.* = .init(event_loop, io, dir);
+        errdefer storage.deinit();
+
+        const log_buffer = try gpa.alignedAlloc(u8, .fromByteUnits(sector_size), log_buffer_size);
+        errdefer gpa.free(log_buffer);
 
         const memtables = try gpa.create([2]MemTable);
         errdefer gpa.destroy(memtables);
@@ -607,11 +661,15 @@ pub const Store = struct {
             .io = io,
             .dir = dir,
             .lock_file = lock_file,
+            .event_loop = event_loop,
+            .storage = storage,
             .memtables = memtables,
             .active_index = 0,
             .sequence_last = 0,
             // The log and the manifest are opened by `recover`.
             .log = undefined,
+            .log_buffer = log_buffer,
+            .log_file_size = log_size,
             .log_number = 0,
             .file_number_next = 0,
             .tables = tables,
@@ -655,6 +713,12 @@ pub const Store = struct {
         gpa.free(self.index_storage);
         gpa.free(self.flush_block_buffer);
         gpa.free(self.get_block_buffer);
+        gpa.free(self.log_buffer);
+
+        self.storage.deinit();
+        gpa.destroy(self.storage);
+        self.event_loop.deinit();
+        gpa.destroy(self.event_loop);
 
         // Closing the file releases the lock.
         self.lock_file.close(self.io);
@@ -724,18 +788,26 @@ pub const Store = struct {
         // The share comes before the batch is logged, so that an error from
         // the flush leaves the batch unwritten.
         if (self.flushing != null) {
-            try self.flushStep(flush_pace * batch_memtable_size);
+            try self.flushStep(flush_pace * self.flushShare(batch_bytes.len, batch_memtable_size));
         }
 
-        // The batch goes to the log only if all of it can then be applied.
-        if (batch_memtable_size > self.activeMemtable().bytesFree()) {
+        // The batch goes to the log only if all of it can then be applied,
+        // and only if the log has room for it. Whichever of the memtable
+        // and the log fills first, the memtable is frozen and a new log is
+        // started.
+        const memtable_is_full = batch_memtable_size > self.activeMemtable().bytesFree();
+        const log_is_full = !self.log.hasRoomFor(batch_bytes.len);
+        if (memtable_is_full or log_is_full) {
             try self.makeRoom();
             assert(batch_memtable_size <= self.activeMemtable().bytesFree());
+            assert(self.log.hasRoomFor(batch_bytes.len));
         }
 
         _ = self.log.append(batch_bytes) catch |err| switch (err) {
-            // A batch is never longer than the log's payload limit.
+            // A batch is never longer than the log's payload limit, and
+            // room for it was made above.
             error.PayloadTooLarge => unreachable,
+            error.LogFull => unreachable,
             else => |other| {
                 self.broken = true;
                 return other;
@@ -745,8 +817,25 @@ pub const Store = struct {
         self.sequence_last = applyBatch(memtable, batch_bytes, self.sequence_last + 1);
     }
 
-    /// Freezes the full active memtable, so that the other one, which is
-    /// empty, takes the writes.
+    /// How many bytes of a frozen memtable a write should see flushed,
+    /// before `flush_pace` is applied, so that the flush is over before the
+    /// next freeze.
+    ///
+    /// The next freeze comes when the active memtable or its log is full,
+    /// whichever is first. A write uses up some part of each. The larger of
+    /// the two parts is the part of the way to the next freeze that this
+    /// write covers, and the write flushes that part of a whole memtable.
+    fn flushShare(self: *const Store, batch_len: usize, batch_memtable_size: usize) usize {
+        const memtable_size = self.activeMemtable().arena.buffer.len;
+        const log_room: u64 = self.log.file_size - sector_size;
+        const record_size: u64 = sector_log.recordSize(batch_len);
+        // The record's part of the log, as bytes of a memtable.
+        const log_share: usize = @intCast(record_size * memtable_size / log_room);
+        return @max(batch_memtable_size, log_share);
+    }
+
+    /// Freezes the active memtable, which is full or whose log is full, so
+    /// that the other one, which is empty, takes the writes.
     fn makeRoom(self: *Store) CommitError!void {
         // The shares that writes do are sized so that a flush is over
         // before the active memtable fills again. The store does not depend
@@ -981,11 +1070,13 @@ pub const Store = struct {
         const log_name = manifest.fileName(&name_buffer, .log, log_number_new);
 
         // The new log carries on from the last record of the current one.
-        var log_new = try wal.Writer.create(
-            self.io,
-            self.dir,
+        // The current log is not being appended to, so the buffer the two
+        // share is free for the new one to be written out from.
+        var log_new = try Log.Writer.create(
+            self.storage,
             log_name,
-            log_payload_size_max,
+            self.log_file_size,
+            self.log_buffer,
             self.log.last,
         );
         errdefer {
@@ -1337,6 +1428,7 @@ pub const Store = struct {
         self.log_number = log_number_named;
         self.file_number_next = self.tables.file_number_next;
         var log_end = named.end;
+        var log_file_len = named.file_size;
 
         if (newer != null) {
             self.active_index = 1;
@@ -1344,6 +1436,7 @@ pub const Store = struct {
             self.log_number = log_number_newer;
             self.file_number_next = log_number_newer + 1;
             log_end = newer.?.end;
+            log_file_len = newer.?.file_size;
 
             // Run the interrupted flush again, from the start.
             try self.flushBegin(
@@ -1357,7 +1450,7 @@ pub const Store = struct {
 
         var name_buffer: [manifest.file_name_size_max]u8 = undefined;
         const log_name = manifest.fileName(&name_buffer, .log, self.log_number);
-        self.log = try wal.Writer.open(self.io, self.dir, log_name, log_payload_size_max, log_end);
+        self.log = try Log.Writer.open(self.storage, log_name, log_file_len, self.log_buffer, log_end);
     }
 
     /// Reads the manifest and applies its edits to `tables`. Returns where
@@ -1411,7 +1504,7 @@ pub const Store = struct {
 
         var name_buffer: [manifest.file_name_size_max]u8 = undefined;
         const log_name = manifest.fileName(&name_buffer, .log, log_number_first);
-        self.log = try wal.Writer.create(self.io, self.dir, log_name, log_payload_size_max, .none);
+        self.log = try Log.Writer.create(self.storage, log_name, self.log_file_size, self.log_buffer, .none);
         errdefer self.log.close();
 
         self.manifest_writer = try manifest.Writer.create(self.io, self.dir);
@@ -1469,7 +1562,7 @@ pub const Store = struct {
         const log_name = manifest.fileName(&name_buffer, .log, log_number_first);
 
         var log_is_there = true;
-        var reader_or_error = wal.Reader.open(self.io, self.dir, log_name, self.scratch.buffer);
+        var reader_or_error = Log.Reader.open(self.storage, log_name, self.log_buffer);
         if (reader_or_error) |*reader| {
             defer reader.close();
             const record = try reader.next();
@@ -1481,6 +1574,8 @@ pub const Store = struct {
         } else |err| switch (err) {
             error.FileNotFound => log_is_there = false,
             error.IncompleteLog => {},
+            // The header is intact and the file is not the length it gives.
+            error.WrongFileSize => return error.Corrupt,
             else => |other| return other,
         }
         if (log_is_there) {
@@ -1635,7 +1730,9 @@ pub const Store = struct {
         /// The record the log carries on from, as its file header says.
         previous: wal.RecordId,
         /// Where the log's valid records end.
-        end: wal.End,
+        end: sector_log.End,
+        /// The length of the log's file.
+        file_size: u64,
         /// The sequence number of the last operation in the log, or the
         /// number the log follows if it holds none.
         sequence_last: u64,
@@ -1654,11 +1751,20 @@ pub const Store = struct {
         var name_buffer: [manifest.file_name_size_max]u8 = undefined;
         const log_name = manifest.fileName(&name_buffer, .log, log_number);
 
-        // Nothing is in the scratch batch yet, so its buffer is free to
+        // No log is being appended to yet, so the log buffer is free to
         // hold the records being replayed.
-        var reader: wal.Reader = try .open(self.io, self.dir, log_name, self.scratch.buffer);
+        var reader = Log.Reader.open(self.storage, log_name, self.log_buffer) catch |err| switch (err) {
+            // The header is intact and the file is not the length it gives.
+            error.WrongFileSize => return error.Corrupt,
+            else => |other| return other,
+        };
         defer reader.close();
         const previous = reader.end().last;
+        // A log this store wrote has room for the largest batch. One that
+        // has not could not be appended to.
+        if (reader.file_size < sector_log.fileSizeMin(log_payload_size_max)) {
+            return error.Corrupt;
+        }
 
         var sequence_last = sequence_before;
         while (true) {
@@ -1681,6 +1787,7 @@ pub const Store = struct {
         return .{
             .previous = previous,
             .end = reader.end(),
+            .file_size = reader.file_size,
             .sequence_last = sequence_last,
         };
     }
@@ -1777,13 +1884,65 @@ const test_memtable_size = 64 * 1024;
 /// The length of the values those tests write.
 const test_value_size = 1000;
 
+/// The length of each log file in the tests. Writing a log of the real
+/// size out for every test would take far too long.
+///
+/// It is large enough that the small memtables of the tests always fill
+/// before their log does, whatever the tests write: a memtable of
+/// `test_memtable_size` bytes holds at most this many entries, and each
+/// entry was logged in a record of at least one sector.
+const test_log_file_size = sector_size * (2 + test_log_records_max) + log_buffer_size;
+const test_log_records_max = test_memtable_size / MemTable.entry_overhead_min;
+
+comptime {
+    assert(test_log_file_size % sector_size == 0);
+    assert(test_log_file_size >= sector_log.fileSizeMin(log_payload_size_max));
+    assert(model_memtable_size <= test_memtable_size);
+}
+
 fn openStore(dir: Io.Dir) !Store {
-    return Store.open(testing.allocator, testing.io, dir, .{});
+    return Store.openWithSizes(
+        testing.allocator,
+        testing.io,
+        dir,
+        .{},
+        MemTable.buffer_size_max,
+        test_log_file_size,
+    );
 }
 
 fn openSmallStore(dir: Io.Dir) !Store {
-    return Store.openWithMemtableSize(testing.allocator, testing.io, dir, .{}, test_memtable_size);
+    return Store.openWithSizes(
+        testing.allocator,
+        testing.io,
+        dir,
+        .{},
+        test_memtable_size,
+        test_log_file_size,
+    );
 }
+
+/// A Storage on a directory, for the tests that make or read log files by
+/// hand. It holds pointers into itself, so it is set up in place and must
+/// not be moved.
+const TestLogs = struct {
+    event_loop: AsyncIo,
+    storage: Storage,
+    buffer: []align(sector_size) u8,
+
+    fn init(self: *TestLogs, dir: Io.Dir) !void {
+        self.event_loop = try .init();
+        errdefer self.event_loop.deinit();
+        self.storage = .init(&self.event_loop, testing.io, dir);
+        self.buffer = try testing.allocator.alignedAlloc(u8, .fromByteUnits(sector_size), log_buffer_size);
+    }
+
+    fn deinit(self: *TestLogs) void {
+        testing.allocator.free(self.buffer);
+        self.storage.deinit();
+        self.event_loop.deinit();
+    }
+};
 
 fn logName(buffer: *[manifest.file_name_size_max]u8, log_number: u64) []const u8 {
     return manifest.fileName(buffer, .log, log_number);
@@ -1800,6 +1959,23 @@ fn logLength(dir: Io.Dir, log_number: u64) !u64 {
     return try file.length(testing.io);
 }
 
+/// Reads `buffer.len` bytes of a log file from `offset`.
+fn readLogBytes(dir: Io.Dir, log_number: u64, buffer: []u8, offset: u64) !void {
+    var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+    const file = try dir.openFile(testing.io, logName(&name_buffer, log_number), .{ .mode = .read_only });
+    defer file.close(testing.io);
+    const count = try file.readPositionalAll(testing.io, buffer, offset);
+    try testing.expectEqual(buffer.len, count);
+}
+
+/// Overwrites part of a log file.
+fn writeLogBytes(dir: Io.Dir, log_number: u64, bytes: []const u8, offset: u64) !void {
+    var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+    const file = try dir.openFile(testing.io, logName(&name_buffer, log_number), .{ .mode = .read_write });
+    defer file.close(testing.io);
+    try file.writePositionalAll(testing.io, bytes, offset);
+}
+
 fn setLogLength(dir: Io.Dir, log_number: u64, len: u64) !void {
     var name_buffer: [manifest.file_name_size_max]u8 = undefined;
     const file = try dir.openFile(testing.io, logName(&name_buffer, log_number), .{ .mode = .write_only });
@@ -1814,8 +1990,8 @@ fn makeLogReadOnly(store: *Store, dir: Io.Dir) !void {
     var name_buffer: [manifest.file_name_size_max]u8 = undefined;
     const name = logName(&name_buffer, store.log_number);
     const read_only = try dir.openFile(testing.io, name, .{ .mode = .read_only });
-    store.log.file.close(testing.io);
-    store.log.file = read_only;
+    store.log.file.handle.close(testing.io);
+    store.log.file.handle = read_only;
 }
 
 /// Appends one record to the end of a log file of a store that is closed.
@@ -1823,16 +1999,50 @@ fn appendToLog(dir: Io.Dir, log_number: u64, payload: []const u8) !void {
     var name_buffer: [manifest.file_name_size_max]u8 = undefined;
     const name = logName(&name_buffer, log_number);
 
-    const buffer = try testing.allocator.alloc(u8, log_payload_size_max);
-    defer testing.allocator.free(buffer);
-    var reader: wal.Reader = try .open(testing.io, dir, name, buffer);
+    var logs: TestLogs = undefined;
+    try logs.init(dir);
+    defer logs.deinit();
+
+    var reader: Log.Reader = try .open(&logs.storage, name, logs.buffer);
     while (try reader.next()) |_| {}
     const end = reader.end();
+    const file_size = reader.file_size;
     reader.close();
 
-    var writer: wal.Writer = try .open(testing.io, dir, name, log_payload_size_max, end);
+    var writer: Log.Writer = try .open(&logs.storage, name, file_size, logs.buffer, end);
     defer writer.close();
     _ = try writer.append(payload);
+}
+
+/// Where the valid records of a log file of a store that is closed end.
+fn logEnd(dir: Io.Dir, log_number: u64) !sector_log.End {
+    var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+    const name = logName(&name_buffer, log_number);
+
+    var logs: TestLogs = undefined;
+    try logs.init(dir);
+    defer logs.deinit();
+
+    var reader: Log.Reader = try .open(&logs.storage, name, logs.buffer);
+    defer reader.close();
+    while (try reader.next()) |_| {}
+    return reader.end();
+}
+
+/// Writes zeros over a log file from `offset` to its end, which is what
+/// the file held there before anything was appended.
+fn zeroLogFrom(dir: Io.Dir, log_number: u64, offset: u64) !void {
+    var name_buffer: [manifest.file_name_size_max]u8 = undefined;
+    const file = try dir.openFile(testing.io, logName(&name_buffer, log_number), .{ .mode = .read_write });
+    defer file.close(testing.io);
+    const len = try file.length(testing.io);
+    const zeros: [sector_size]u8 = @splat(0);
+    var position = offset;
+    while (position < len) {
+        const chunk: usize = @intCast(@min(zeros.len, len - position));
+        try file.writePositionalAll(testing.io, zeros[0..chunk], position);
+        position += chunk;
+    }
 }
 
 /// Creates a file that holds `contents`.
@@ -2552,8 +2762,7 @@ test "a newer log that does not follow the manifest's log is reported" {
     }
     // The first log ends on op 1, and this log claims to follow no record.
     {
-        var log: wal.Writer = try .create(testing.io, tmp.dir, "000002.log", log_payload_size_max, .none);
-        log.close();
+        try createLogAfter(tmp.dir, "000002.log", .none);
     }
     try testing.expectError(error.Corrupt, openStore(tmp.dir));
 }
@@ -2567,12 +2776,10 @@ test "two logs newer than the manifest's are reported" {
         defer store.close(testing.allocator);
     }
     {
-        var log: wal.Writer = try .create(testing.io, tmp.dir, "000002.log", log_payload_size_max, .none);
-        log.close();
+        try createLogAfter(tmp.dir, "000002.log", .none);
     }
     {
-        var log: wal.Writer = try .create(testing.io, tmp.dir, "000003.log", log_payload_size_max, .none);
-        log.close();
+        try createLogAfter(tmp.dir, "000003.log", .none);
     }
     try testing.expectError(error.Corrupt, openStore(tmp.dir));
 }
@@ -2713,7 +2920,20 @@ test "a manifest whose log is missing or incomplete is reported" {
             defer store.close(testing.allocator);
             try store.put("a", "1");
         }
-        try setLogLength(tmp.dir, log_number_first, wal.file_header_size - 1);
+        try setLogLength(tmp.dir, log_number_first, sector_size - 1);
+        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+    }
+    {
+        // Nothing but zeros, which is what a log that was never finished
+        // looks like. The manifest names this log, so it was finished.
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var store = try openStore(tmp.dir);
+            defer store.close(testing.allocator);
+            try store.put("a", "1");
+        }
+        try zeroLogFrom(tmp.dir, log_number_first, 0);
         try testing.expectError(error.Corrupt, openStore(tmp.dir));
     }
 }
@@ -2733,8 +2953,7 @@ test "a log that does not begin where the manifest says is reported" {
     // after no op at all.
     try tmp.dir.deleteFile(testing.io, "000002.log");
     {
-        var log: wal.Writer = try .create(testing.io, tmp.dir, "000002.log", log_payload_size_max, .none);
-        log.close();
+        try createLogAfter(tmp.dir, "000002.log", .none);
     }
     try testing.expectError(error.Corrupt, openStore(tmp.dir));
 }
@@ -2758,10 +2977,11 @@ test "a first log left too short by a crash while the store was created is repla
     try expectValue(&store, "a", "1");
 }
 
-test "a first log left as a header of zeros by a crash is created again" {
+test "a first log left as zeros by a crash is created again" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const zeros: [wal.file_header_size]u8 = @splat(0);
+    // The file was being written out, and the crash came before its header.
+    const zeros: [3 * sector_size]u8 = @splat(0);
     try writeFile(tmp.dir, "000001.log", &zeros);
 
     var store = try openStore(tmp.dir);
@@ -2777,8 +2997,7 @@ test "a store whose creation a crash cut off before the first edit is created ag
 
     // The first log and the manifest exist, but the manifest has no edit.
     {
-        var log: wal.Writer = try .create(testing.io, tmp.dir, "000001.log", log_payload_size_max, .none);
-        log.close();
+        try createLogAfter(tmp.dir, "000001.log", .none);
         var manifest_writer: manifest.Writer = try .create(testing.io, tmp.dir);
         manifest_writer.close();
     }
@@ -3430,7 +3649,10 @@ fn makeStoreWithOneWrite(dir: Io.Dir) !wal.RecordId {
 
 /// Creates an empty log file that says it carries on from `previous`.
 fn createLogAfter(dir: Io.Dir, name: []const u8, previous: wal.RecordId) !void {
-    var log: wal.Writer = try .create(testing.io, dir, name, log_payload_size_max, previous);
+    var logs: TestLogs = undefined;
+    try logs.init(dir);
+    defer logs.deinit();
+    var log: Log.Writer = try .create(&logs.storage, name, test_log_file_size, logs.buffer, previous);
     log.close();
 }
 
@@ -3684,7 +3906,14 @@ const model_key_count = 48;
 const model_memtable_size = 32 * 1024;
 
 fn openModelStore(dir: Io.Dir) !Store {
-    return Store.openWithMemtableSize(testing.allocator, testing.io, dir, .{}, model_memtable_size);
+    return Store.openWithSizes(
+        testing.allocator,
+        testing.io,
+        dir,
+        .{},
+        model_memtable_size,
+        test_log_file_size,
+    );
 }
 
 /// Checks every key and a full scan of the store against the model. Entry
@@ -4090,7 +4319,7 @@ test "an empty batch is rejected and nothing is written" {
         var store = try openStore(tmp.dir);
         defer store.close(testing.allocator);
         try store.put("a", "1");
-        const len_before = try logLength(tmp.dir, log_number_first);
+        const end_before = try logEnd(tmp.dir, log_number_first);
 
         var batch: WriteBatch = try .init(testing.allocator);
         defer batch.deinit(testing.allocator);
@@ -4103,7 +4332,7 @@ test "an empty batch is rejected and nothing is written" {
 
         // The rejected writes used no op number and left no trace.
         try testing.expectEqual(@as(u64, 1), store.opLatest());
-        try testing.expectEqual(len_before, try logLength(tmp.dir, log_number_first));
+        try testing.expectEqual(end_before, try logEnd(tmp.dir, log_number_first));
     }
 
     // The log holds no empty record, so the store opens again.
@@ -4142,20 +4371,23 @@ test "a batch that was only partly written to the log is not there after a crash
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var len_before_last: u64 = 0;
-    var len_after_last: u64 = 0;
+    // The second batch's record is three sectors long.
+    const long_value: [2 * sector_size]u8 = @splat('v');
+    const record_size = 3 * sector_size;
+
+    var record_offset: u64 = 0;
     {
         var store = try openStore(tmp.dir);
         defer store.close(testing.allocator);
         try store.put("a", "1");
-        len_before_last = try logLength(tmp.dir, log_number_first);
+        record_offset = (try logEnd(tmp.dir, log_number_first)).offset;
 
         var batch: WriteBatch = try .init(testing.allocator);
         defer batch.deinit(testing.allocator);
         try batch.put("a", "changed");
-        try batch.put("b", "2");
+        try batch.put("b", &long_value);
+        try testing.expectEqual(@as(usize, record_size), sector_log.recordSize(batch.bytes().len));
         try store.write(&batch);
-        len_after_last = try logLength(tmp.dir, log_number_first);
     }
 
     // With the log whole, the store opens with both operations of the batch.
@@ -4164,22 +4396,33 @@ test "a batch that was only partly written to the log is not there after a crash
         defer store.close(testing.allocator);
         try testing.expectEqual(@as(u64, 2), store.opLatest());
         try expectValue(&store, "a", "changed");
-        try expectValue(&store, "b", "2");
+        try expectValue(&store, "b", &long_value);
     }
 
-    // Cut the log at every point inside the last record. Each time, the
-    // store opens with the first write and nothing of the second batch.
-    var len = len_before_last;
-    while (len < len_after_last) {
-        try setLogLength(tmp.dir, log_number_first, len);
+    // A crash during the append can leave any of the record's sectors
+    // unwritten, still holding the zeros the file was created with. Each
+    // time, the store opens with the first write and nothing of the batch.
+    var record: [record_size]u8 = undefined;
+    try readLogBytes(tmp.dir, log_number_first, &record, record_offset);
+    const zeros: [sector_size]u8 = @splat(0);
+
+    var landed_mask: u8 = 0;
+    while (landed_mask < 7) : (landed_mask += 1) {
+        for (0..3) |sector| {
+            const offset = record_offset + sector * sector_size;
+            const landed = (landed_mask >> @intCast(sector)) & 1 == 1;
+            if (landed) {
+                try writeLogBytes(tmp.dir, log_number_first, record[sector * sector_size ..][0..sector_size], offset);
+            } else {
+                try writeLogBytes(tmp.dir, log_number_first, &zeros, offset);
+            }
+        }
 
         var store = try openStore(tmp.dir);
         try testing.expectEqual(@as(u64, 1), store.opLatest());
         try expectValue(&store, "a", "1");
         try expectAbsent(&store, "b");
         store.close(testing.allocator);
-
-        len += 1;
     }
 
     // The store carries on from there.
@@ -4190,17 +4433,86 @@ test "a batch that was only partly written to the log is not there after a crash
     try expectValue(&store, "c", "3");
 }
 
+test "a full log freezes the memtable, as a full memtable does" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A log with room for the largest batch and four sectors more, under
+    // memtables of the full size: the log fills long before the memtable.
+    const small_log_size = sector_log.fileSizeMin(log_payload_size_max) + 4 * sector_size;
+    const records_per_log = (small_log_size - sector_size) / sector_size;
+    const writes = 2 * records_per_log + 1;
+
+    var key_buffer: [16]u8 = undefined;
+    {
+        var store = try Store.openWithSizes(
+            testing.allocator,
+            testing.io,
+            tmp.dir,
+            .{},
+            MemTable.buffer_size_max,
+            small_log_size,
+        );
+        defer store.close(testing.allocator);
+
+        var index: u64 = 0;
+        while (index < writes) : (index += 1) {
+            const key = try std.fmt.bufPrint(&key_buffer, "key{d:0>6}", .{index});
+            try store.put(key, "value");
+        }
+        // Each of the first two logs filled, and each time the memtable
+        // was frozen: the store is on its third log. A freeze takes two
+        // file numbers, one for the new log and one for the table.
+        try testing.expectEqual(log_number_first + 3, store.log_number);
+        try testing.expect(store.tables.count() >= 1);
+        try testing.expectEqual(writes, store.opLatest());
+    }
+
+    var store = try Store.openWithSizes(
+        testing.allocator,
+        testing.io,
+        tmp.dir,
+        .{},
+        MemTable.buffer_size_max,
+        small_log_size,
+    );
+    defer store.close(testing.allocator);
+    try testing.expectEqual(writes, store.opLatest());
+    var index: u64 = 0;
+    while (index < writes) : (index += 1) {
+        const key = try std.fmt.bufPrint(&key_buffer, "key{d:0>6}", .{index});
+        try expectValue(&store, key, "value");
+    }
+}
+
+test "a newer log whose header is damaged is reported, not deleted" {
+    // A newer log with no header is what a crash while it was being
+    // created leaves, and is deleted. One that still holds something is a
+    // log that has lost its header, and deleting it would lose writes.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const last = try makeStoreWithOneWrite(tmp.dir);
+    try createLogAfter(tmp.dir, "000002.log", last);
+    try appendToLog(tmp.dir, 2, "anything at all");
+
+    const zeros: [sector_size]u8 = @splat(0);
+    try writeLogBytes(tmp.dir, 2, &zeros, 0);
+    try testing.expectError(error.NotALog, openStore(tmp.dir));
+    try testing.expect(try fileExists(tmp.dir, "000002.log"));
+}
+
 test "a directory cannot be open in two stores at once" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var first = try openStore(tmp.dir);
     try first.put("a", "1");
-    const len_before = try logLength(tmp.dir, log_number_first);
+    const end_before = try logEnd(tmp.dir, log_number_first);
 
     // A second open is refused, and leaves the log alone.
     try testing.expectError(error.StoreAlreadyOpen, openStore(tmp.dir));
-    try testing.expectEqual(len_before, try logLength(tmp.dir, log_number_first));
+    try testing.expectEqual(end_before, try logEnd(tmp.dir, log_number_first));
 
     // The first store still works.
     try first.put("b", "2");

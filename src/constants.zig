@@ -90,3 +90,14 @@ pub const async_io_ring_entries = 128;
 /// the system's cache is read and written in whole sectors, and the log
 /// pads every record to a whole number of them.
 pub const sector_size = 4096;
+
+/// The length of each write-ahead log file, in bytes. A log is written out
+/// to this length when it is created, so that appending to it never changes
+/// the file's size.
+///
+/// A store freezes its active memtable when either the memtable or its log
+/// is full. Every record takes at least one sector of the log, so a store
+/// that is given one small operation at a time fills its log long before
+/// its memtable: at this size a log holds 65,535 such records. A caller
+/// that batches its writes fills the memtable first.
+pub const log_file_size = 256 * 1024 * 1024;
