@@ -22,8 +22,9 @@
 //! buffer, and neither may be moved, freed or assigned to until the
 //! callback has run.
 //!
-//! Creating, opening, closing and deleting files, and syncing the
-//! directory, are ordinary blocking calls for now.
+//! Creating, opening, closing, truncating, deleting and listing files,
+//! syncing the directory, and taking the directory's lock are ordinary
+//! blocking calls for now.
 //!
 //! The store takes its Storage type as a compile-time parameter. Tests pass
 //! a simulated one, which keeps files in memory and can crash; see
@@ -61,6 +62,9 @@ pub const Storage = struct {
     /// what a short read or write from the system looks like.
     transfer_size_max: usize,
 
+    /// Held locked while this storage has the directory's lock.
+    lock_file: ?Io.File,
+
     pub const ReadError = async_io.ReadError;
     pub const WriteError = async_io.WriteError || async_io.SyncError || error{
         /// The system wrote nothing and reported no error.
@@ -73,6 +77,40 @@ pub const Storage = struct {
     pub const DeleteError = Io.Dir.DeleteFileError;
     pub const SizeError = Io.File.LengthError;
     pub const SyncDirError = Io.Dir.OpenError || Io.File.SyncError;
+    pub const TruncateError = Io.File.SetLengthError;
+    pub const ListError = Io.Dir.OpenError || Io.Dir.Iterator.Error;
+    pub const LockError = Io.File.OpenError || error{
+        /// Another storage has the directory locked, in this process or
+        /// another one.
+        AlreadyLocked,
+    };
+
+    /// The name of the file that is held locked for as long as a storage
+    /// has the directory's lock. The file is empty, and is left in the
+    /// directory afterwards: only the lock on it means anything.
+    pub const lock_file_name = "LOCK";
+
+    /// The names of the files in the directory, in no particular order.
+    pub const Listing = struct {
+        std_io: Io,
+        dir: Io.Dir,
+        entries: Io.Dir.Iterator,
+
+        /// The next name, or `null` when every file has been named. The
+        /// name is valid until the next call.
+        pub fn next(self: *Listing) ListError!?[]const u8 {
+            const entry = try self.entries.next(self.std_io);
+            if (entry == null) {
+                return null;
+            }
+            return entry.?.name;
+        }
+
+        pub fn close(self: *Listing) void {
+            self.dir.close(self.std_io);
+            self.* = undefined;
+        }
+    };
 
     pub const Access = enum { read_only, read_write };
 
@@ -143,12 +181,55 @@ pub const Storage = struct {
             .std_io = std_io,
             .dir = dir,
             .transfer_size_max = async_io.transfer_size_max,
+            .lock_file = null,
         };
     }
 
-    /// Nothing may be in flight.
+    /// Nothing may be in flight, and the lock must have been given up.
     pub fn deinit(self: *Storage) void {
+        assert(self.lock_file == null);
         self.* = undefined;
+    }
+
+    /// Takes the lock that marks the directory as in use, so that it is
+    /// never open in two stores at once. The lock is held until `unlock`,
+    /// or until the process ends.
+    pub fn lock(self: *Storage) LockError!void {
+        assert(self.lock_file == null);
+        // The file is not truncated: it is always empty, and another
+        // storage may hold it locked.
+        const lock_file = self.dir.createFile(self.std_io, lock_file_name, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => return error.AlreadyLocked,
+            else => |other| return other,
+        };
+        self.lock_file = lock_file;
+    }
+
+    pub fn unlock(self: *Storage) void {
+        // Closing the file releases the lock.
+        self.lock_file.?.close(self.std_io);
+        self.lock_file = null;
+    }
+
+    /// Starts a listing of the files in the directory. Close it when done.
+    pub fn list(self: *Storage) ListError!Listing {
+        const dir = try self.dir.openDir(self.std_io, ".", .{ .iterate = true });
+        return .{
+            .std_io = self.std_io,
+            .dir = dir,
+            .entries = dir.iterate(),
+        };
+    }
+
+    /// Cuts the file down to `len` bytes. Like a write, the change is not
+    /// durable until the file is synced. No operation on the file may be
+    /// in flight.
+    pub fn truncate(self: *Storage, file: File, len: u64) TruncateError!void {
+        try file.handle.setLength(self.std_io, len);
     }
 
     /// Creates a file for reading and writing. Fails if it already exists.

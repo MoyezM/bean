@@ -86,6 +86,9 @@ pub const Storage = struct {
     /// Whether `poll` or `wait` is running. A callback must not call them.
     running: bool,
 
+    /// Whether the directory's lock is held.
+    locked: bool,
+
     pub const ReadError = error{InputOutput};
     pub const WriteError = error{InputOutput};
     pub const SyncError = error{InputOutput};
@@ -94,6 +97,36 @@ pub const Storage = struct {
     pub const DeleteError = error{ FileNotFound, InputOutput };
     pub const SizeError = error{InputOutput};
     pub const SyncDirError = error{InputOutput};
+    pub const TruncateError = error{InputOutput};
+    pub const ListError = error{InputOutput};
+    pub const LockError = error{ AlreadyLocked, InputOutput };
+
+    /// The names of the files in the directory, in the order they were
+    /// created.
+    pub const Listing = struct {
+        storage: *Storage,
+        index: u32,
+
+        /// The next name, or `null` when every file has been named. The
+        /// name is valid until the next call.
+        pub fn next(self: *Listing) ListError!?[]const u8 {
+            if (self.storage.crashed) {
+                return error.InputOutput;
+            }
+            while (self.index < self.storage.file_count) {
+                const file = &self.storage.files[self.index];
+                self.index += 1;
+                if (file.listed) {
+                    return file.name;
+                }
+            }
+            return null;
+        }
+
+        pub fn close(self: *Listing) void {
+            self.* = undefined;
+        }
+    };
 
     pub const Access = enum { read_only, read_write };
 
@@ -194,7 +227,46 @@ pub const Storage = struct {
             .crash_plan = null,
             .crashed = false,
             .running = false,
+            .locked = false,
         };
+    }
+
+    /// Takes the lock that marks the directory as in use. The lock is held
+    /// until `unlock`, or until the machine crashes.
+    pub fn lock(self: *Storage) LockError!void {
+        if (self.crashed) {
+            return error.InputOutput;
+        }
+        if (self.locked) {
+            return error.AlreadyLocked;
+        }
+        self.locked = true;
+    }
+
+    pub fn unlock(self: *Storage) void {
+        assert(self.locked);
+        self.locked = false;
+    }
+
+    /// Starts a listing of the files in the directory. Close it when done.
+    pub fn list(self: *Storage) ListError!Listing {
+        if (self.crashed) {
+            return error.InputOutput;
+        }
+        return .{ .storage = self, .index = 0 };
+    }
+
+    /// Cuts the file down to `len` bytes. Like a write, the change is not
+    /// durable until the file is synced.
+    pub fn truncate(self: *Storage, file: File, len: u64) TruncateError!void {
+        if (self.crashed) {
+            return error.InputOutput;
+        }
+        assert(file.access == .read_write);
+        const state = &self.files[file.index];
+        assert(len <= state.visible.len);
+        state.visible = self.gpa.realloc(state.visible, @intCast(len)) catch outOfMemory();
+        state.visible_version += 1;
     }
 
     /// Nothing may be in flight.
@@ -420,6 +492,8 @@ pub const Storage = struct {
         assert(self.crashed);
         assert(self.in_flight == 0);
         self.crashed = false;
+        // The process that held the lock is gone.
+        self.locked = false;
     }
 
     /// Flips one byte of a file, in both copies, as a disk that damages
@@ -621,6 +695,13 @@ pub const Storage = struct {
     /// kept or lost. Afterwards the two copies are the same.
     fn losePower(self: *Storage, file: *FileState) void {
         const random = self.prng.random();
+        if (file.visible.len < file.durable.len) {
+            // The file was cut down and the cut was not synced. It holds
+            // or it does not.
+            if (random.boolean()) {
+                file.durable = self.gpa.realloc(file.durable, file.visible.len) catch outOfMemory();
+            }
+        }
         var offset: usize = 0;
         while (offset < file.visible.len) : (offset += sector_size) {
             const end = @min(offset + sector_size, file.visible.len);

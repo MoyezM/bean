@@ -518,3 +518,103 @@ test "simulated: a durable write is not undone by an older sync that ends later"
         try expectContents(&storage, "data", "new");
     }
 }
+
+fn checkListing(comptime Storage: type, storage: *Storage) !void {
+    const names = [_][]const u8{ "one", "two", "three" };
+    for (names) |name| {
+        const file = try storage.createFile(name, .{ .direct = false });
+        storage.closeFile(file);
+    }
+    try storage.deleteFile("two");
+
+    var seen_one = false;
+    var seen_three = false;
+    var listing = try storage.list();
+    defer listing.close();
+    while (try listing.next()) |name| {
+        try testing.expect(!std.mem.eql(u8, name, "two"));
+        if (std.mem.eql(u8, name, "one")) {
+            seen_one = true;
+        }
+        if (std.mem.eql(u8, name, "three")) {
+            seen_three = true;
+        }
+    }
+    try testing.expect(seen_one);
+    try testing.expect(seen_three);
+}
+
+test "a listing names the files that exist" {
+    inline for (fixtures) |Fixture| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        try checkListing(Fixture.Storage, &fixture.storage);
+    }
+}
+
+fn checkTruncate(comptime Storage: type, storage: *Storage) !void {
+    const Blocking = BlockingType(Storage);
+    const file = try storage.createFile("cut", .{ .direct = false });
+    defer storage.closeFile(file);
+    try Blocking.writeAll(storage, file, "keep this, drop this", 0, .durable);
+    try storage.truncate(file, 9);
+    try Blocking.syncFile(storage, file);
+    try testing.expectEqual(@as(u64, 9), try storage.fileSize(file));
+
+    var buffer: [20]u8 = undefined;
+    const len = try Blocking.readAll(storage, file, &buffer, 0);
+    try testing.expectEqualStrings("keep this", buffer[0..len]);
+}
+
+test "a file can be cut down" {
+    inline for (fixtures) |Fixture| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        try checkTruncate(Fixture.Storage, &fixture.storage);
+    }
+}
+
+fn checkLock(comptime Storage: type, storage: *Storage) !void {
+    try storage.lock();
+    storage.unlock();
+    // It can be taken again once it has been given up.
+    try storage.lock();
+    storage.unlock();
+}
+
+test "the directory's lock can be taken and given up" {
+    inline for (fixtures) |Fixture| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        try checkLock(Fixture.Storage, &fixture.storage);
+    }
+}
+
+test "real: a second storage on the same directory cannot take the lock" {
+    var fixture: RealFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    var other: real.Storage = .init(&fixture.io, testing.io, fixture.tmp.dir);
+    defer other.deinit();
+
+    try fixture.storage.lock();
+    try testing.expectError(error.AlreadyLocked, other.lock());
+    fixture.storage.unlock();
+    try other.lock();
+    other.unlock();
+}
+
+test "simulated: the lock is held once, and a crash releases it" {
+    var storage: Simulated = .init(testing.allocator, .{});
+    defer storage.deinit();
+    try storage.lock();
+    try testing.expectError(error.AlreadyLocked, storage.lock());
+    storage.crash(.process_kill);
+    storage.restart();
+    try storage.lock();
+    storage.unlock();
+}
