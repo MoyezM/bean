@@ -2,7 +2,8 @@
 //!
 //! This is the log the store writes its batches to, and the layout of the
 //! manifest (`manifest.zig`), whose records are edits. It replaces the
-//! format in `wal.zig`, which nothing uses any more.
+//! format in `wal.zig`, which the store no longer uses; the log benchmark
+//! in `bench.zig` still does.
 //!
 //! Why it differs from `wal.zig`. A durable write is cheap when it changes
 //! nothing but data, and expensive when the file system also has to record
@@ -42,7 +43,9 @@
 //! the directory is synced, and only then is the file header written. A
 //! file with a valid header is therefore complete and durably named. A
 //! crash before the header leaves a file of zeros, possibly short, which
-//! holds no records and is reported as `IncompleteLog`.
+//! holds no records and is reported as `IncompleteLog`. A file with no
+//! valid header that holds anything but zeros, however short, is reported
+//! as `NotALog`.
 //!
 //! Where the log ends. The file's length says nothing, so the reader walks
 //! the records. At each sector boundary it expects the next record of the
@@ -90,8 +93,8 @@ const blocking_wait_ns = 100 * std.time.ns_per_ms;
 pub const file_header_size = @sizeOf(FileHeader);
 pub const record_header_size = @sizeOf(RecordHeader);
 
-/// Identifies one record in the chain. The same as in `wal.zig`, because a
-/// chain can run from a file of one format into a file of the other.
+/// Identifies one record in the chain. The type is the one `wal.zig`
+/// defines, which numbers and chains its records the same way.
 pub const RecordId = wal.RecordId;
 
 /// Where the valid records of a log file end.
@@ -578,13 +581,13 @@ pub fn LogType(comptime Storage: type) type {
             };
 
             pub const OpenError = error{
-                /// The file is all zeros, or shorter than a sector. A crash
+                /// The file is all zeros, of any length, or empty. A crash
                 /// while the log was being created leaves this. Such a file
                 /// holds no records, so it is safe to delete and create
                 /// again.
                 IncompleteLog,
                 /// The file does not start with a valid log file header,
-                /// and is not all zeros either. It may hold records.
+                /// and is not all zeros either. It may hold something.
                 NotALog,
                 /// The file's length is not the length its header gives.
                 WrongFileSize,
@@ -607,13 +610,18 @@ pub fn LogType(comptime Storage: type) type {
                 errdefer storage.closeFile(file);
 
                 const file_len = try storage.fileSize(file);
-                if (file_len < sector_size) {
-                    return error.IncompleteLog;
-                }
 
                 const sector = buffer[0..sector_size];
                 const header_read = try Blocking.readAll(storage, file, sector, 0);
                 if (header_read < sector_size) {
+                    // Too short to hold a header. Zeros are what a crash
+                    // during `Writer.create` leaves. Anything else was put
+                    // there by something other than this code, and is not
+                    // taken for a file that is safe to delete.
+                    const short_is_zeros = std.mem.allEqual(u8, sector[0..header_read], 0);
+                    if (!short_is_zeros) {
+                        return error.NotALog;
+                    }
                     return error.IncompleteLog;
                 }
                 const header = FileHeader.fromBytes(sector[0..file_header_size]);
@@ -1097,6 +1105,18 @@ test "a file with a zero header that still holds something is not taken for inco
     const zeros: [sector_size]u8 = @splat(0);
     storage.setBytes(test_name, 0, &zeros);
     try testing.expectError(error.NotALog, openError(&storage));
+}
+
+test "a short file that holds something is not taken for incomplete" {
+    const lengths = [_]usize{ 1, 200, sector_size - 1 };
+    for (lengths) |len| {
+        var storage: Simulated = .init(testing.allocator, .{});
+        defer storage.deinit();
+        var bytes: [sector_size]u8 = @splat(0);
+        bytes[len - 1] = 1;
+        try writeRawFile(&storage, bytes[0..len]);
+        try testing.expectError(error.NotALog, openError(&storage));
+    }
 }
 
 test "a file that does not start with a log header is not a log" {

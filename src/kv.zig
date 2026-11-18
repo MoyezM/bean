@@ -344,8 +344,12 @@ pub fn StoreType(comptime Storage: type) type {
         pub const FlushError = error{
             /// The table that was just written does not read back as written.
             Corrupt,
-            /// The manifest has no room to record the table. Nothing rewrites
-            /// the manifest yet, so the store takes no more flushes.
+            /// The manifest has no room to record the table. The store checks
+            /// for room before it freezes a memtable and reports `StoreFull`
+            /// then, so a flush does not get here. If one did, the store
+            /// would be broken, and would report this each time it was opened,
+            /// because opening runs the flush again and nothing rewrites the
+            /// manifest yet.
             ManifestFull,
         } || Storage.CreateError || Storage.OpenError || Storage.WriteError || Storage.SyncError ||
             Storage.SizeError || Storage.ReadError || Storage.SyncDirError || Storage.DeleteError;
@@ -375,14 +379,14 @@ pub fn StoreType(comptime Storage: type) type {
             IndexTooLarge,
             /// A table has a data block longer than any this code writes.
             BlockTooLarge,
-        } || Allocator.Error || FlushError || Storage.TruncateError || Storage.ListError ||
+        } || Allocator.Error || FlushError || Storage.ListError ||
             Storage.LockError || async_io.InitError;
 
         /// What writing a batch that holds at least one operation can report.
         pub const CommitError = error{
             /// The active memtable or its log has no room for the batch, and
-            /// every table slot is taken, so the memtable cannot be flushed
-            /// to make room.
+            /// the memtable cannot be flushed to make room: every table slot
+            /// is taken, or the manifest has no room to record another table.
             StoreFull,
             /// An earlier write failed, and the store must be closed and opened
             /// again before it is written to.
@@ -708,8 +712,9 @@ pub fn StoreType(comptime Storage: type) type {
             assert(log_size % sector_size == 0);
             assert(log_size >= sector_log.fileSizeMin(log_payload_size_max));
 
-            // The lock comes first: opening a store can delete and truncate
-            // files, which must not happen under a store that is already open.
+            // The lock comes first: opening a store can delete files and
+            // overwrite parts of them, which must not happen under a store
+            // that is already open.
             storage.lock() catch |err| switch (err) {
                 error.AlreadyLocked => return error.StoreAlreadyOpen,
                 else => |other| return other,
@@ -1176,8 +1181,12 @@ pub fn StoreType(comptime Storage: type) type {
             if (self.flushing != null) {
                 try self.flushComplete();
             }
-            // The frozen memtable needs a table slot to be flushed into.
+            // The frozen memtable needs a table slot to be flushed into, and
+            // the manifest needs room to record the table.
             if (self.tables.count() == tables_max) {
+                return error.StoreFull;
+            }
+            if (!self.manifest_writer.hasRoomForFlush()) {
                 return error.StoreFull;
             }
             self.freeze() catch |err| {
@@ -1190,8 +1199,9 @@ pub fn StoreType(comptime Storage: type) type {
         /// tables are durable. The store does this by itself as memtables fill;
         /// this is for a caller that wants the logs emptied now.
         ///
-        /// `StoreFull` means every table slot is taken and the active memtable
-        /// was left as it is. After any error but `StoreFull` and `StoreBroken`,
+        /// `StoreFull` means every table slot is taken, or the manifest has no
+        /// room to record another table, and the active memtable was left as
+        /// it is. After any error but `StoreFull` and `StoreBroken`,
         /// every later write returns `StoreBroken` until the store is closed and
         /// opened again.
         pub fn flush(self: *Store) CommitError!void {
@@ -1210,6 +1220,9 @@ pub fn StoreType(comptime Storage: type) type {
                 return;
             }
             if (self.tables.count() == tables_max) {
+                return error.StoreFull;
+            }
+            if (!self.manifest_writer.hasRoomForFlush()) {
                 return error.StoreFull;
             }
             self.freeze() catch |err| {
@@ -1834,8 +1847,8 @@ pub fn StoreType(comptime Storage: type) type {
         fn readManifest(self: *Store) OpenError!?manifest.End {
             var reader = ManifestReader.open(self.storage, self.manifest_buffer) catch |err| switch (err) {
                 error.FileNotFound => return null,
-                // The file is all zeros: a crash came while it was being
-                // created. It holds no edits.
+                // The file is all zeros, of whatever length: a crash came
+                // while it was being created. It holds no edits.
                 error.IncompleteLog => return null,
                 // The header is intact, and the file is not the length a
                 // manifest is.
@@ -2270,6 +2283,9 @@ const DiskManifestReader = DiskStore.ManifestReader;
 /// The memory a test gives a manifest writer or reader.
 const TestManifestBuffer = [manifest.buffer_size]u8;
 const RealStorage = @import("testing/real_storage.zig").RealStorage;
+/// The layout the log and the manifest had before `sector_log.zig`. Only
+/// the tests use it, to make files that earlier code wrote.
+const wal = @import("wal.zig");
 
 /// The size of each memtable in the tests that need a memtable to fill
 /// after a few dozen writes.
@@ -3130,9 +3146,10 @@ test "a new log that a crash left incomplete is removed" {
         defer store.close(testing.allocator);
         try store.put("a", "1");
     }
-    // A crash while a freeze was creating the second log leaves a file too
-    // short to be a log.
-    try writeFile(tmp.dir, "000002.log", "short");
+    // A crash while a freeze was creating the second log leaves a file of
+    // zeros, too short to be a log.
+    const short_zeros: [5]u8 = @splat(0);
+    try writeFile(tmp.dir, "000002.log", &short_zeros);
 
     var store = try openStore(tmp.dir);
     defer store.close(testing.allocator);
@@ -3319,8 +3336,11 @@ test "a manifest whose log is missing or incomplete is reported" {
             defer store.close(testing.allocator);
             try store.put("a", "1");
         }
+        // Cut short, the log has lost part of its header's sector. What is
+        // left is not zeros, so it is not taken for a log that was never
+        // finished.
         try setLogLength(tmp.dir, log_number_first, sector_size - 1);
-        try testing.expectError(error.Corrupt, openStore(tmp.dir));
+        try testing.expectError(error.NotALog, openStore(tmp.dir));
     }
     {
         // Nothing but zeros, which is what a log that was never finished
@@ -3360,14 +3380,16 @@ test "a log that does not begin where the manifest says is reported" {
 test "a first log left too short by a crash while the store was created is replaced" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeFile(tmp.dir, "000001.log", "short");
+    // What such a crash leaves: zeros, and not many of them.
+    const short_zeros: [5]u8 = @splat(0);
+    try writeFile(tmp.dir, "000001.log", &short_zeros);
 
     // Without leave to create a store, there is none to open.
     const options: Options = .{ .create_if_missing = false };
     const result = DiskStore.open(testing.allocator, testing.io, tmp.dir, options);
     try testing.expectError(error.StoreNotFound, result);
     // The refused open left the short log as it was.
-    try testing.expectEqual(@as(u64, "short".len), try logLength(tmp.dir, log_number_first));
+    try testing.expectEqual(@as(u64, short_zeros.len), try logLength(tmp.dir, log_number_first));
 
     var store = try openStore(tmp.dir);
     defer store.close(testing.allocator);
@@ -3419,7 +3441,7 @@ test "a store whose creation a crash cut off before the first edit is created ag
     try expectValue(&store, "a", "1");
 }
 
-test "a manifest that is not in this code's layout is reported, and nothing is deleted" {
+test "a manifest whose header is damaged is reported, and nothing is deleted" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     {
@@ -3428,15 +3450,108 @@ test "a manifest that is not in this code's layout is reported, and nothing is d
         try store.put("a", "1");
     }
 
-    // Put something else where the manifest's header is: a manifest written
-    // by an older version of this code, say.
+    // Put bytes that are not a log header where the manifest's header is.
     {
         const file = try tmp.dir.openFile(testing.io, manifest.file_name, .{ .mode = .write_only });
         defer file.close(testing.io);
-        try file.writePositionalAll(testing.io, "beanlog1", 0);
+        try file.writePositionalAll(testing.io, "not this", 0);
     }
 
     try testing.expectError(error.NotALog, openStore(tmp.dir));
+    try testing.expect(try fileExists(tmp.dir, manifest.file_name));
+    try testing.expect(try fileExists(tmp.dir, "000001.log"));
+}
+
+/// Replaces the manifest in `dir` with one in the layout earlier code wrote
+/// (`wal.zig`), holding `edit_count` edits. With one edit the file is far
+/// shorter than a sector.
+fn writeOldLayoutManifest(dir: Io.Dir, edit_count: u64) !void {
+    try dir.deleteFile(testing.io, manifest.file_name);
+
+    var edit_buffer: [manifest.edit_size_max]u8 = undefined;
+    const edit_bytes = manifest.encode(.{
+        .added = &.{},
+        .removed = &.{},
+        .log_number = 1,
+        .file_number_next = 2,
+        .op_flushed = 0,
+        .sequence_flushed = 0,
+    }, &edit_buffer);
+
+    var real: RealStorage = undefined;
+    try real.init(dir);
+    defer real.deinit();
+    var old_writer: wal.WriterType(DiskStorage) = try .create(
+        &real.storage,
+        manifest.file_name,
+        manifest.edit_size_max,
+        .none,
+    );
+    defer old_writer.close();
+    var appended: u64 = 0;
+    while (appended < edit_count) : (appended += 1) {
+        _ = try old_writer.append(edit_bytes);
+    }
+}
+
+test "a manifest in the layout earlier code wrote is reported, and nothing is deleted" {
+    // One edit makes a manifest shorter than a sector. A hundred make one
+    // longer than a sector.
+    const edit_counts = [_]u64{ 1, 100 };
+    for (edit_counts) |edit_count| {
+        // Beside a first log that holds a write, and beside one that holds
+        // nothing, which is what a store that was never written to has.
+        const log_holds_write = [_]bool{ true, false };
+        for (log_holds_write) |holds_write| {
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            {
+                var store = try openStore(tmp.dir);
+                defer store.close(testing.allocator);
+                if (holds_write) {
+                    try store.put("a", "1");
+                }
+            }
+            try writeOldLayoutManifest(tmp.dir, edit_count);
+
+            try testing.expectError(error.NotALog, openStore(tmp.dir));
+            try testing.expect(try fileExists(tmp.dir, manifest.file_name));
+            try testing.expect(try fileExists(tmp.dir, "000001.log"));
+        }
+    }
+}
+
+test "a manifest of the wrong length is reported, and nothing is deleted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openStore(tmp.dir);
+        defer store.close(testing.allocator);
+    }
+
+    // A whole log with a right header, one sector longer than a manifest.
+    try tmp.dir.deleteFile(testing.io, manifest.file_name);
+    {
+        const manifest_buffer = try testing.allocator.alignedAlloc(
+            u8,
+            .fromByteUnits(sector_size),
+            manifest.buffer_size,
+        );
+        defer testing.allocator.free(manifest_buffer);
+        var real: RealStorage = undefined;
+        try real.init(tmp.dir);
+        defer real.deinit();
+        var log: DiskLog.Writer = try .create(
+            &real.storage,
+            manifest.file_name,
+            manifest.file_size + sector_size,
+            manifest_buffer,
+            .none,
+        );
+        log.close();
+    }
+
+    try testing.expectError(error.Corrupt, openStore(tmp.dir));
     try testing.expect(try fileExists(tmp.dir, manifest.file_name));
     try testing.expect(try fileExists(tmp.dir, "000001.log"));
 }
@@ -5356,24 +5471,19 @@ fn expectWideAfterSimulatedCrash(store: *SimulatedStore, acknowledged: u64) !u64
     return present;
 }
 
-/// The storage operations one write of the wide-key crash test started:
-/// the first is operation `first + 1`, and the last is operation `last`.
-const OperationRange = struct {
-    first: u64,
-    last: u64,
-};
-
 test "simulated: a crash while a manifest edit of several sectors is written leaves a store that opens" {
     // With keys of the longest size, the edit that records a flush is
     // longer than two sectors. A power loss can keep some of the sectors
-    // of an edit in flight and lose others.
+    // of an edit in flight and lose others. A process that is killed can
+    // leave the whole edit written and not yet durable.
     //
     // First the workload is run with no crash, to learn which storage
-    // operations belong to a write that recorded a table in the manifest.
-    // The store starts the same operations in the same order every time,
-    // whatever the seed.
-    var recording: [tables_max]OperationRange = undefined;
-    var recording_count: usize = 0;
+    // operation is the write of each such edit. The store starts the same
+    // operations in the same order every time, whatever the seed.
+    var edit_operations: [tables_max]u64 = undefined;
+    // Where in the manifest each of those edits goes.
+    var edit_offsets: [tables_max]u64 = undefined;
+    var edit_count: usize = 0;
     {
         var storage: Simulated = .init(testing.allocator, .{ .seed = 0 });
         defer storage.deinit();
@@ -5381,29 +5491,40 @@ test "simulated: a crash while a manifest edit of several sectors is written lea
         defer store.close(testing.allocator);
         var number: u64 = 0;
         while (number < wide_test_writes) : (number += 1) {
-            const operations_before = storage.operations_started;
             const tables_before = store.tables.count();
+            const manifest_offset_before = store.manifest_writer.log.offset;
             try putWideSimulated(&store, number);
             if (store.tables.count() > tables_before) {
-                recording[recording_count] = .{
-                    .first = operations_before,
-                    .last = storage.operations_started,
-                };
-                recording_count += 1;
+                // The edit is what this test says it is: several sectors.
+                const edit_size = store.manifest_writer.log.offset - manifest_offset_before;
+                try testing.expect(edit_size > 2 * sector_size);
+                // Three sectors exactly, which the count of sectors that
+                // survive a crash relies on below.
+                try testing.expectEqual(@as(u64, 3 * sector_size), edit_size);
+                edit_operations[edit_count] = storage.lastWriteOperation(manifest.file_name);
+                edit_offsets[edit_count] = manifest_offset_before;
+                edit_count += 1;
             }
         }
     }
     // The workload flushes several times.
-    try testing.expect(recording_count >= 3);
+    try testing.expect(edit_count >= 3);
 
-    for (recording[0..recording_count]) |range| {
-        var crash_after = range.first + 1;
-        while (crash_after <= range.last) : (crash_after += 1) {
+    const kinds = [_]simulated_storage.CrashKind{ .power_loss, .process_kill };
+    // In how many trials the crash left all of the edit's sectors in the
+    // file, and in how many it left some and not others. Both must happen,
+    // or the test did not test what it says.
+    var edits_whole: u64 = 0;
+    var edits_torn: u64 = 0;
+
+    for (edit_operations[0..edit_count], 0..) |edit_operation, edit_index| {
+        for (kinds) |kind| {
             var seed: u64 = 0;
-            while (seed < 4) : (seed += 1) {
+            while (seed < 16) : (seed += 1) {
                 var storage: Simulated = .init(testing.allocator, .{ .seed = seed });
                 defer storage.deinit();
-                storage.crashAfterOperations(crash_after, .power_loss);
+                // The crash comes with the edit's write in flight.
+                storage.crashAfterOperations(edit_operation, kind);
 
                 var acknowledged: u64 = 0;
                 {
@@ -5417,15 +5538,54 @@ test "simulated: a crash while a manifest edit of several sectors is written lea
                 try testing.expect(storage.crashed);
                 storage.restart();
 
+                // Every sector of the edit holds something other than
+                // zeros: a header or part of a key.
+                var sectors_there: u64 = 0;
+                var sector_index: u64 = 0;
+                while (sector_index < 3) : (sector_index += 1) {
+                    const sector_start: usize = @intCast(edit_offsets[edit_index] + sector_index * sector_size);
+                    const sector = storage.contents(manifest.file_name)[sector_start..][0..sector_size];
+                    if (!std.mem.allEqual(u8, sector, 0)) {
+                        sectors_there += 1;
+                    }
+                }
+                if (sectors_there == 3) {
+                    edits_whole += 1;
+                }
+                if (sectors_there == 1 or sectors_there == 2) {
+                    edits_torn += 1;
+                }
+
+                // In half the trials the machine crashes again while the
+                // store is being opened, a few operations in.
+                if (seed % 2 == 1) {
+                    storage.crashAfterOperations(1 + seed, kind);
+                    if (openSimulatedStore(&storage)) |opened| {
+                        var store = opened;
+                        store.close(testing.allocator);
+                    } else |_| {}
+                    if (storage.crashed) {
+                        storage.restart();
+                    } else {
+                        // Opening took fewer operations than that.
+                        storage.crash(kind);
+                        storage.restart();
+                    }
+                }
+
                 var present: u64 = 0;
                 {
                     var store = try openSimulatedStore(&storage);
                     defer store.close(testing.allocator);
                     present = try expectWideAfterSimulatedCrash(&store, acknowledged);
+                    // Opening the store runs an interrupted flush again,
+                    // so the table is there whether the edit survived or
+                    // was written a second time.
+                    try testing.expect(store.tables.count() >= edit_index + 1);
                 }
 
-                // A second power loss, straight after the store was opened,
-                // must change nothing.
+                // A power loss straight after the store was opened must
+                // change nothing.
                 storage.crash(.power_loss_worst);
                 storage.restart();
                 var store = try openSimulatedStore(&storage);
@@ -5434,6 +5594,8 @@ test "simulated: a crash while a manifest edit of several sectors is written lea
             }
         }
     }
+    try testing.expect(edits_whole > 0);
+    try testing.expect(edits_torn > 0);
 }
 
 test "a first log that has lost its header, with no manifest, is reported, not deleted" {

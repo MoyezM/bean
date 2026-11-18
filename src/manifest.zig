@@ -14,6 +14,14 @@
 //! earlier edit, and a power loss partway through can damage only the edit
 //! being written.
 //!
+//! The log's known limit applies here through keys (see `sector_log.zig`).
+//! An edit holds each table's smallest and largest key as the client gave
+//! them, and an edit with long keys takes several sectors. If a key holds
+//! the image of a record header where a sector begins, and a power loss
+//! then tears that edit, the reader takes the image for a later record and
+//! reports the manifest as corrupt. Nothing durable is lost, but the store
+//! does not open until the manifest is repaired.
+//!
 //! The file is `file_size` bytes long from the moment it is created. Nothing
 //! rewrites the manifest yet, so a manifest that has no room for another
 //! edit is full for good, and `append` reports `ManifestFull`. Until tables
@@ -844,6 +852,12 @@ pub fn WriterType(comptime Storage: type) type {
             self.* = undefined;
         }
 
+        /// Whether the manifest has room for the edit that records a flush,
+        /// whatever keys the new table has.
+        pub fn hasRoomForFlush(self: *const Writer) bool {
+            return self.log.hasRoomFor(flush_edit_size_max);
+        }
+
         /// Appends one edit and makes it durable. `edit_bytes` must be a
         /// well-formed edit, from `encode`, that the store's `TableSet` has
         /// checked. It must not be in the writer's buffer.
@@ -870,9 +884,9 @@ pub fn ReaderType(comptime Storage: type) type {
 
         log: Log.Reader,
 
-        /// `IncompleteLog` means the file is all zeros or shorter than a
-        /// sector, which a crash while the manifest was being created leaves.
-        /// Such a file holds no edits. `WrongFileSize` also covers a file
+        /// `IncompleteLog` means the file is all zeros, of any length, which
+        /// a crash while the manifest was being created leaves. Such a file
+        /// holds no edits. `WrongFileSize` also covers a file
         /// that is whole but not `file_size` long, which this code never
         /// writes.
         pub const OpenError = Log.Reader.OpenError;
@@ -2305,13 +2319,20 @@ test "a full manifest refuses an edit and keeps the edits it has" {
     }
 
     var reader: RealReader = try .open(&real.storage, &file_buffer);
-    defer reader.close();
     var read: u64 = 0;
     while (try reader.next()) |_| {
         read += 1;
     }
     try testing.expectEqual(edits_that_fit, read);
-    try testing.expectEqual(@as(u64, file_size), reader.end().offset);
+    const end = reader.end();
+    try testing.expectEqual(@as(u64, file_size), end.offset);
+    reader.close();
+
+    // A writer opened on the full manifest refuses the same way.
+    var writer: RealWriter = try .open(&real.storage, &file_buffer, end);
+    defer writer.close();
+    try testing.expect(!writer.hasRoomForFlush());
+    try testing.expectError(error.ManifestFull, writer.append(edit_bytes));
 }
 
 test "file names are the number in at least six digits and an ending" {

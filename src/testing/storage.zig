@@ -217,6 +217,9 @@ pub const Storage = struct {
         listed: bool,
         /// Whether the directory would list the file after a power loss.
         listed_durable: bool,
+        /// Which operation was the last write started on the file, counted
+        /// as `operations_started` counts. 0 if there has been none.
+        write_operation_last: u64,
     };
 
     pub fn init(gpa: std.mem.Allocator, options: Options) Storage {
@@ -309,6 +312,7 @@ pub const Storage = struct {
             .durable_version = 0,
             .listed = true,
             .listed_durable = false,
+            .write_operation_last = 0,
         };
         self.file_count += 1;
         return .{ .index = index, .direct = options.direct, .access = .read_write };
@@ -406,6 +410,7 @@ pub const Storage = struct {
         };
         operation.pending.kind = .write;
         self.schedule(&operation.pending);
+        self.files[file.index].write_operation_last = operation.pending.sequence;
     }
 
     /// Starts a sync of the file: when it ends without an error, everything
@@ -536,6 +541,14 @@ pub const Storage = struct {
     pub fn contents(self: *Storage, name: []const u8) []const u8 {
         const index = self.findListed(name).?;
         return self.files[index].visible;
+    }
+
+    /// Which operation was the last write started on the file: 1 for the
+    /// first operation the storage was given. 0 if the file has not been
+    /// written to. A test uses this to plan a crash during that write.
+    pub fn lastWriteOperation(self: *Storage, name: []const u8) u64 {
+        const index = self.findListed(name).?;
+        return self.files[index].write_operation_last;
     }
 
     pub fn exists(self: *Storage, name: []const u8) bool {
