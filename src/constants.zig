@@ -105,3 +105,9 @@ pub const sector_size = 4096;
 /// a store takes before it is full: one log's worth for each table, and
 /// one more for the memtable.
 pub const log_file_size = 256 * 1024 * 1024;
+
+/// How many bits of memory a table's filter has for each key the table can
+/// hold. A lookup asks the filter before it reads the table; at ten bits a
+/// key, about one lookup in a hundred for a key the table does not hold
+/// reads the table anyway.
+pub const filter_bits_per_key = 10;

@@ -11,6 +11,7 @@ pub const write_batch = @import("write_batch.zig");
 
 test {
     _ = @import("async_io.zig");
+    _ = @import("bloom.zig");
     _ = @import("checksum.zig");
     _ = @import("durable.zig");
     _ = @import("bench_group_commit.zig");

@@ -67,6 +67,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const async_io = @import("async_io.zig");
+const bloom = @import("bloom.zig");
 const AsyncIo = async_io.AsyncIo;
 const constants = @import("constants.zig");
 const manifest = @import("manifest.zig");
@@ -229,6 +230,12 @@ pub fn StoreType(comptime Storage: type) type {
         /// Room for the index of every table: `tables_max` parts of
         /// `sstable.index_size_max` bytes, one for each slot.
         index_storage: []u8,
+        /// Room for the filter of every table: `tables_max` parts of
+        /// `filter_size` bytes, one for each slot.
+        filter_storage: []u8,
+        /// The length of each table's filter. It has `bloom.bits_per_key`
+        /// bits for each entry of the largest table this store writes.
+        filter_size: usize,
         /// Holds the data block a flush is filling.
         flush_block_buffer: []u8,
         /// Holds the data block `get` is reading.
@@ -254,6 +261,10 @@ pub fn StoreType(comptime Storage: type) type {
         /// Set when a write to a file has failed. The state of the files is
         /// then unknown, so every later write is refused.
         broken: bool,
+        /// How many times a lookup has read a table file. A lookup reads
+        /// none for a key the memtables hold, and none for a table whose
+        /// filter rules the key out.
+        table_reads: u64,
         /// How many times a write or a flush has been asked for. A scan
         /// remembers this number, to tell that nothing has changed under it.
         write_count: u64,
@@ -264,6 +275,11 @@ pub fn StoreType(comptime Storage: type) type {
             /// Only meaningful while the slot is in use.
             file_number: u64,
             reader: TableReader,
+            /// Which keys the table holds, more or less. A lookup asks it
+            /// before reading the table. It is not stored in the file: a
+            /// flush fills it as it writes the table, and `open` fills it
+            /// by reading the table through.
+            filter: bloom.Filter,
         };
 
         /// How far a flush has got.
@@ -301,6 +317,9 @@ pub fn StoreType(comptime Storage: type) type {
             slot_index: usize,
             /// Open while the stage is `writing`.
             writer: TableWriter,
+            /// The filter of the table being written, in that slot's part
+            /// of `filter_storage`. Each entry written is added to it.
+            filter: bloom.Filter,
             cursor: MemTable.Iterator,
             /// The entry to write next, or `null` once every entry is written.
             entry_next: ?MemTable.Entry,
@@ -707,6 +726,12 @@ pub fn StoreType(comptime Storage: type) type {
             errdefer gpa.free(edit_buffer);
             const index_storage = try gpa.alloc(u8, tables_max * sstable.index_size_max);
             errdefer gpa.free(index_storage);
+            // A table is one memtable written out, and every entry took at
+            // least this much of the memtable.
+            const table_entries_max = memtable_size / MemTable.entry_overhead_min;
+            const filter_size = bloom.sizeFor(table_entries_max);
+            const filter_storage = try gpa.alloc(u8, tables_max * filter_size);
+            errdefer gpa.free(filter_storage);
             const flush_block_buffer = try gpa.alloc(u8, sstable.block_size_max);
             errdefer gpa.free(flush_block_buffer);
             const get_block_buffer = try gpa.alloc(u8, sstable.block_size_max);
@@ -736,6 +761,8 @@ pub fn StoreType(comptime Storage: type) type {
                 .scratch = scratch,
                 .edit_buffer = edit_buffer,
                 .index_storage = index_storage,
+                .filter_storage = filter_storage,
+                .filter_size = filter_size,
                 .flush_block_buffer = flush_block_buffer,
                 .get_block_buffer = get_block_buffer,
                 .write_queue_head = null,
@@ -745,6 +772,7 @@ pub fn StoreType(comptime Storage: type) type {
                 .append_ended = false,
                 .advancing = false,
                 .broken = false,
+                .table_reads = 0,
                 .write_count = 0,
             };
             try store.recover(options);
@@ -775,6 +803,7 @@ pub fn StoreType(comptime Storage: type) type {
             self.scratch.deinit(gpa);
             gpa.free(self.edit_buffer);
             gpa.free(self.index_storage);
+            gpa.free(self.filter_storage);
             gpa.free(self.flush_block_buffer);
             gpa.free(self.get_block_buffer);
             gpa.free(self.log_buffer);
@@ -1180,7 +1209,10 @@ pub fn StoreType(comptime Storage: type) type {
             }
 
             // The tables, from the newest to the oldest. The first one that has
-            // an entry for the key has the newest one.
+            // an entry for the key has the newest one. A table is read only
+            // if the key lies in its range of keys and its filter does not
+            // rule the key out.
+            const key_hash = bloom.hash(key);
             var sequence_limit: ?u64 = null;
             while (true) {
                 const found = self.newestTableOlderThan(sequence_limit);
@@ -1197,6 +1229,10 @@ pub fn StoreType(comptime Storage: type) type {
                 if (std.mem.order(u8, key, table.key_max) == .gt) {
                     continue;
                 }
+                if (!slot.filter.mayContain(key_hash)) {
+                    continue;
+                }
+                self.table_reads += 1;
                 const in_table = try slot.reader.get(key, self.get_block_buffer);
                 switch (in_table) {
                     .value => |value| return try copyValue(value, buffer),
@@ -1300,6 +1336,13 @@ pub fn StoreType(comptime Storage: type) type {
             return self.index_storage[start..][0..sstable.index_size_max];
         }
 
+        /// The part of `filter_storage` that belongs to one table slot, as
+        /// a filter.
+        fn slotFilter(self: *const Store, slot_index: usize) bloom.Filter {
+            const start = slot_index * self.filter_size;
+            return .init(self.filter_storage[start..][0..self.filter_size]);
+        }
+
         /// The index of a slot that holds no table, or `null` if every slot is
         /// taken.
         fn freeSlotIndex(self: *const Store) ?usize {
@@ -1387,6 +1430,8 @@ pub fn StoreType(comptime Storage: type) type {
             var name_buffer: [manifest.file_name_size_max]u8 = undefined;
             const table_name = manifest.fileName(&name_buffer, .table, table_number);
 
+            const filter = self.slotFilter(slot_index);
+            filter.clear();
             const writer = try TableWriter.create(self.storage, table_name, .{}, .{
                 .block = self.flush_block_buffer,
                 .index = self.slotIndexBuffer(slot_index),
@@ -1403,6 +1448,7 @@ pub fn StoreType(comptime Storage: type) type {
                 .table_number = table_number,
                 .slot_index = slot_index,
                 .writer = writer,
+                .filter = filter,
                 .cursor = cursor,
                 .entry_next = entry_first,
                 .key_min = entry_first.key,
@@ -1488,6 +1534,8 @@ pub fn StoreType(comptime Storage: type) type {
                     else => |other| return other,
                 };
 
+                flushing.filter.add(bloom.hash(entry.key));
+
                 // The entries come in key order, so the last one written has
                 // the largest key so far.
                 flushing.key_max = entry.key;
@@ -1568,6 +1616,7 @@ pub fn StoreType(comptime Storage: type) type {
                 .in_use = true,
                 .file_number = flushing.table_number,
                 .reader = reader,
+                .filter = flushing.filter,
             };
             flushing.stage = .table_recorded;
         }
@@ -2005,10 +2054,25 @@ pub fn StoreType(comptime Storage: type) type {
                     return error.BlockTooLarge;
                 }
 
+                // The filter is not in the file. Read the table through to
+                // fill it. No flush is running yet, so its block buffer is
+                // free.
+                const filter = self.slotFilter(slot_index);
+                filter.clear();
+                var entries = reader.iterator(self.flush_block_buffer);
+                while (true) {
+                    const entry = try entries.next();
+                    if (entry == null) {
+                        break;
+                    }
+                    filter.add(bloom.hash(entry.?.key));
+                }
+
                 self.slots[slot_index] = .{
                     .in_use = true,
                     .file_number = table.file_number,
                     .reader = reader,
+                    .filter = filter,
                 };
             }
         }
@@ -5498,5 +5562,64 @@ test "simulated: with several writes in flight, a crash keeps a prefix that hold
         // that was in the log when the crash came, then nothing.
         const present = try expectAfterSimulatedCrash(&store, acknowledged);
         try testing.expect(present <= acknowledged + 1);
+    }
+}
+
+test "a lookup skips the tables whose filters rule the key out" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Three tables, each holding every third number, so that all three
+    // cover the same range of keys and only a filter can tell them apart.
+    // A third of them fits in one of the tests' small memtables.
+    const count = 150;
+    {
+        var store = try openSmallStore(tmp.dir);
+        defer store.close(testing.allocator);
+        var remainder: u64 = 0;
+        while (remainder < 3) : (remainder += 1) {
+            var number: u64 = remainder;
+            while (number < count) : (number += 3) {
+                try putNumbered(&store, 2 * number);
+            }
+            try store.flush();
+        }
+        try testing.expectEqual(@as(usize, 3), store.tables.count());
+
+        // A key that is there is found by reading one table, give or take
+        // the odd wrong "maybe" from another table's filter.
+        store.table_reads = 0;
+        var number: u64 = 0;
+        while (number < count) : (number += 1) {
+            try expectNumbered(&store, 2 * number);
+        }
+        try testing.expect(store.table_reads >= count);
+        try testing.expect(store.table_reads <= count + count / 10);
+
+        // A key that is in no table, but inside every table's range, reads
+        // almost none: odd numbers were never written.
+        store.table_reads = 0;
+        var key_buffer: [8]u8 = undefined;
+        number = 0;
+        while (number < count - 1) : (number += 1) {
+            try expectAbsent(&store, numberedKey(&key_buffer, 2 * number + 1));
+        }
+        try testing.expect(store.table_reads <= count / 10);
+    }
+
+    // The filters are not stored. Opening the store builds them again, and
+    // they work the same.
+    var store = try openSmallStore(tmp.dir);
+    defer store.close(testing.allocator);
+    store.table_reads = 0;
+    var key_buffer: [8]u8 = undefined;
+    var number: u64 = 0;
+    while (number < count - 1) : (number += 1) {
+        try expectAbsent(&store, numberedKey(&key_buffer, 2 * number + 1));
+    }
+    try testing.expect(store.table_reads <= count / 10);
+    number = 0;
+    while (number < count) : (number += 1) {
+        try expectNumbered(&store, 2 * number);
     }
 }
