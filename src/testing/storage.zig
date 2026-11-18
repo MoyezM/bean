@@ -54,7 +54,15 @@ pub const Options = struct {
     files_max: u32 = 256,
 };
 
-pub const CrashKind = enum { power_loss, process_kill };
+pub const CrashKind = enum {
+    /// The power goes. Each thing that was not durable is kept or lost by
+    /// the toss of a coin.
+    power_loss,
+    /// The power goes, and everything that was not durable is lost.
+    power_loss_worst,
+    /// The process dies and the machine stays up.
+    process_kill,
+};
 
 pub const Storage = struct {
     gpa: std.mem.Allocator,
@@ -460,10 +468,14 @@ pub const Storage = struct {
             pending = operation.next;
         }
 
-        if (kind == .power_loss) {
-            const names_kept = self.prng.random().boolean();
+        if (kind == .power_loss or kind == .power_loss_worst) {
+            const lose_all = kind == .power_loss_worst;
+            var names_kept = self.prng.random().boolean();
+            if (lose_all) {
+                names_kept = false;
+            }
             for (self.files[0..self.file_count]) |*file| {
-                self.losePower(file);
+                self.losePower(file, lose_all);
                 if (names_kept) {
                     file.listed_durable = file.listed;
                 } else {
@@ -703,12 +715,12 @@ pub const Storage = struct {
 
     /// The power went: each sector that was written and not made durable is
     /// kept or lost. Afterwards the two copies are the same.
-    fn losePower(self: *Storage, file: *FileState) void {
+    fn losePower(self: *Storage, file: *FileState, lose_all: bool) void {
         const random = self.prng.random();
         if (file.visible.len < file.durable.len) {
             // The file was cut down and the cut was not synced. It holds
             // or it does not.
-            if (random.boolean()) {
+            if (!lose_all and random.boolean()) {
                 file.durable = self.gpa.realloc(file.durable, file.visible.len) catch outOfMemory();
             }
         }
@@ -723,7 +735,7 @@ pub const Storage = struct {
             if (is_durable) {
                 continue;
             }
-            if (random.boolean()) {
+            if (!lose_all and random.boolean()) {
                 self.writeInto(&file.durable, offset, sector);
             }
         }

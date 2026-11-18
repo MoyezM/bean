@@ -826,9 +826,11 @@ const Bench = struct {
         batch: WriteBatch,
         operation: kv.DiskStore.Write = .{},
         in_flight: bool = false,
-        /// Set when a write has failed, for example because the store is
-        /// full. The lookups carry on without the writes.
+        /// Set when a write has failed. The lookups carry on without the
+        /// writes.
         stopped: bool = false,
+        /// Whether the write that failed did so because the store is full.
+        store_full: bool = false,
         /// How many writes have ended without an error.
         operations: u64 = 0,
 
@@ -846,7 +848,8 @@ const Bench = struct {
                 writer.stopped = true;
                 return;
             };
-            writer.bench.store.writeStart(&writer.operation, onEnded, &writer.batch) catch {
+            writer.bench.store.writeStart(&writer.operation, onEnded, &writer.batch) catch |err| {
+                std.debug.print("bean-bench: the writes stopped: {t}\n", .{err});
                 writer.stopped = true;
                 return;
             };
@@ -858,8 +861,13 @@ const Bench = struct {
             writer.in_flight = false;
             if (operation.result) |_| {
                 writer.operations += 1;
-            } else |_| {
+            } else |err| {
                 writer.stopped = true;
+                if (err == error.StoreFull) {
+                    writer.store_full = true;
+                } else {
+                    std.debug.print("bean-bench: the writes stopped: {t}\n", .{err});
+                }
             }
         }
     };
@@ -882,6 +890,13 @@ const Bench = struct {
             .batch = try .init(self.gpa),
         };
         defer writer.batch.deinit(self.gpa);
+        // On every way out, the write that is still in flight must end
+        // before its batch is freed.
+        defer {
+            while (self.store.hasWritesInFlight()) {
+                self.store.wait(std.time.ns_per_ms);
+            }
+        }
 
         const start_ns = nowNs(self.io);
         while (result.operations < self.config.readCount() and !deadline.passed()) {
@@ -912,7 +927,7 @@ const Bench = struct {
         }
 
         result.writes_meanwhile = writer.operations;
-        result.store_full = writer.stopped;
+        result.store_full = writer.store_full;
         result.latency = summarizeLatencies("read", samples_ns[0..timer.count]);
         return result;
     }

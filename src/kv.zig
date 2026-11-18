@@ -254,8 +254,9 @@ pub fn StoreType(comptime Storage: type) type {
         /// Set by the log when that append has ended, and cleared when
         /// `advance` has dealt with it.
         append_ended: bool,
-        /// Whether `advance` is running. A write's callback must not call
-        /// `poll`, `wait` or a blocking write.
+        /// Whether `advance` is running. A write's callback runs inside it,
+        /// and must not call `poll`, `wait`, `close`, `flush` or a blocking
+        /// write. It may read, and may start further writes.
         advancing: bool,
 
         /// Set when a write to a file has failed. The state of the files is
@@ -265,7 +266,9 @@ pub fn StoreType(comptime Storage: type) type {
         /// none for a key the memtables hold, and none for a table whose
         /// filter rules the key out.
         table_reads: u64,
-        /// How many times a write or a flush has been asked for. A scan
+        /// How many times the memtables or the set of tables may have
+        /// changed: a write was handed to the log, a batch went into the
+        /// memtable, or a flush was asked for. A scan
         /// remembers this number, to tell that nothing has changed under it.
         write_count: u64,
 
@@ -785,6 +788,7 @@ pub fn StoreType(comptime Storage: type) type {
         ///
         /// `gpa` must be the allocator passed to `open`.
         pub fn close(self: *Store, gpa: Allocator) void {
+            assert(!self.advancing);
             assert(!self.hasWritesInFlight());
             if (self.flushing != null) {
                 const flushing = &self.flushing.?;
@@ -908,7 +912,10 @@ pub fn StoreType(comptime Storage: type) type {
                 // has ended.
                 return;
             }
-            self.storage.wait(timeout_ns);
+            if (!self.append_ended) {
+                // Nothing has ended yet, so there is something to wait for.
+                self.storage.wait(timeout_ns);
+            }
             self.advance();
         }
 
@@ -953,6 +960,9 @@ pub fn StoreType(comptime Storage: type) type {
 
             while (self.write_logging == null and self.write_queue_head != null) {
                 if (self.broken) {
+                    // Callbacks run in the order the writes were started,
+                    // so the write that ended goes first.
+                    self.finishEnded(&ended, ended_is_applied);
                     self.finishWrite(self.dequeueWrite(), error.StoreBroken);
                     continue;
                 }
@@ -977,16 +987,30 @@ pub fn StoreType(comptime Storage: type) type {
 
                 _ = self.dequeueWrite();
                 self.logWrite(next, must_make_room) catch |err| {
+                    // The write that ended is told so before this one is
+                    // told it failed: callbacks run in start order.
+                    self.finishEnded(&ended, ended_is_applied);
                     self.finishWrite(next, err);
                 };
             }
 
-            if (ended) |write_ended| {
-                if (!ended_is_applied) {
-                    self.applyWrite(write_ended);
-                }
-                self.finishWrite(write_ended, {});
+            self.finishEnded(&ended, ended_is_applied);
+        }
+
+        /// Finishes the write whose record became durable, if it has not
+        /// been finished yet: puts its batch in the memtable unless that
+        /// has been done, runs its callback, and clears `ended` so that it
+        /// is not finished twice.
+        fn finishEnded(self: *Store, ended: *?*Write, ended_is_applied: bool) void {
+            if (ended.* == null) {
+                return;
             }
+            const operation = ended.*.?;
+            ended.* = null;
+            if (!ended_is_applied) {
+                self.applyWrite(operation);
+            }
+            self.finishWrite(operation, {});
         }
 
         /// Takes the oldest waiting write off the queue.
@@ -1033,6 +1057,8 @@ pub fn StoreType(comptime Storage: type) type {
         fn applyWrite(self: *Store, operation: *Write) void {
             const memtable = self.activeMemtable();
             self.sequence_last = applyBatch(memtable, operation.batch.bytes(), self.sequence_last + 1);
+            // The memtable has changed under any scan that is open.
+            self.write_count += 1;
         }
 
         fn finishWrite(self: *Store, operation: *Write, result: CommitError!void) void {
@@ -1159,6 +1185,7 @@ pub fn StoreType(comptime Storage: type) type {
         /// every later write returns `StoreBroken` until the store is closed and
         /// opened again.
         pub fn flush(self: *Store) CommitError!void {
+            assert(!self.advancing);
             assert(!self.hasWritesInFlight());
             if (self.broken) {
                 return error.StoreBroken;
@@ -5086,7 +5113,7 @@ fn hasNumberedSimulated(store: *SimulatedStore, number: u64) !bool {
 /// How many writes the crash tests make when nothing stops them: enough
 /// for the log to fill and the memtable to be frozen and flushed more than
 /// once.
-const crash_test_writes = 130;
+const crash_test_writes = 200;
 
 /// Checks a store that was reopened after a crash. Writes `0` to
 /// `acknowledged - 1` had returned before the crash and must all be there.
@@ -5124,6 +5151,7 @@ test "simulated: a store is created, written, closed and opened" {
         // freeze takes two file numbers, one for the new log and one for
         // the table.
         try testing.expect(store.log_number >= log_number_first + 3);
+        try testing.expect(store.tables.count() >= 2);
     }
 
     var store = try openSimulatedStore(&storage);
@@ -5192,8 +5220,9 @@ test "simulated: no acknowledged write is lost, whenever the crash comes" {
         }
 
         // Opening the store was the moment it took what it found as its
-        // contents. A power loss straight afterwards must change nothing.
-        storage.crash(.power_loss);
+        // contents. A power loss straight afterwards must change nothing,
+        // even one that loses everything that was not made durable.
+        storage.crash(.power_loss_worst);
         storage.restart();
         {
             var store = try openSimulatedStore(&storage);
@@ -5310,6 +5339,16 @@ test "simulated: a newer log whose header was written but not synced does not st
     // flush again, which makes the manifest name that log. The header must
     // be durable before that, or a power loss leaves the manifest naming a
     // file of zeros.
+    // Which of the freeze's storage operations is the write of the new
+    // log's header: after the writes that write the file out, and the sync
+    // of them.
+    const prewrite_writes = (crash_log_file_size + log_buffer_size - 1) / log_buffer_size;
+    const freeze_header_operation = prewrite_writes + 2;
+
+    // In how many seeds the header reached the disk without being synced,
+    // which is the state this test is about.
+    var header_landed: u64 = 0;
+
     var seed: u64 = 0;
     while (seed < 30) : (seed += 1) {
         var storage: Simulated = .init(testing.allocator, .{ .seed = seed });
@@ -5337,22 +5376,26 @@ test "simulated: a newer log whose header was written but not synced does not st
             }
             try testing.expectEqual(log_number_first, store.log_number);
 
-            // The next write freezes. Kill the process at each operation
-            // of the freeze in turn, one seed at a time.
-            storage.crashAfterOperations(1 + seed % 8, .process_kill);
+            // The next write freezes. The freeze writes the new log out,
+            // syncs it, and then writes its header. Kill the process with
+            // the header's write in flight: in some seeds the header's
+            // sector lands, and is then on the disk but not synced.
+            storage.crashAfterOperations(freeze_header_operation, .process_kill);
             putNumberedSimulated(&store, acknowledged) catch {};
         }
-        if (!storage.crashed) {
-            continue;
-        }
+        try testing.expect(storage.crashed);
         storage.restart();
+        if (storage.contents("000002.log")[0] != 0) {
+            header_landed += 1;
+        }
 
-        // Open the store, which may run the flush again, then lose power.
+        // Open the store, which may run the flush again, then lose power
+        // in the worst way: everything that was not made durable is gone.
         {
             var store = try openSimulatedStore(&storage);
             store.close(testing.allocator);
         }
-        storage.crash(.power_loss);
+        storage.crash(.power_loss_worst);
         storage.restart();
 
         var store = try openSimulatedStore(&storage);
@@ -5362,6 +5405,8 @@ test "simulated: a newer log whose header was written but not synced does not st
             try testing.expect(try hasNumberedSimulated(&store, number));
         }
     }
+    // The state was reached, so the test tested it.
+    try testing.expect(header_landed > 0);
 }
 
 /// A numbered write that has been started and not waited for, with the
