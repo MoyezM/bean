@@ -1,7 +1,8 @@
 //! The write-ahead log, in whole sectors, in a file of fixed size.
 //!
-//! This is the log the store writes its batches to. It replaces the format
-//! in `wal.zig` for that purpose; the manifest still uses `wal.zig`.
+//! This is the log the store writes its batches to, and the layout of the
+//! manifest (`manifest.zig`), whose records are edits. It replaces the
+//! format in `wal.zig`, which nothing uses any more.
 //!
 //! Why it differs from `wal.zig`. A durable write is cheap when it changes
 //! nothing but data, and expensive when the file system also has to record

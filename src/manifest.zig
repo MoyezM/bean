@@ -5,11 +5,19 @@
 //! manifest is the list of every edit since the store was created. Applying
 //! the edits in order gives the tables the store has now.
 //!
-//! The manifest is stored as a write-ahead log (see `wal.zig`) whose records
-//! are edits. That gives it the log's properties: every edit is checksummed
-//! and synced before it counts, an edit is applied whole or not at all, and
-//! an edit that a crash left half-written is ignored when the manifest is
-//! read back.
+//! The manifest is stored as a log in whole sectors (see `sector_log.zig`)
+//! whose records are edits. That gives it the log's properties: every edit
+//! is checksummed and durable before it counts, an edit is applied whole or
+//! not at all, and an edit that a crash left half-written is ignored when
+//! the manifest is read back. An edit starts on a sector boundary and is
+//! written in one piece, so writing it never touches a sector that holds an
+//! earlier edit, and a power loss partway through can damage only the edit
+//! being written.
+//!
+//! The file is `file_size` bytes long from the moment it is created. Nothing
+//! rewrites the manifest yet, so a manifest that has no room for another
+//! edit is full for good, and `append` reports `ManifestFull`. Until tables
+//! are merged a store never gets there: see the check beside `file_size`.
 //!
 //! An edit, with all integers little-endian:
 //!
@@ -58,7 +66,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const constants = @import("constants.zig");
-const wal = @import("wal.zig");
+const sector_log = @import("sector_log.zig");
 
 /// The longest key a table description holds.
 pub const key_size_max = constants.key_size_max;
@@ -88,6 +96,24 @@ pub const edit_size_max = edit_header_size +
     tables_max * table_size_max +
     tables_max * file_number_size;
 
+/// The most bytes an edit that adds one table and removes none takes. A
+/// flush writes such an edit.
+const flush_edit_size_max = edit_header_size + table_size_max;
+
+/// The length of the manifest file, in bytes.
+pub const file_size = constants.manifest_file_size;
+
+/// The length of the buffer a writer or a reader needs. It holds one edit
+/// as it is in the file: a record of whole sectors.
+pub const buffer_size = sector_log.bufferSize(edit_size_max);
+
+/// The memory a writer or a reader is given: `buffer_size` bytes that start
+/// on a sector boundary.
+pub const Buffer = []align(sector_log.sector_size) u8;
+
+/// Where the valid edits of a manifest end.
+pub const End = sector_log.End;
+
 /// The longest key the encoding can represent. Key lengths are a u16.
 const key_size_format_max = std.math.maxInt(u16);
 
@@ -108,7 +134,19 @@ comptime {
     assert(level_count <= level_count_format_max);
 
     // An edit is the payload of one log record.
-    assert(edit_size_max <= wal.payload_size_format_max);
+    assert(edit_size_max <= sector_log.payload_size_format_max);
+
+    assert(file_size % sector_log.sector_size == 0);
+    assert(file_size >= sector_log.fileSizeMin(edit_size_max));
+
+    // Nothing merges tables yet. A store appends one edit when it is
+    // created and one for each flush, and it stops flushing once it holds
+    // `tables_max` tables. The file has room for all of those edits at
+    // their largest, so such a store never fills its manifest.
+    const creation_edit_room = sector_log.recordSize(edit_header_size);
+    const flush_edit_room = sector_log.recordSize(flush_edit_size_max);
+    const edits_room = creation_edit_room + tables_max * flush_edit_room;
+    assert(file_size >= sector_log.sector_size + edits_room);
 }
 
 /// The first bytes of every edit, as they are in the file.
@@ -764,26 +802,40 @@ pub const TableSet = struct {
 pub fn WriterType(comptime Storage: type) type {
     return struct {
         const Writer = @This();
-        const LogWriter = wal.WriterType(Storage);
+        const Log = sector_log.LogType(Storage);
 
-        log: LogWriter,
+        log: Log.Writer,
 
-        pub const CreateError = LogWriter.CreateError;
-        pub const OpenError = LogWriter.OpenError;
-        pub const AppendError = Storage.WriteError || Storage.SyncError;
+        pub const CreateError = Log.Writer.CreateError;
+        pub const OpenError = Log.Writer.OpenError;
+        pub const AppendError = error{
+            /// The manifest has no room for the edit. Nothing was written,
+            /// and the writer can still be used.
+            ManifestFull,
+        } || Storage.WriteError;
 
-        /// Creates a new, empty manifest, and syncs it. Fails if the file
-        /// already exists.
-        pub fn create(storage: *Storage) CreateError!Writer {
-            const log = try LogWriter.create(storage, file_name, edit_size_max, .none);
+        /// Creates a new, empty manifest, `file_size` bytes long, and makes
+        /// it durable. Fails if the file already exists.
+        ///
+        /// `buffer` holds each edit on its way to the file. It must be
+        /// `buffer_size` long, and the writer uses it until it is closed.
+        pub fn create(storage: *Storage, buffer: Buffer) CreateError!Writer {
+            assert(buffer.len == buffer_size);
+            const log = try Log.Writer.create(storage, file_name, file_size, buffer, .none);
             return .{ .log = log };
         }
 
         /// Opens an existing manifest to append after its valid edits. `end`
         /// must come from `Reader.end` after that reader reached the end of the
         /// same file.
-        pub fn open(storage: *Storage, end: wal.End) OpenError!Writer {
-            const log = try LogWriter.open(storage, file_name, edit_size_max, end);
+        ///
+        /// What a crash left of a half-written edit is wiped, and the file
+        /// is synced, before this returns.
+        ///
+        /// `buffer` is as for `create`.
+        pub fn open(storage: *Storage, buffer: Buffer, end: End) OpenError!Writer {
+            assert(buffer.len == buffer_size);
+            const log = try Log.Writer.open(storage, file_name, file_size, buffer, end);
             return .{ .log = log };
         }
 
@@ -792,17 +844,18 @@ pub fn WriterType(comptime Storage: type) type {
             self.* = undefined;
         }
 
-        /// Appends one edit and syncs the file. `edit_bytes` must be a
+        /// Appends one edit and makes it durable. `edit_bytes` must be a
         /// well-formed edit, from `encode`, that the store's `TableSet` has
-        /// checked.
+        /// checked. It must not be in the writer's buffer.
         ///
-        /// After an error the state of the file is unknown, and the writer must
-        /// not be used again.
+        /// After any error other than `ManifestFull` the state of the file is
+        /// unknown, and the writer must not be used again.
         pub fn append(self: *Writer, edit_bytes: []const u8) AppendError!void {
             assert(edit_bytes.len <= edit_size_max);
             _ = self.log.append(edit_bytes) catch |err| switch (err) {
-                // An edit is never longer than the limit the log was given.
+                // An edit is never longer than the buffer was sized for.
                 error.PayloadTooLarge => unreachable,
+                error.LogFull => return error.ManifestFull,
                 else => |other| return other,
             };
         }
@@ -813,22 +866,31 @@ pub fn WriterType(comptime Storage: type) type {
 pub fn ReaderType(comptime Storage: type) type {
     return struct {
         const Reader = @This();
-        const LogReader = wal.ReaderType(Storage);
+        const Log = sector_log.LogType(Storage);
 
-        log: LogReader,
+        log: Log.Reader,
 
-        pub const OpenError = LogReader.OpenError;
+        /// `IncompleteLog` means the file is all zeros or shorter than a
+        /// sector, which a crash while the manifest was being created leaves.
+        /// Such a file holds no edits. `WrongFileSize` also covers a file
+        /// that is whole but not `file_size` long, which this code never
+        /// writes.
+        pub const OpenError = Log.Reader.OpenError;
 
         pub const NextError = error{
             /// A record of the manifest is not a well-formed edit.
             InvalidEdit,
-        } || LogReader.NextError;
+        } || Log.Reader.NextError;
 
         /// Opens the manifest. `buffer` holds one edit at a time, and must be
-        /// at least `edit_size_max` long.
-        pub fn open(storage: *Storage, buffer: []u8) OpenError!Reader {
-            assert(buffer.len >= edit_size_max);
-            const log = try LogReader.open(storage, file_name, buffer);
+        /// `buffer_size` long.
+        pub fn open(storage: *Storage, buffer: Buffer) OpenError!Reader {
+            assert(buffer.len == buffer_size);
+            var log = try Log.Reader.open(storage, file_name, buffer);
+            errdefer log.close();
+            if (log.file_size != file_size) {
+                return error.WrongFileSize;
+            }
             return .{ .log = log };
         }
 
@@ -851,7 +913,7 @@ pub fn ReaderType(comptime Storage: type) type {
 
         /// Where the edits returned so far end. Once `next` has returned `null`,
         /// this is where a `Writer` should resume.
-        pub fn end(self: *const Reader) wal.End {
+        pub fn end(self: *const Reader) End {
             return self.log.end();
         }
     };
@@ -926,7 +988,11 @@ const testing = std.testing;
 const RealStorage = @import("testing/real_storage.zig").RealStorage;
 const RealWriter = WriterType(@import("storage.zig").Storage);
 const RealReader = ReaderType(@import("storage.zig").Storage);
-const RealLogWriter = wal.WriterType(@import("storage.zig").Storage);
+const RealLog = sector_log.LogType(@import("storage.zig").Storage);
+
+/// The memory a test gives a writer or a reader.
+const TestBuffer = [buffer_size]u8;
+const test_buffer_alignment = sector_log.sector_size;
 
 /// The flushed op and flushed sequence number that the tests' edits carry,
 /// unless a test is about those numbers. The sequence number is larger than
@@ -1951,12 +2017,12 @@ test "the flushed numbers move only with the log, and only forwards" {
 }
 
 /// Reads the whole manifest in `dir` into `set`, and returns where it ends.
-fn readManifest(dir: Io.Dir, set: *TableSet) !wal.End {
+fn readManifest(dir: Io.Dir, set: *TableSet) !End {
     var real: RealStorage = undefined;
     try real.init(dir);
     defer real.deinit();
-    var buffer: [edit_size_max]u8 = undefined;
-    var reader: RealReader = try .open(&real.storage, &buffer);
+    var file_buffer: TestBuffer align(test_buffer_alignment) = undefined;
+    var reader: RealReader = try .open(&real.storage, &file_buffer);
     defer reader.close();
 
     while (try reader.next()) |edit| {
@@ -1973,9 +2039,10 @@ test "edits written to a manifest rebuild the same tables when it is read" {
     try real.init(tmp.dir);
     defer real.deinit();
     var buffer: [edit_size_max]u8 = undefined;
+    var file_buffer: TestBuffer align(test_buffer_alignment) = undefined;
 
     {
-        var writer: RealWriter = try .create(&real.storage);
+        var writer: RealWriter = try .create(&real.storage, &file_buffer);
         defer writer.close();
         try writer.append(encode(.{
             .added = &.{testTable(2, "a", "m")},
@@ -2001,10 +2068,12 @@ test "edits written to a manifest rebuild the same tables when it is read" {
     try testing.expectEqual(@as(usize, 2), set.count());
     try testing.expectEqual(@as(u64, 5), set.log_number);
     try testing.expectEqual(@as(u64, 6), set.file_number_next);
+    // The header's sector, and one sector for each of the two edits.
+    try testing.expectEqual(@as(u64, 3 * sector_log.sector_size), end.offset);
 
     // More edits are appended after the ones already there.
     {
-        var writer: RealWriter = try .open(&real.storage, end);
+        var writer: RealWriter = try .open(&real.storage, &file_buffer, end);
         defer writer.close();
         try writer.append(encode(.{
             .added = &.{testTable(6, "a", "z")},
@@ -2026,17 +2095,21 @@ test "edits written to a manifest rebuild the same tables when it is read" {
     try testing.expectEqual(test_sequence_flushed, reopened.sequence_flushed);
 }
 
-test "an edit that a crash left half-written is ignored" {
+test "an edit that a crash left half-written is ignored, and the next edit takes its place" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var real: RealStorage = undefined;
     try real.init(tmp.dir);
     defer real.deinit();
     var buffer: [edit_size_max]u8 = undefined;
+    var file_buffer: TestBuffer align(test_buffer_alignment) = undefined;
 
-    var len_after_first: u64 = 0;
+    // The second edit has keys long enough that it takes three sectors.
+    const long_key_min: [key_size_max]u8 = @splat('b');
+    const long_key_max: [key_size_max]u8 = @splat('y');
+    var second_edit_offset: u64 = 0;
     {
-        var writer: RealWriter = try .create(&real.storage);
+        var writer: RealWriter = try .create(&real.storage, &file_buffer);
         defer writer.close();
         try writer.append(encode(.{
             .added = &.{testTable(2, "a", "m")},
@@ -2046,13 +2119,80 @@ test "an edit that a crash left half-written is ignored" {
             .op_flushed = test_op_flushed,
             .sequence_flushed = test_sequence_flushed,
         }, &buffer));
-
-        const file = try tmp.dir.openFile(testing.io, file_name, .{ .mode = .read_only });
-        len_after_first = try file.length(testing.io);
-        file.close(testing.io);
+        second_edit_offset = writer.log.offset;
 
         try writer.append(encode(.{
-            .added = &.{testTable(4, "b", "z")},
+            .added = &.{testTable(4, &long_key_min, &long_key_max)},
+            .removed = &.{},
+            .log_number = 5,
+            .file_number_next = 6,
+            .op_flushed = test_op_flushed,
+            .sequence_flushed = test_sequence_flushed,
+        }, &buffer));
+        try testing.expectEqual(second_edit_offset + 3 * sector_log.sector_size, writer.log.offset);
+    }
+
+    // The second edit's first sector reached the disk and its last did not.
+    {
+        const file = try tmp.dir.openFile(testing.io, file_name, .{ .mode = .write_only });
+        defer file.close(testing.io);
+        const zeros: [sector_log.sector_size]u8 = @splat(0);
+        const last_sector_offset = second_edit_offset + 2 * sector_log.sector_size;
+        try file.writePositionalAll(testing.io, &zeros, last_sector_offset);
+    }
+
+    var set: TableSet = try .init(testing.allocator);
+    defer set.deinit(testing.allocator);
+    const end = try readManifest(tmp.dir, &set);
+    try testing.expectEqual(@as(usize, 1), set.count());
+    try testing.expect(set.find(2) != null);
+    try testing.expect(set.find(4) == null);
+    try testing.expectEqual(second_edit_offset, end.offset);
+
+    // A writer carries on from there, over what is left of the torn edit.
+    {
+        var writer: RealWriter = try .open(&real.storage, &file_buffer, end);
+        defer writer.close();
+        try writer.append(encode(.{
+            .added = &.{testTable(4, "n", "z")},
+            .removed = &.{},
+            .log_number = 5,
+            .file_number_next = 6,
+            .op_flushed = test_op_flushed,
+            .sequence_flushed = test_sequence_flushed,
+        }, &buffer));
+    }
+    var reopened: TableSet = try .init(testing.allocator);
+    defer reopened.deinit(testing.allocator);
+    _ = try readManifest(tmp.dir, &reopened);
+    try testing.expectEqual(@as(usize, 2), reopened.count());
+    try expectTable(testTable(4, "n", "z"), reopened.find(4).?.*);
+}
+
+test "an edit damaged before the last one is reported, not taken for the end" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
+    var buffer: [edit_size_max]u8 = undefined;
+    var file_buffer: TestBuffer align(test_buffer_alignment) = undefined;
+
+    var first_edit_offset: u64 = 0;
+    {
+        var writer: RealWriter = try .create(&real.storage, &file_buffer);
+        defer writer.close();
+        first_edit_offset = writer.log.offset;
+        try writer.append(encode(.{
+            .added = &.{testTable(2, "a", "m")},
+            .removed = &.{},
+            .log_number = 3,
+            .file_number_next = 4,
+            .op_flushed = test_op_flushed,
+            .sequence_flushed = test_sequence_flushed,
+        }, &buffer));
+        try writer.append(encode(.{
+            .added = &.{testTable(4, "n", "z")},
             .removed = &.{},
             .log_number = 5,
             .file_number_next = 6,
@@ -2061,19 +2201,20 @@ test "an edit that a crash left half-written is ignored" {
         }, &buffer));
     }
 
-    // Cut the file partway through the second edit.
+    // Damage one byte of the first edit.
     {
-        const file = try tmp.dir.openFile(testing.io, file_name, .{ .mode = .write_only });
+        const file = try tmp.dir.openFile(testing.io, file_name, .{ .mode = .read_write });
         defer file.close(testing.io);
-        try file.setLength(testing.io, len_after_first + 10);
+        const damaged_offset = first_edit_offset + sector_log.record_header_size;
+        var byte: [1]u8 = undefined;
+        _ = try file.readPositionalAll(testing.io, &byte, damaged_offset);
+        byte[0] ^= 0xff;
+        try file.writePositionalAll(testing.io, &byte, damaged_offset);
     }
 
     var set: TableSet = try .init(testing.allocator);
     defer set.deinit(testing.allocator);
-    _ = try readManifest(tmp.dir, &set);
-    try testing.expectEqual(@as(usize, 1), set.count());
-    try testing.expect(set.find(2) != null);
-    try testing.expect(set.find(4) == null);
+    try testing.expectError(error.Corrupt, readManifest(tmp.dir, &set));
 }
 
 test "a manifest record that is not an edit is reported" {
@@ -2082,17 +2223,95 @@ test "a manifest record that is not an edit is reported" {
     var real: RealStorage = undefined;
     try real.init(tmp.dir);
     defer real.deinit();
+    var file_buffer: TestBuffer align(test_buffer_alignment) = undefined;
 
     {
-        var log: RealLogWriter = try .create(&real.storage, file_name, edit_size_max, .none);
+        var log: RealLog.Writer = try .create(&real.storage, file_name, file_size, &file_buffer, .none);
         defer log.close();
         _ = try log.append("not an edit");
     }
 
-    var buffer: [edit_size_max]u8 = undefined;
-    var reader: RealReader = try .open(&real.storage, &buffer);
+    var reader: RealReader = try .open(&real.storage, &file_buffer);
     defer reader.close();
     try testing.expectError(error.InvalidEdit, reader.next());
+}
+
+test "a manifest that is not the length this code writes is reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
+    var file_buffer: TestBuffer align(test_buffer_alignment) = undefined;
+
+    // A whole log, with a header that gives its length rightly, but longer
+    // than a manifest is.
+    {
+        const longer_size = file_size + sector_log.sector_size;
+        var log: RealLog.Writer = try .create(&real.storage, file_name, longer_size, &file_buffer, .none);
+        log.close();
+    }
+    try testing.expectError(error.WrongFileSize, RealReader.open(&real.storage, &file_buffer));
+}
+
+test "a manifest that was never finished being created holds no edits" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
+    var file_buffer: TestBuffer align(test_buffer_alignment) = undefined;
+
+    // What a crash before the header was written leaves: zeros.
+    {
+        const file = try tmp.dir.createFile(testing.io, file_name, .{});
+        defer file.close(testing.io);
+        const zeros: [sector_log.sector_size]u8 = @splat(0);
+        try file.writePositionalAll(testing.io, &zeros, 0);
+        try file.writePositionalAll(testing.io, &zeros, sector_log.sector_size);
+    }
+    try testing.expectError(error.IncompleteLog, RealReader.open(&real.storage, &file_buffer));
+}
+
+test "a full manifest refuses an edit and keeps the edits it has" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var real: RealStorage = undefined;
+    try real.init(tmp.dir);
+    defer real.deinit();
+    var buffer: [edit_size_max]u8 = undefined;
+    var file_buffer: TestBuffer align(test_buffer_alignment) = undefined;
+
+    // An edit that changes no tables takes one sector. Fill the file.
+    const edit_bytes = encode(.{
+        .added = &.{},
+        .removed = &.{},
+        .log_number = 3,
+        .file_number_next = 4,
+        .op_flushed = test_op_flushed,
+        .sequence_flushed = test_sequence_flushed,
+    }, &buffer);
+    const edits_that_fit = file_size / sector_log.sector_size - 1;
+    {
+        var writer: RealWriter = try .create(&real.storage, &file_buffer);
+        defer writer.close();
+        var appended: u64 = 0;
+        while (appended < edits_that_fit) : (appended += 1) {
+            try writer.append(edit_bytes);
+        }
+        try testing.expectError(error.ManifestFull, writer.append(edit_bytes));
+        // The refusal changed nothing, and can be repeated.
+        try testing.expectError(error.ManifestFull, writer.append(edit_bytes));
+    }
+
+    var reader: RealReader = try .open(&real.storage, &file_buffer);
+    defer reader.close();
+    var read: u64 = 0;
+    while (try reader.next()) |_| {
+        read += 1;
+    }
+    try testing.expectEqual(edits_that_fit, read);
+    try testing.expectEqual(@as(u64, file_size), reader.end().offset);
 }
 
 test "file names are the number in at least six digits and an ending" {

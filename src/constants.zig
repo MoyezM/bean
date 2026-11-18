@@ -106,6 +106,14 @@ pub const sector_size = 4096;
 /// one more for the memtable.
 pub const log_file_size = 256 * 1024 * 1024;
 
+/// The length of the manifest file, in bytes. Like a log, the manifest is
+/// written out to this length when it is created.
+///
+/// Nothing rewrites the manifest yet, so this bounds how many edits a store
+/// can ever record. `manifest.zig` checks that it is enough for a store
+/// that only flushes.
+pub const manifest_file_size = 1024 * 1024;
+
 /// How many bits of memory a table's filter has for each key the table can
 /// hold. A lookup asks the filter before it reads the table; at ten bits a
 /// key, about one lookup in a hundred for a key the table does not hold

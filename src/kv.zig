@@ -75,7 +75,6 @@ const MemTable = @import("memtable.zig").MemTable;
 const sector_log = @import("sector_log.zig");
 const sstable = @import("sstable.zig");
 const DiskStorage = @import("storage.zig").Storage;
-const wal = @import("wal.zig");
 const write_batch = @import("write_batch.zig");
 const WriteBatch = write_batch.WriteBatch;
 
@@ -225,8 +224,12 @@ pub fn StoreType(comptime Storage: type) type {
         /// A batch for `put` and `delete` to build their one operation in. Its
         /// buffer also holds each record while a log is replayed in `open`.
         scratch: WriteBatch,
-        /// Holds one manifest edit, while it is read or written.
+        /// Holds one manifest edit while it is put together, before it is
+        /// handed to the manifest's writer.
         edit_buffer: []u8,
+        /// Holds one manifest edit as it is in the file, on its way there or
+        /// back. `manifest.buffer_size` bytes.
+        manifest_buffer: manifest.Buffer,
         /// Room for the index of every table: `tables_max` parts of
         /// `sstable.index_size_max` bytes, one for each slot.
         index_storage: []u8,
@@ -341,6 +344,9 @@ pub fn StoreType(comptime Storage: type) type {
         pub const FlushError = error{
             /// The table that was just written does not read back as written.
             Corrupt,
+            /// The manifest has no room to record the table. Nothing rewrites
+            /// the manifest yet, so the store takes no more flushes.
+            ManifestFull,
         } || Storage.CreateError || Storage.OpenError || Storage.WriteError || Storage.SyncError ||
             Storage.SizeError || Storage.ReadError || Storage.SyncDirError || Storage.DeleteError;
 
@@ -727,6 +733,8 @@ pub fn StoreType(comptime Storage: type) type {
 
             const edit_buffer = try gpa.alloc(u8, manifest.edit_size_max);
             errdefer gpa.free(edit_buffer);
+            const manifest_buffer = try gpa.alignedAlloc(u8, .fromByteUnits(sector_size), manifest.buffer_size);
+            errdefer gpa.free(manifest_buffer);
             const index_storage = try gpa.alloc(u8, tables_max * sstable.index_size_max);
             errdefer gpa.free(index_storage);
             // A table is one memtable written out, and every entry took at
@@ -763,6 +771,7 @@ pub fn StoreType(comptime Storage: type) type {
                 .flushing = null,
                 .scratch = scratch,
                 .edit_buffer = edit_buffer,
+                .manifest_buffer = manifest_buffer,
                 .index_storage = index_storage,
                 .filter_storage = filter_storage,
                 .filter_size = filter_size,
@@ -806,6 +815,7 @@ pub fn StoreType(comptime Storage: type) type {
             self.tables.deinit(gpa);
             self.scratch.deinit(gpa);
             gpa.free(self.edit_buffer);
+            gpa.free(self.manifest_buffer);
             gpa.free(self.index_storage);
             gpa.free(self.filter_storage);
             gpa.free(self.flush_block_buffer);
@@ -1759,11 +1769,11 @@ pub fn StoreType(comptime Storage: type) type {
             // record that a crash left half-written, and an interrupted flush
             // is run again.
             //
-            // The manifest is opened for writing first. That cuts off an edit
+            // The manifest is opened for writing first. That wipes an edit
             // a crash left half-written and syncs the file, so that every
             // edit read above, which the deletions below rely on, is durable
             // before a file is deleted on its say-so.
-            self.manifest_writer = try ManifestWriter.open(self.storage, manifest_end.?);
+            self.manifest_writer = try ManifestWriter.open(self.storage, self.manifest_buffer, manifest_end.?);
             errdefer self.manifest_writer.close();
 
             try self.removeStrayFiles();
@@ -1821,10 +1831,15 @@ pub fn StoreType(comptime Storage: type) type {
         /// the manifest ends, or `null` if the directory holds no store: there
         /// is no manifest, or a crash while the store was being created left
         /// one with no edits in it.
-        fn readManifest(self: *Store) OpenError!?wal.End {
-            var reader = ManifestReader.open(self.storage, self.edit_buffer) catch |err| switch (err) {
+        fn readManifest(self: *Store) OpenError!?manifest.End {
+            var reader = ManifestReader.open(self.storage, self.manifest_buffer) catch |err| switch (err) {
                 error.FileNotFound => return null,
+                // The file is all zeros: a crash came while it was being
+                // created. It holds no edits.
                 error.IncompleteLog => return null,
+                // The header is intact, and the file is not the length a
+                // manifest is.
+                error.WrongFileSize => return error.Corrupt,
                 else => |other| return other,
             };
             defer reader.close();
@@ -1871,7 +1886,7 @@ pub fn StoreType(comptime Storage: type) type {
             self.log = try Log.Writer.create(self.storage, log_name, self.log_file_size, self.log_buffer, .none);
             errdefer self.log.close();
 
-            self.manifest_writer = try ManifestWriter.create(self.storage);
+            self.manifest_writer = try ManifestWriter.create(self.storage, self.manifest_buffer);
             errdefer self.manifest_writer.close();
 
             const edit_bytes = manifest.encode(.{
@@ -2107,7 +2122,7 @@ pub fn StoreType(comptime Storage: type) type {
         /// What `replayLog` learned about a log.
         const ReplayedLog = struct {
             /// The record the log carries on from, as its file header says.
-            previous: wal.RecordId,
+            previous: sector_log.RecordId,
             /// Where the log's valid records end.
             end: sector_log.End,
             /// The length of the log's file.
@@ -2251,6 +2266,9 @@ const DiskLog = DiskStore.Log;
 const DiskTableWriter = DiskStore.TableWriter;
 const DiskManifestWriter = DiskStore.ManifestWriter;
 const DiskManifestReader = DiskStore.ManifestReader;
+
+/// The memory a test gives a manifest writer or reader.
+const TestManifestBuffer = [manifest.buffer_size]u8;
 const RealStorage = @import("testing/real_storage.zig").RealStorage;
 
 /// The size of each memtable in the tests that need a memtable to fill
@@ -3382,7 +3400,8 @@ test "a store whose creation a crash cut off before the first edit is created ag
         var real: RealStorage = undefined;
         try real.init(tmp.dir);
         defer real.deinit();
-        var manifest_writer: DiskManifestWriter = try .create(&real.storage);
+        var manifest_buffer: TestManifestBuffer align(sector_size) = undefined;
+        var manifest_writer: DiskManifestWriter = try .create(&real.storage, &manifest_buffer);
         manifest_writer.close();
     }
 
@@ -3398,6 +3417,28 @@ test "a store whose creation a crash cut off before the first edit is created ag
     var store = try openStore(tmp.dir);
     defer store.close(testing.allocator);
     try expectValue(&store, "a", "1");
+}
+
+test "a manifest that is not in this code's layout is reported, and nothing is deleted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openStore(tmp.dir);
+        defer store.close(testing.allocator);
+        try store.put("a", "1");
+    }
+
+    // Put something else where the manifest's header is: a manifest written
+    // by an older version of this code, say.
+    {
+        const file = try tmp.dir.openFile(testing.io, manifest.file_name, .{ .mode = .write_only });
+        defer file.close(testing.io);
+        try file.writePositionalAll(testing.io, "beanlog1", 0);
+    }
+
+    try testing.expectError(error.NotALog, openStore(tmp.dir));
+    try testing.expect(try fileExists(tmp.dir, manifest.file_name));
+    try testing.expect(try fileExists(tmp.dir, "000001.log"));
 }
 
 test "files of a store whose manifest is gone are not taken for a new store" {
@@ -3445,16 +3486,16 @@ test "a manifest edit that does not fit the edits before it is reported" {
             .sequence_flushed = 0,
         }, &edit_buffer);
 
-        var read_buffer: [manifest.edit_size_max]u8 = undefined;
+        var manifest_buffer: TestManifestBuffer align(sector_size) = undefined;
         var real: RealStorage = undefined;
         try real.init(tmp.dir);
         defer real.deinit();
-        var reader: DiskManifestReader = try .open(&real.storage, &read_buffer);
+        var reader: DiskManifestReader = try .open(&real.storage, &manifest_buffer);
         while (try reader.next()) |_| {}
         const end = reader.end();
         reader.close();
 
-        var writer: DiskManifestWriter = try .open(&real.storage, end);
+        var writer: DiskManifestWriter = try .open(&real.storage, &manifest_buffer, end);
         defer writer.close();
         try writer.append(edit_bytes);
     }
@@ -3483,7 +3524,7 @@ test "a manifest whose flushed op is too large to count on from is reported" {
     // before the largest.
     const op_before_largest = std.math.maxInt(u64) - 1;
     {
-        const previous: wal.RecordId = .{ .op = op_before_largest, .checksum = 0 };
+        const previous: sector_log.RecordId = .{ .op = op_before_largest, .checksum = 0 };
         var logs: TestLogs = undefined;
         try logs.init(tmp.dir);
         defer logs.deinit();
@@ -3508,7 +3549,8 @@ test "a manifest whose flushed op is too large to count on from is reported" {
         var real: RealStorage = undefined;
         try real.init(tmp.dir);
         defer real.deinit();
-        var writer: DiskManifestWriter = try .create(&real.storage);
+        var manifest_buffer: TestManifestBuffer align(sector_size) = undefined;
+        var writer: DiskManifestWriter = try .create(&real.storage, &manifest_buffer);
         defer writer.close();
         try writer.append(edit_bytes);
     }
@@ -4037,37 +4079,47 @@ test "open deletes nothing when the manifest has lost its last edit" {
     defer tmp.cleanup();
     try makeStoreWithOneTable(tmp.dir);
 
-    // Damage the last byte of the manifest. The edit that recorded the
-    // flush no longer counts, so the manifest names the first log, which
-    // the flush deleted, and holds no table.
+    // Damage a byte of the manifest's last edit. The edit that recorded
+    // the flush no longer counts, so the manifest names the first log,
+    // which the flush deleted, and holds no table.
+    //
+    // The manifest holds two edits of one sector each, after its header's
+    // sector: the one that created the store, and the flush's.
+    const flush_edit_offset = 2 * sector_size;
+    const manifest_before = try testing.allocator.alloc(u8, manifest.file_size);
+    defer testing.allocator.free(manifest_before);
     {
         const file = try tmp.dir.openFile(testing.io, manifest.file_name, .{ .mode = .read_write });
         defer file.close(testing.io);
-        const len = try file.length(testing.io);
-        var last: [1]u8 = undefined;
-        _ = try file.readPositionalAll(testing.io, &last, len - 1);
-        last[0] ^= 0xff;
-        try file.writePositionalAll(testing.io, &last, len - 1);
+        try testing.expectEqual(@as(u64, manifest.file_size), try file.length(testing.io));
+
+        const damaged_offset = flush_edit_offset + sector_log.record_header_size;
+        var byte: [1]u8 = undefined;
+        _ = try file.readPositionalAll(testing.io, &byte, damaged_offset);
+        // The edit is there: its first byte is the count of tables it adds.
+        try testing.expectEqual(@as(u8, 1), byte[0]);
+        byte[0] ^= 0xff;
+        try file.writePositionalAll(testing.io, &byte, damaged_offset);
+
+        _ = try file.readPositionalAll(testing.io, manifest_before, 0);
     }
-    const manifest_len_before = blk: {
-        const file = try tmp.dir.openFile(testing.io, manifest.file_name, .{ .mode = .read_only });
-        defer file.close(testing.io);
-        break :blk try file.length(testing.io);
-    };
 
     try testing.expectError(error.Corrupt, openStore(tmp.dir));
 
-    // The table that holds the data is still there, and so is all of the
-    // manifest.
+    // The table that holds the data is still there, and the manifest is as
+    // it was: the damaged edit was not wiped.
     try expectNumberedFiles(tmp.dir, &.{ "000002.log", "000003.sst" });
+    const manifest_after = try testing.allocator.alloc(u8, manifest.file_size);
+    defer testing.allocator.free(manifest_after);
     const file = try tmp.dir.openFile(testing.io, manifest.file_name, .{ .mode = .read_only });
     defer file.close(testing.io);
-    try testing.expectEqual(manifest_len_before, try file.length(testing.io));
+    _ = try file.readPositionalAll(testing.io, manifest_after, 0);
+    try testing.expect(std.mem.eql(u8, manifest_before, manifest_after));
 }
 
 /// Makes a store in `dir` that holds one write in its first log, closes
 /// it, and returns the last record of that log.
-fn makeStoreWithOneWrite(dir: Io.Dir) !wal.RecordId {
+fn makeStoreWithOneWrite(dir: Io.Dir) !sector_log.RecordId {
     var store = try openStore(dir);
     defer store.close(testing.allocator);
     try store.put("a", "1");
@@ -4075,7 +4127,7 @@ fn makeStoreWithOneWrite(dir: Io.Dir) !wal.RecordId {
 }
 
 /// Creates an empty log file that says it carries on from `previous`.
-fn createLogAfter(dir: Io.Dir, name: []const u8, previous: wal.RecordId) !void {
+fn createLogAfter(dir: Io.Dir, name: []const u8, previous: sector_log.RecordId) !void {
     var logs: TestLogs = undefined;
     try logs.init(dir);
     defer logs.deinit();
@@ -4148,7 +4200,7 @@ test "a newer log under a file number the manifest has handed out is reported" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var last: wal.RecordId = undefined;
+    var last: sector_log.RecordId = undefined;
     {
         var store = try openStore(tmp.dir);
         defer store.close(testing.allocator);
@@ -4167,7 +4219,7 @@ test "a newer log beside a store with every table slot taken is reported" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var last: wal.RecordId = undefined;
+    var last: sector_log.RecordId = undefined;
     var log_number_next: u64 = 0;
     {
         var store = try openStore(tmp.dir);
@@ -4199,20 +4251,28 @@ test "a later log with no manifest is not taken for a new store" {
 
 /// Makes a store by hand: an empty first log, and a manifest that follows
 /// `manifest_previous` and holds the one edit given.
-fn makeStoreByHand(dir: Io.Dir, edit: manifest.Edit, manifest_previous: wal.RecordId) !void {
+fn makeStoreByHand(dir: Io.Dir, edit: manifest.Edit, manifest_previous: sector_log.RecordId) !void {
     try createLogAfter(dir, "000001.log", .{ .op = edit.op_flushed, .checksum = 0 });
 
     const edit_buffer = try testing.allocator.alloc(u8, manifest.edit_size_max);
     defer testing.allocator.free(edit_buffer);
     const edit_bytes = manifest.encode(edit, edit_buffer);
 
+    const manifest_buffer = try testing.allocator.alignedAlloc(
+        u8,
+        .fromByteUnits(sector_size),
+        manifest.buffer_size,
+    );
+    defer testing.allocator.free(manifest_buffer);
+
     var real: RealStorage = undefined;
     try real.init(dir);
     defer real.deinit();
-    var log: wal.WriterType(DiskStorage) = try .create(
+    var log: DiskLog.Writer = try .create(
         &real.storage,
         manifest.file_name,
-        manifest.edit_size_max,
+        manifest.file_size,
+        manifest_buffer,
         manifest_previous,
     );
     defer log.close();
@@ -5241,6 +5301,137 @@ test "simulated: no acknowledged write is lost, whenever the crash comes" {
         var number: u64 = 0;
         while (number < present + 5) : (number += 1) {
             try testing.expect(try hasNumberedSimulated(&store, number));
+        }
+    }
+}
+
+/// The key of wide test entry `number`: the number, then padding up to the
+/// longest key the store takes. A table of such keys has a manifest edit
+/// several sectors long.
+fn wideKey(buffer: *[key_size_max]u8, number: u64) []const u8 {
+    @memset(buffer, 'k');
+    _ = std.fmt.bufPrint(buffer[0..8], "{d:0>8}", .{number}) catch unreachable;
+    return buffer;
+}
+
+fn putWideSimulated(store: *SimulatedStore, number: u64) !void {
+    var key_buffer: [key_size_max]u8 = undefined;
+    var value_buffer: [test_value_size]u8 = undefined;
+    try store.put(wideKey(&key_buffer, number), numberedValue(&value_buffer, number));
+}
+
+/// Whether the store holds the wide entry. Fails if the store holds the key
+/// with any other value.
+fn hasWideSimulated(store: *SimulatedStore, number: u64) !bool {
+    var key_buffer: [key_size_max]u8 = undefined;
+    var value_buffer: [test_value_size]u8 = undefined;
+    var get_buffer: [test_value_size]u8 = undefined;
+    const found = try store.get(wideKey(&key_buffer, number), &get_buffer);
+    if (found == null) {
+        return false;
+    }
+    try testing.expectEqualSlices(u8, numberedValue(&value_buffer, number), found.?);
+    return true;
+}
+
+/// How many writes the wide-key crash test makes when nothing stops it:
+/// enough for several flushes, and few enough that the store does not fill.
+const wide_test_writes = 50;
+
+/// The same check as `expectAfterSimulatedCrash`, for wide entries.
+fn expectWideAfterSimulatedCrash(store: *SimulatedStore, acknowledged: u64) !u64 {
+    var number: u64 = 0;
+    while (number < acknowledged) : (number += 1) {
+        try testing.expect(try hasWideSimulated(store, number));
+    }
+    var present = acknowledged;
+    if (try hasWideSimulated(store, acknowledged)) {
+        present += 1;
+    }
+    number = acknowledged + 1;
+    while (number < wide_test_writes) : (number += 1) {
+        try testing.expect(!try hasWideSimulated(store, number));
+    }
+    try testing.expectEqual(present, store.opLatest());
+    return present;
+}
+
+/// The storage operations one write of the wide-key crash test started:
+/// the first is operation `first + 1`, and the last is operation `last`.
+const OperationRange = struct {
+    first: u64,
+    last: u64,
+};
+
+test "simulated: a crash while a manifest edit of several sectors is written leaves a store that opens" {
+    // With keys of the longest size, the edit that records a flush is
+    // longer than two sectors. A power loss can keep some of the sectors
+    // of an edit in flight and lose others.
+    //
+    // First the workload is run with no crash, to learn which storage
+    // operations belong to a write that recorded a table in the manifest.
+    // The store starts the same operations in the same order every time,
+    // whatever the seed.
+    var recording: [tables_max]OperationRange = undefined;
+    var recording_count: usize = 0;
+    {
+        var storage: Simulated = .init(testing.allocator, .{ .seed = 0 });
+        defer storage.deinit();
+        var store = try openSimulatedStore(&storage);
+        defer store.close(testing.allocator);
+        var number: u64 = 0;
+        while (number < wide_test_writes) : (number += 1) {
+            const operations_before = storage.operations_started;
+            const tables_before = store.tables.count();
+            try putWideSimulated(&store, number);
+            if (store.tables.count() > tables_before) {
+                recording[recording_count] = .{
+                    .first = operations_before,
+                    .last = storage.operations_started,
+                };
+                recording_count += 1;
+            }
+        }
+    }
+    // The workload flushes several times.
+    try testing.expect(recording_count >= 3);
+
+    for (recording[0..recording_count]) |range| {
+        var crash_after = range.first + 1;
+        while (crash_after <= range.last) : (crash_after += 1) {
+            var seed: u64 = 0;
+            while (seed < 4) : (seed += 1) {
+                var storage: Simulated = .init(testing.allocator, .{ .seed = seed });
+                defer storage.deinit();
+                storage.crashAfterOperations(crash_after, .power_loss);
+
+                var acknowledged: u64 = 0;
+                {
+                    var store = try openSimulatedStore(&storage);
+                    defer store.close(testing.allocator);
+                    while (acknowledged < wide_test_writes) {
+                        putWideSimulated(&store, acknowledged) catch break;
+                        acknowledged += 1;
+                    }
+                }
+                try testing.expect(storage.crashed);
+                storage.restart();
+
+                var present: u64 = 0;
+                {
+                    var store = try openSimulatedStore(&storage);
+                    defer store.close(testing.allocator);
+                    present = try expectWideAfterSimulatedCrash(&store, acknowledged);
+                }
+
+                // A second power loss, straight after the store was opened,
+                // must change nothing.
+                storage.crash(.power_loss_worst);
+                storage.restart();
+                var store = try openSimulatedStore(&storage);
+                defer store.close(testing.allocator);
+                try testing.expectEqual(present, try expectWideAfterSimulatedCrash(&store, acknowledged));
+            }
         }
     }
 }
